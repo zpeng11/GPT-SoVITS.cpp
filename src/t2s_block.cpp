@@ -5,6 +5,123 @@
 
 namespace gpt_sovits {
 
+static ::ggml_tensor * build_sine_positional_embedding(
+    ::ggml_context * ctx,
+    int64_t          d_model,
+    int64_t          n_tokens)
+{
+    GGML_ASSERT(d_model > 0);
+    GGML_ASSERT(n_tokens >= 0);
+    GGML_ASSERT(d_model % 2 == 0);
+
+    if (n_tokens == 0) {
+        return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, 0);
+    }
+
+    ::ggml_tensor * positions = ggml_arange(ctx, 0.0f, (float) n_tokens, 1.0f);
+
+    // ggml_timestep_embedding uses the same frequency schedule as the Python
+    // implementation, but outputs [cos half | sin half]. Reorder it to the
+    // GPT-SoVITS layout [sin0, cos0, sin1, cos1, ...] explicitly instead of
+    // relying on reshape/permute stride tricks.
+    ::ggml_tensor * pe_half = ggml_timestep_embedding(ctx, positions, (int) d_model, 10000);
+    const int64_t half = d_model / 2;
+    const size_t element_size = ggml_element_size(pe_half);
+
+    // Build {1, half, T} views so concat(dim=0) materializes [sin_j, cos_j]
+    // pairs for each channel group and token.
+    ::ggml_tensor * sin_half = ggml_view_3d(
+        ctx,
+        pe_half,
+        1,
+        half,
+        n_tokens,
+        /* nb1 = */ element_size,
+        /* nb2 = */ pe_half->nb[1],
+        /* offset = */ half * element_size);
+    ::ggml_tensor * cos_half = ggml_view_3d(
+        ctx,
+        pe_half,
+        1,
+        half,
+        n_tokens,
+        /* nb1 = */ element_size,
+        /* nb2 = */ pe_half->nb[1],
+        /* offset = */ 0);
+
+    ::ggml_tensor * pe = ggml_concat(ctx, sin_half, cos_half, 0);
+    pe = ggml_cont(ctx, pe);
+
+    return ggml_reshape_2d(ctx, pe, d_model, n_tokens);
+}
+
+static ::ggml_tensor * add_positional_embedding(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * alpha)
+{
+    const int64_t d_model = x->ne[0];
+    const int64_t n_tokens = x->ne[1];
+
+    GGML_ASSERT(alpha != nullptr);
+
+    if (n_tokens == 0) {
+        return x;
+    }
+
+    ::ggml_tensor * pe = build_sine_positional_embedding(ctx, d_model, n_tokens);
+    ::ggml_tensor * scaled_pe = ggml_mul(ctx, pe, alpha);
+
+    return ggml_add(ctx, x, scaled_pe);
+}
+
+::ggml_tensor * t2s_encoder_block_forward(
+    ::ggml_context                    * ctx,
+    ::ggml_tensor                     * x_tokens,
+    ::ggml_tensor                     * bert_feature,
+    ::ggml_tensor                     * prompt_tokens,
+    const t2s_encoder_block_weights  & weights)
+{
+    GGML_ASSERT(x_tokens != nullptr);
+    GGML_ASSERT(bert_feature != nullptr);
+    GGML_ASSERT(weights.text_embedding != nullptr);
+    GGML_ASSERT(weights.bert_proj_w != nullptr);
+    GGML_ASSERT(weights.bert_proj_b != nullptr);
+    GGML_ASSERT(weights.text_pos_alpha != nullptr);
+    GGML_ASSERT(x_tokens->type == GGML_TYPE_I32);
+    GGML_ASSERT(bert_feature->ne[0] == weights.bert_proj_w->ne[0]);
+    GGML_ASSERT(bert_feature->ne[1] == x_tokens->ne[0]);
+
+    // Text token embedding: {d_model, T_x}
+    ::ggml_tensor * x = ggml_get_rows(ctx, weights.text_embedding, x_tokens);
+
+    // BERT projection: {1024, T_x} -> {d_model, T_x}
+    ::ggml_tensor * bert_proj = ggml_mul_mat(ctx, weights.bert_proj_w, bert_feature);
+    bert_proj = ggml_add(ctx, bert_proj, weights.bert_proj_b);
+
+    x = ggml_add(ctx, x, bert_proj);
+    x = add_positional_embedding(ctx, x, weights.text_pos_alpha);
+
+    if (prompt_tokens == nullptr) {
+        return x;
+    }
+
+    GGML_ASSERT(weights.audio_embedding != nullptr);
+    GGML_ASSERT(weights.audio_pos_alpha != nullptr);
+    GGML_ASSERT(prompt_tokens->type == GGML_TYPE_I32);
+
+    if (prompt_tokens->ne[0] == 0) {
+        return x;
+    }
+
+    // Prompt token embedding: {d_model, T_y}
+    ::ggml_tensor * y = ggml_get_rows(ctx, weights.audio_embedding, prompt_tokens);
+    y = add_positional_embedding(ctx, y, weights.audio_pos_alpha);
+
+    // Concatenate text and prompt sequence along the token dimension.
+    return ggml_concat(ctx, x, y, 1);
+}
+
 struct ggml_tensor * t2s_block_forward(
     struct ggml_context       * ctx,
     struct ggml_cgraph        * gf,

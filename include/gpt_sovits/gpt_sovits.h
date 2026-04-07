@@ -4,6 +4,52 @@
 
 namespace gpt_sovits {
 
+// Weights for building the T2S prefill input sequence up to xy_pos.
+//
+// This matches the Python path used before process_prompt(...):
+//   x_tokens -> text embedding
+//           + bert_proj(bert_feature)
+//           + SinePositionalEmbedding.forward(x)
+//   prompt_tokens -> audio embedding + SinePositionalEmbedding.forward(y)
+//   xy_pos = concat(text, prompt)
+//
+// All tensors use ggml's shape convention (ne[0] = innermost dim).
+// This block currently targets single-sample inference.
+struct t2s_encoder_block_weights {
+    // Text path
+    struct ggml_tensor * text_embedding;  // {d_model, phoneme_vocab}
+    struct ggml_tensor * bert_proj_w;     // {1024, d_model}
+    struct ggml_tensor * bert_proj_b;     // {d_model}
+    struct ggml_tensor * text_pos_alpha;  // scalar or {1}
+
+    // Prompt/audio path
+    struct ggml_tensor * audio_embedding; // {d_model, semantic_vocab}
+    struct ggml_tensor * audio_pos_alpha; // scalar or {1}
+};
+
+// Build the computation graph for the prefill embedding block up to xy_pos.
+//
+// Parameters:
+//   ctx          - ggml context for tensor/op allocation
+//   x_tokens     - phoneme token ids                 {T_x} (i32)
+//   bert_feature - BERT features                     {1024, T_x}
+//   prompt_tokens- semantic prompt token ids         {T_y} (i32), or nullptr
+//   weights      - encoder weights (see t2s_encoder_block_weights)
+//
+// Returns:
+//   xy_pos {d_model, T_x + T_y} when prompt_tokens is present,
+//          {d_model, T_x} otherwise.
+//
+// Positional embeddings are generated inside the block using the same
+// frequency schedule as SinePositionalEmbedding.extend_pe() in GPT-SoVITS,
+// with x_scale = 1.0 (the current model configuration uses scale=False).
+struct ggml_tensor * t2s_encoder_block_forward(
+    struct ggml_context              * ctx,
+    struct ggml_tensor               * x_tokens,
+    struct ggml_tensor               * bert_feature,
+    struct ggml_tensor               * prompt_tokens,
+    const t2s_encoder_block_weights  & weights);
+
 // Per-layer weights for a T2S (Text-to-Semantic) Transformer block.
 //
 // Implements a post-norm Transformer encoder layer:
