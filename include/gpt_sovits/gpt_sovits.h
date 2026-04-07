@@ -50,8 +50,9 @@ struct ggml_tensor * sovits_extract_latent_block_forward(
 //
 // Parameters:
 //   ctx                - ggml context for tensor/op allocation
-//   logits             - next-token logits              {vocab} or {vocab, 1}
-//   seen_mask          - optional seen-token mask       {vocab} or {vocab, 1}
+//   y                  - hidden state from last attention layer  {d_model} or {d_model, 1}
+//   lm_head_w          - projection weight (no bias)            {d_model, vocab}
+//   seen_mask          - optional seen-token mask               {vocab} or {vocab, 1}
 //                        Values are treated as binary via step(mask):
 //                        > 0 means token has appeared before.
 //   top_k              - <= 0 disables top-k filtering
@@ -73,7 +74,8 @@ struct ggml_tensor * sovits_extract_latent_block_forward(
 //     `exp_noise` to be supplied by the caller.
 struct ggml_tensor * t2s_sampler_block_forward(
     struct ggml_context * ctx,
-    struct ggml_tensor  * logits,
+    struct ggml_tensor  * y,
+    struct ggml_tensor  * lm_head_w,
     struct ggml_tensor  * seen_mask,
     int                   top_k,
     float                 top_p,

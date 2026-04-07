@@ -269,7 +269,8 @@ static ::ggml_tensor * pick_sampler_token(
 
 ::ggml_tensor * t2s_sampler_block_forward(
     ::ggml_context * ctx,
-    ::ggml_tensor  * logits,
+    ::ggml_tensor  * y,
+    ::ggml_tensor  * lm_head_w,
     ::ggml_tensor  * seen_mask,
     int              top_k,
     float            top_p,
@@ -277,6 +278,8 @@ static ::ggml_tensor * pick_sampler_token(
     float            repetition_penalty,
     ::ggml_tensor  * exp_noise)
 {
+    ::ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_w, y);
+
     t2s_sampler_probs_result probs = build_sampler_probs(
         ctx,
         logits,
