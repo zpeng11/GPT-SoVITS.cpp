@@ -4,6 +4,47 @@
 
 namespace gpt_sovits {
 
+// Weights for the SoVITS semantic extractor path used by
+// SynthesizerTrn.extract_latent(...):
+//   hubert_feature -> ssl_proj Conv1d -> RVQ nearest-code lookup -> codes
+//
+// This block matches the inference-only path that produces prompt semantic
+// tokens from HuBERT features. The current GPT-SoVITS models use a single RVQ
+// layer (n_q = 1), so only one codebook is required here.
+struct sovits_extract_latent_block_weights {
+    // Conv1d(768, 768, kernel=2, stride=2) in ggml kernel layout.
+    // PyTorch weight [out_channels, in_channels, kernel_size]
+    // maps to ggml {kernel_size, in_channels, out_channels}.
+    struct ggml_tensor * ssl_proj_w;     // {2, 768, 768}
+    struct ggml_tensor * ssl_proj_b;     // {768}
+
+    // RVQ codebook for the first and only quantizer layer.
+    // PyTorch embed shape [1024, 768] maps to ggml {768, 1024} so
+    // ggml_mul_mat(codebook, ssl) yields per-token scores {1024, T'}.
+    struct ggml_tensor * codebook;       // {768, 1024}
+};
+
+// Build the computation graph for the inference path used by
+// SynthesizerTrn.extract_latent(...).
+//
+// Parameters:
+//   ctx            - ggml context for tensor/op allocation
+//   hubert_feature - CN-HuBERT features               {768, T}
+//   weights        - block weights (see above)
+//
+// Returns:
+//   codes {T'} (i32), where T' is the post-conv sequence length.
+//
+// Notes:
+//   - This implements only the inference path. Training-only EMA updates,
+//     commitment loss, and straight-through quantized outputs are omitted.
+//   - Current GPT-SoVITS checkpoints force semantic_frame_rate = "25hz" in
+//     TTS inference, so ssl_proj is the stride-2 Conv1d path.
+struct ggml_tensor * sovits_extract_latent_block_forward(
+    struct ggml_context                       * ctx,
+    struct ggml_tensor                        * hubert_feature,
+    const sovits_extract_latent_block_weights & weights);
+
 // Weights for building the T2S prefill input sequence up to xy_pos.
 //
 // This matches the Python path used before process_prompt(...):

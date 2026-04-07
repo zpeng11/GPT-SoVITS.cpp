@@ -5,6 +5,57 @@
 
 namespace gpt_sovits {
 
+::ggml_tensor * sovits_extract_latent_block_forward(
+    ::ggml_context                       * ctx,
+    ::ggml_tensor                        * hubert_feature,
+    const sovits_extract_latent_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(hubert_feature != nullptr);
+    GGML_ASSERT(weights.ssl_proj_w != nullptr);
+    GGML_ASSERT(weights.ssl_proj_b != nullptr);
+    GGML_ASSERT(weights.codebook != nullptr);
+
+    GGML_ASSERT(hubert_feature->ne[0] == weights.ssl_proj_w->ne[1]);
+    GGML_ASSERT(weights.ssl_proj_w->ne[0] == 2);
+    GGML_ASSERT(weights.ssl_proj_w->ne[1] == weights.codebook->ne[0]);
+    GGML_ASSERT(weights.ssl_proj_w->ne[2] == weights.ssl_proj_b->ne[0]);
+
+    // ggml_conv_1d expects data laid out as {time, channels}. Convert from the
+    // project's usual {channels, time} convention, then transpose back.
+    ::ggml_tensor * ssl_input = ggml_permute(ctx, hubert_feature, 1, 0, 2, 3);
+    ssl_input = ggml_cont(ctx, ssl_input);
+
+    ::ggml_tensor * ssl = ggml_conv_1d(
+        ctx,
+        weights.ssl_proj_w,
+        ssl_input,
+        /* s0 = */ 2,
+        /* p0 = */ 0,
+        /* d0 = */ 1);
+    ssl = ggml_permute(ctx, ssl, 1, 0, 2, 3);
+    ssl = ggml_cont(ctx, ssl);
+    ssl = ggml_add(ctx, ssl, weights.ssl_proj_b);
+
+    // Nearest-code lookup for the single RVQ layer.
+    //
+    // Python computes:
+    //   dist = -(||x||^2 - 2 xE^T + ||E||^2)
+    //   codes = argmax(dist)
+    // The per-token ||x||^2 term does not change argmax, so we use the simpler
+    // equivalent score = xE^T - 0.5 ||E||^2.
+    ::ggml_tensor * score = ggml_mul_mat(ctx, weights.codebook, ssl);
+
+    ::ggml_tensor * codebook_sq = ggml_sqr(ctx, weights.codebook);
+    ::ggml_tensor * codebook_norm = ggml_sum_rows(ctx, codebook_sq);
+    codebook_norm = ggml_reshape_1d(ctx, codebook_norm, weights.codebook->ne[1]);
+    codebook_norm = ggml_scale(ctx, codebook_norm, 0.5f);
+
+    score = ggml_sub(ctx, score, codebook_norm);
+
+    return ggml_argmax(ctx, score);
+}
+
 static ::ggml_tensor * build_sine_positional_embedding(
     ::ggml_context * ctx,
     int64_t          d_model,
