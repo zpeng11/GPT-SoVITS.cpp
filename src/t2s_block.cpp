@@ -122,14 +122,14 @@ static ::ggml_tensor * add_positional_embedding(
     return ggml_concat(ctx, x, y, 1);
 }
 
-struct ggml_tensor * t2s_block_forward(
+struct ggml_tensor * t2s_attention_block_forward(
     struct ggml_context       * ctx,
     struct ggml_cgraph        * gf,
     struct ggml_tensor        * x,
     struct ggml_tensor        * mask,
     struct ggml_tensor        * k_cache,
     struct ggml_tensor        * v_cache,
-    const t2s_block_weights   & weights,
+    const t2s_attention_block_weights   & weights,
     int                         n_past,
     int                         n_head,
     float                       eps)
