@@ -45,6 +45,42 @@ struct ggml_tensor * sovits_extract_latent_block_forward(
     struct ggml_tensor                        * hubert_feature,
     const sovits_extract_latent_block_weights & weights);
 
+// Build the computation graph for the T2S sampler path used by
+// AR.models.utils.sample(...).
+//
+// Parameters:
+//   ctx                - ggml context for tensor/op allocation
+//   logits             - next-token logits              {vocab} or {vocab, 1}
+//   seen_mask          - optional seen-token mask       {vocab} or {vocab, 1}
+//                        Values are treated as binary via step(mask):
+//                        > 0 means token has appeared before.
+//   top_k              - <= 0 disables top-k filtering
+//   top_p              - >= 1 disables top-p filtering
+//   temperature        - logits are divided by max(temperature, 1e-5)
+//   repetition_penalty - 1.0 disables repetition penalty
+//   exp_noise      - optional Exp(1) noise samples      {vocab} or {vocab, 1}
+//                    When null, this falls back to greedy argmax.
+//
+// Returns:
+//   next token id {1} (i32)
+//
+// Notes:
+//   - This block targets single-sample inference.
+//   - Top-p is applied in sorted-logit space exactly as in AR.models.utils.
+//   - Masked logits use a large negative finite sentinel so softmax underflows
+//     them to zero without requiring a dedicated masked_fill op.
+//   - ggml does not provide a graph RNG op, so randomized sampling requires
+//     `exp_noise` to be supplied by the caller.
+struct ggml_tensor * t2s_sampler_block_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * logits,
+    struct ggml_tensor  * seen_mask,
+    int                   top_k,
+    float                 top_p,
+    float                 temperature,
+    float                 repetition_penalty,
+    struct ggml_tensor  * exp_noise);
+
 // Weights for building the T2S prefill input sequence up to xy_pos.
 //
 // This matches the Python path used before process_prompt(...):

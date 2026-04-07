@@ -5,6 +5,135 @@
 
 namespace gpt_sovits {
 
+static constexpr float kSamplerMaskLogit = -1.0e10f;
+
+struct t2s_sampler_probs_result {
+    ::ggml_tensor * probs_sorted;
+    ::ggml_tensor * sorted_indices;
+};
+
+static ::ggml_tensor * flatten_vector_like(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x)
+{
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(x->ne[2] == 1);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[0] == 1);
+
+    if (x->ne[1] == 1) {
+        return ggml_reshape_1d(ctx, x, x->ne[0]);
+    }
+
+    ::ggml_tensor * flat = ggml_reshape_1d(ctx, x, x->ne[1]);
+    return ggml_cont(ctx, flat);
+}
+
+static ::ggml_tensor * ensure_scalar_rows(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x)
+{
+    ::ggml_tensor * flat = flatten_vector_like(ctx, x);
+    return ggml_reshape_2d(ctx, flat, 1, flat->ne[0]);
+}
+
+static ::ggml_tensor * masked_lerp(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * base,
+    ::ggml_tensor  * selected,
+    ::ggml_tensor  * mask)
+{
+    // base + mask * (selected - base), with mask in {0, 1}
+    return ggml_add(ctx, base, ggml_mul(ctx, mask, ggml_sub(ctx, selected, base)));
+}
+
+static ::ggml_tensor * apply_top_p_sorted(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * sorted_logits,
+    float            top_p)
+{
+    if (!(top_p < 1.0f)) {
+        return sorted_logits;
+    }
+
+    const int64_t vocab = sorted_logits->ne[0];
+    if (vocab <= 1) {
+        return sorted_logits;
+    }
+
+    ::ggml_tensor * sorted_probs = ggml_soft_max(ctx, sorted_logits);
+    ::ggml_tensor * cum_probs = ggml_cumsum(ctx, sorted_probs);
+
+    ::ggml_tensor * threshold = ggml_fill(ctx, sorted_logits, top_p);
+    ::ggml_tensor * remove_mask = ggml_step(ctx, ggml_sub(ctx, cum_probs, threshold));
+
+    // Shift right by one so the first token above the threshold is kept.
+    ::ggml_tensor * keep_head = ggml_view_1d(ctx, remove_mask, 1, 0);
+    keep_head = ggml_cont(ctx, keep_head);
+    keep_head = ggml_fill(ctx, keep_head, 0.0f);
+    ::ggml_tensor * remove_tail = ggml_view_1d(
+        ctx,
+        remove_mask,
+        vocab - 1,
+        /* offset = */ ggml_element_size(remove_mask));
+    ::ggml_tensor * shifted_remove = ggml_concat(ctx, keep_head, remove_tail, 0);
+    shifted_remove = ggml_cont(ctx, shifted_remove);
+
+    ::ggml_tensor * masked_value = ggml_fill(ctx, sorted_logits, kSamplerMaskLogit);
+    return masked_lerp(ctx, sorted_logits, masked_value, shifted_remove);
+}
+
+static ::ggml_tensor * apply_top_k_sorted(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * sorted_logits,
+    int              top_k)
+{
+    if (top_k <= 0) {
+        return sorted_logits;
+    }
+
+    const int64_t vocab = sorted_logits->ne[0];
+    if (top_k >= vocab) {
+        return sorted_logits;
+    }
+
+    const size_t element_size = ggml_element_size(sorted_logits);
+    ::ggml_tensor * pivot = ggml_view_1d(
+        ctx,
+        sorted_logits,
+        1,
+        /* offset = */ (size_t) (top_k - 1) * element_size);
+    pivot = ggml_repeat(ctx, pivot, sorted_logits);
+
+    ::ggml_tensor * remove_mask = ggml_step(ctx, ggml_sub(ctx, pivot, sorted_logits));
+    ::ggml_tensor * masked_value = ggml_fill(ctx, sorted_logits, kSamplerMaskLogit);
+
+    return masked_lerp(ctx, sorted_logits, masked_value, remove_mask);
+}
+
+static ::ggml_tensor * apply_repetition_penalty(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * logits,
+    ::ggml_tensor  * seen_mask,
+    float            repetition_penalty)
+{
+    if (seen_mask == nullptr || repetition_penalty == 1.0f) {
+        return logits;
+    }
+
+    GGML_ASSERT(seen_mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(logits->ne[0] == seen_mask->ne[0]);
+
+    ::ggml_tensor * seen = ggml_step(ctx, seen_mask);
+    ::ggml_tensor * neg_mask = ggml_step(ctx, ggml_neg(ctx, logits));
+
+    ::ggml_tensor * pos_scaled = ggml_scale(ctx, logits, 1.0f / repetition_penalty);
+    ::ggml_tensor * neg_scaled = ggml_scale(ctx, logits, repetition_penalty);
+    ::ggml_tensor * selected = masked_lerp(ctx, pos_scaled, neg_scaled, neg_mask);
+
+    return masked_lerp(ctx, logits, selected, seen);
+}
+
 ::ggml_tensor * sovits_extract_latent_block_forward(
     ::ggml_context                       * ctx,
     ::ggml_tensor                        * hubert_feature,
@@ -54,6 +183,114 @@ namespace gpt_sovits {
     score = ggml_sub(ctx, score, codebook_norm);
 
     return ggml_argmax(ctx, score);
+}
+
+static t2s_sampler_probs_result build_sampler_probs(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * logits,
+    ::ggml_tensor  * seen_mask,
+    int              top_k,
+    float            top_p,
+    float            temperature,
+    float            repetition_penalty)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(logits != nullptr);
+    GGML_ASSERT(logits->type == GGML_TYPE_F32);
+    GGML_ASSERT(repetition_penalty > 0.0f);
+
+    ::ggml_tensor * logits_vec = flatten_vector_like(ctx, logits);
+    const int64_t vocab = logits_vec->ne[0];
+    ::ggml_tensor * seen_mask_vec = nullptr;
+
+    if (seen_mask != nullptr) {
+        GGML_ASSERT(seen_mask->type == GGML_TYPE_F32);
+        seen_mask_vec = flatten_vector_like(ctx, seen_mask);
+        GGML_ASSERT(seen_mask_vec->ne[0] == vocab);
+    }
+
+    ::ggml_tensor * adjusted = apply_repetition_penalty(
+        ctx,
+        logits_vec,
+        seen_mask_vec,
+        repetition_penalty);
+
+    ::ggml_tensor * sorted_indices = ggml_argsort(ctx, adjusted, GGML_SORT_ORDER_DESC);
+
+    ::ggml_tensor * logits_for_gather = ensure_scalar_rows(ctx, adjusted);
+    ::ggml_tensor * sorted_logits = ggml_get_rows(ctx, logits_for_gather, sorted_indices);
+    sorted_logits = ggml_reshape_1d(ctx, sorted_logits, vocab);
+
+    sorted_logits = apply_top_p_sorted(ctx, sorted_logits, top_p);
+
+    const float inv_temperature = 1.0f / fmaxf(temperature, 1.0e-5f);
+    sorted_logits = ggml_scale(ctx, sorted_logits, inv_temperature);
+
+    sorted_logits = apply_top_k_sorted(ctx, sorted_logits, top_k);
+
+    t2s_sampler_probs_result result;
+    result.probs_sorted = ggml_soft_max(ctx, sorted_logits);
+    result.sorted_indices = sorted_indices;
+    return result;
+}
+
+static ::ggml_tensor * pick_sampler_token(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * probs_sorted,
+    ::ggml_tensor  * sorted_indices,
+    ::ggml_tensor  * exp_noise)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(probs_sorted != nullptr);
+    GGML_ASSERT(sorted_indices != nullptr);
+    GGML_ASSERT(probs_sorted->type == GGML_TYPE_F32);
+    GGML_ASSERT(sorted_indices->type == GGML_TYPE_I32);
+
+    ::ggml_tensor * probs_vec = flatten_vector_like(ctx, probs_sorted);
+    ::ggml_tensor * indices_vec = flatten_vector_like(ctx, sorted_indices);
+    const int64_t vocab = probs_vec->ne[0];
+
+    GGML_ASSERT(indices_vec->ne[0] == vocab);
+
+    ::ggml_tensor * score = probs_vec;
+    if (exp_noise != nullptr) {
+        GGML_ASSERT(exp_noise->type == GGML_TYPE_F32);
+        ::ggml_tensor * noise_vec = flatten_vector_like(ctx, exp_noise);
+        GGML_ASSERT(noise_vec->ne[0] == vocab);
+        score = ggml_div(ctx, probs_vec, noise_vec);
+    }
+
+    ::ggml_tensor * score_matrix = ggml_reshape_2d(ctx, score, vocab, 1);
+    ::ggml_tensor * picked_rank = ggml_argmax(ctx, score_matrix);
+
+    ::ggml_tensor * picked_token = ggml_get_rows(ctx, ensure_scalar_rows(ctx, indices_vec), picked_rank);
+    return ggml_reshape_1d(ctx, picked_token, 1);
+}
+
+::ggml_tensor * t2s_sampler_block_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * logits,
+    ::ggml_tensor  * seen_mask,
+    int              top_k,
+    float            top_p,
+    float            temperature,
+    float            repetition_penalty,
+    ::ggml_tensor  * exp_noise)
+{
+    t2s_sampler_probs_result probs = build_sampler_probs(
+        ctx,
+        logits,
+        seen_mask,
+        top_k,
+        top_p,
+        temperature,
+        repetition_penalty);
+
+    return pick_sampler_token(
+        ctx,
+        probs.probs_sorted,
+        probs.sorted_indices,
+        exp_noise);
 }
 
 static ::ggml_tensor * build_sine_positional_embedding(
