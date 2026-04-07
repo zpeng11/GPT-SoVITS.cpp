@@ -83,6 +83,26 @@ struct ggml_tensor * t2s_sampler_block_forward(
     float                 repetition_penalty,
     struct ggml_tensor  * exp_noise);
 
+// Build the computation graph for audio token embedding with positional
+// encoding. Reusable for both prompt prefill (start_position=0) and
+// autoregressive decode steps (start_position=y_len+idx).
+//
+// Parameters:
+//   ctx             - ggml context for tensor/op allocation
+//   token_ids       - audio/prompt token ids            {T} or {1} (i32)
+//   audio_embedding - embedding weight                  {d_model, semantic_vocab}
+//   audio_pos_alpha - positional embedding scale        scalar or {1}
+//   start_position  - position offset for PE generation (0 for prefill)
+//
+// Returns:
+//   Embedded tokens with positional encoding {d_model, T}.
+struct ggml_tensor * t2s_audio_embed_block_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * token_ids,
+    struct ggml_tensor  * audio_embedding,
+    struct ggml_tensor  * audio_pos_alpha,
+    int64_t               start_position);
+
 // Weights for building the T2S prefill input sequence up to xy_pos.
 //
 // This matches the Python path used before process_prompt(...):

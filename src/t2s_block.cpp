@@ -299,17 +299,20 @@ static ::ggml_tensor * pick_sampler_token(
 static ::ggml_tensor * build_sine_positional_embedding(
     ::ggml_context * ctx,
     int64_t          d_model,
-    int64_t          n_tokens)
+    int64_t          n_tokens,
+    int64_t          start_position = 0)
 {
     GGML_ASSERT(d_model > 0);
     GGML_ASSERT(n_tokens >= 0);
+    GGML_ASSERT(start_position >= 0);
     GGML_ASSERT(d_model % 2 == 0);
 
     if (n_tokens == 0) {
         return ggml_new_tensor_2d(ctx, GGML_TYPE_F32, d_model, 0);
     }
 
-    ::ggml_tensor * positions = ggml_arange(ctx, 0.0f, (float) n_tokens, 1.0f);
+    ::ggml_tensor * positions = ggml_arange(
+        ctx, (float) start_position, (float) (start_position + n_tokens), 1.0f);
 
     // ggml_timestep_embedding uses the same frequency schedule as the Python
     // implementation, but outputs [cos half | sin half]. Reorder it to the
@@ -349,7 +352,8 @@ static ::ggml_tensor * build_sine_positional_embedding(
 static ::ggml_tensor * add_positional_embedding(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
-    ::ggml_tensor  * alpha)
+    ::ggml_tensor  * alpha,
+    int64_t          start_position = 0)
 {
     const int64_t d_model = x->ne[0];
     const int64_t n_tokens = x->ne[1];
@@ -360,17 +364,16 @@ static ::ggml_tensor * add_positional_embedding(
         return x;
     }
 
-    ::ggml_tensor * pe = build_sine_positional_embedding(ctx, d_model, n_tokens);
+    ::ggml_tensor * pe = build_sine_positional_embedding(ctx, d_model, n_tokens, start_position);
     ::ggml_tensor * scaled_pe = ggml_mul(ctx, pe, alpha);
 
     return ggml_add(ctx, x, scaled_pe);
 }
 
-::ggml_tensor * t2s_encoder_block_forward(
+static ::ggml_tensor * embed_text_forward(
     ::ggml_context                    * ctx,
     ::ggml_tensor                     * x_tokens,
     ::ggml_tensor                     * bert_feature,
-    ::ggml_tensor                     * prompt_tokens,
     const t2s_encoder_block_weights  & weights)
 {
     GGML_ASSERT(x_tokens != nullptr);
@@ -392,8 +395,36 @@ static ::ggml_tensor * add_positional_embedding(
 
     x = ggml_add(ctx, x, bert_proj);
     x = add_positional_embedding(ctx, x, weights.text_pos_alpha);
+    return x;
+}
 
-    if (prompt_tokens == nullptr) {
+::ggml_tensor * t2s_audio_embed_block_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * token_ids,
+    ::ggml_tensor  * audio_embedding,
+    ::ggml_tensor  * audio_pos_alpha,
+    int64_t          start_position)
+{
+    GGML_ASSERT(token_ids != nullptr);
+    GGML_ASSERT(token_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(audio_embedding != nullptr);
+    GGML_ASSERT(audio_pos_alpha != nullptr);
+    GGML_ASSERT(token_ids->ne[0] > 0);
+
+    ::ggml_tensor * y = ggml_get_rows(ctx, audio_embedding, token_ids);
+    return add_positional_embedding(ctx, y, audio_pos_alpha, start_position);
+}
+
+::ggml_tensor * t2s_encoder_block_forward(
+    ::ggml_context                    * ctx,
+    ::ggml_tensor                     * x_tokens,
+    ::ggml_tensor                     * bert_feature,
+    ::ggml_tensor                     * prompt_tokens,
+    const t2s_encoder_block_weights  & weights)
+{
+    ::ggml_tensor * x = embed_text_forward(ctx, x_tokens, bert_feature, weights);
+
+    if (prompt_tokens == nullptr || prompt_tokens->ne[0] == 0) {
         return x;
     }
 
@@ -401,13 +432,9 @@ static ::ggml_tensor * add_positional_embedding(
     GGML_ASSERT(weights.audio_pos_alpha != nullptr);
     GGML_ASSERT(prompt_tokens->type == GGML_TYPE_I32);
 
-    if (prompt_tokens->ne[0] == 0) {
-        return x;
-    }
-
-    // Prompt token embedding: {d_model, T_y}
-    ::ggml_tensor * y = ggml_get_rows(ctx, weights.audio_embedding, prompt_tokens);
-    y = add_positional_embedding(ctx, y, weights.audio_pos_alpha);
+    ::ggml_tensor * y = t2s_audio_embed_block_forward(
+        ctx, prompt_tokens, weights.audio_embedding, weights.audio_pos_alpha,
+        /*start_position=*/0);
 
     // Concatenate text and prompt sequence along the token dimension.
     return ggml_concat(ctx, x, y, 1);
