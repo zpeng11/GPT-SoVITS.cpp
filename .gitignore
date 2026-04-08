@@ -24,3 +24,19 @@ Thumbs.db
 
 # Generated
 compile_commands.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+
+# Model files
+*.gguf
+*.bin
+*.safetensors
+
+# Test reference data
+tests/hubert/models/
+tests/hubert/ref_*.bin
+tests/hubert/*.json

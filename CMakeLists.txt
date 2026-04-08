@@ -20,6 +20,7 @@ endforeach()
 # --- Project options ---
 option(GPTSOVITS_BUILD_SHARED "Build shared library" ON)
 option(GPTSOVITS_BUILD_STATIC "Build static library" ON)
+option(GPTSOVITS_BUILD_TESTS  "Build tests"          OFF)
 
 # --- ggml submodule ---
 # ggml options are passed through naturally via add_subdirectory.
@@ -34,3 +35,9 @@ add_subdirectory(third_party/ggml)
 
 # --- Project sources ---
 add_subdirectory(src)
+
+# --- Tests ---
+if(GPTSOVITS_BUILD_TESTS)
+    enable_testing()
+    add_subdirectory(tests)
+endif()
