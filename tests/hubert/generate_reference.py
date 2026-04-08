@@ -18,7 +18,6 @@ Output files (all raw f32, little-endian):
 """
 
 import argparse
-import json
 import os
 import sys
 
@@ -143,32 +142,7 @@ def main():
     model_out_np = model_out.contiguous().numpy()                    # [T', 768]
     save_f32_bin(os.path.join(args.output_dir, "ref_model_output.bin"), model_out_np)
 
-    # ------------------------------------------------------------------
-    # 6. Save metadata
-    # ------------------------------------------------------------------
     T_prime = int(feat_enc.shape[1])
-    metadata = {
-        "seed": args.seed,
-        "input_length": args.length,
-        "sample_rate": 16000,
-        "shapes": {
-            "ref_input":              {"ggml": [args.length],   "memory": [args.length]},
-            "ref_feature_encoder":    {"ggml": [512, T_prime],  "memory": [T_prime, 512]},
-            "ref_encoder_input":      {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
-            "ref_encoder_layer0":     {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
-            "ref_model_output":       {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
-        },
-        "note": (
-            "All .bin files are raw float32 little-endian. "
-            "Memory layout matches ggml: ne[0] is the contiguous (innermost) dimension."
-        ),
-    }
-
-    meta_path = os.path.join(args.output_dir, "ref_metadata.json")
-    with open(meta_path, "w") as f:
-        json.dump(metadata, f, indent=2)
-    print(f"  Saved {os.path.basename(meta_path)}")
-
     print(f"\nSequence length after conv encoder: T' = {T_prime}")
     print("Done!")
 

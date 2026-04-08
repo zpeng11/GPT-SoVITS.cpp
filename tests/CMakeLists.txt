@@ -14,6 +14,7 @@ include(GoogleTest)
 set(HUBERT_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_load.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_parity.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_flac.cpp
 )
 
 foreach(test_src ${HUBERT_TEST_SOURCES})
