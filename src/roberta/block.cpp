@@ -113,11 +113,25 @@ static ::ggml_tensor * linear_2d(
 
     x = ggml_add(ctx, x, pos_embed);
 
-    // Token-type embeddings (optional — all zeros in GPT-SoVITS inference).
-    if (token_type_ids != nullptr) {
+    // Token-type embeddings.
+    // When token_type_ids is nullptr, default to all zeros (matches HuggingFace
+    // BertModel behavior where None → torch.zeros).
+    GGML_ASSERT(weights.token_type_embeddings != nullptr);
+    if (token_type_ids == nullptr) {
+        // Slice row 0 of token_type_embeddings {1024, 2} → {1024, 1}, then
+        // broadcast: new_tensor_1d(1024) + x {1024, T} works via ggml_add broadcast.
+        const size_t tesz = ggml_element_size(weights.token_type_embeddings);
+        ::ggml_tensor * type_zero = ggml_view_2d(
+            ctx,
+            weights.token_type_embeddings,
+            kHiddenSize, 1,
+            /* nb1 = */ kHiddenSize * tesz,
+            /* offset = */ 0);
+        // type_zero: {1024, 1} — ggml_add will broadcast along dim 1.
+        x = ggml_add(ctx, x, type_zero);
+    } else {
         GGML_ASSERT(token_type_ids->type == GGML_TYPE_I32);
         GGML_ASSERT(token_type_ids->ne[0] == T);
-        GGML_ASSERT(weights.token_type_embeddings != nullptr);
 
         ::ggml_tensor * type_embed = ggml_get_rows(ctx, weights.token_type_embeddings, token_type_ids);
         x = ggml_add(ctx, x, type_embed);
