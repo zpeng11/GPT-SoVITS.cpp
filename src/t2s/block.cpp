@@ -1,4 +1,4 @@
-#include "gpt_sovits/gpt_sovits.h"
+#include "gpt_sovits/t2s.h"
 #include "ggml.h"
 
 #include <cmath>

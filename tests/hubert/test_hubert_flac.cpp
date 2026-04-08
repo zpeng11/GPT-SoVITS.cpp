@@ -12,7 +12,7 @@
 
 #include <gtest/gtest.h>
 
-#include "gpt_sovits/gpt_sovits.h"
+#include "gpt_sovits/hubert.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"

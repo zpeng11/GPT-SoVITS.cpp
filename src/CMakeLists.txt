@@ -1,6 +1,7 @@
-# Collect source files
-file(GLOB GPTSOVITS_SOURCES
-    ${CMAKE_CURRENT_SOURCE_DIR}/*.cpp
+set(GPTSOVITS_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/block.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/loader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/t2s/block.cpp
 )
 
 set(GPTSOVITS_PUBLIC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
