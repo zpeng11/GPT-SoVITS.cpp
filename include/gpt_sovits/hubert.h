@@ -223,12 +223,13 @@ struct hubert_model {
 // Load a HuBERT model from a GGUF file.
 //
 // Parameters:
-//   fname  - path to the .gguf file produced by convert_hubert_to_gguf.py
-//   model  - output model struct (will be populated)
+//   fname   - path to the .gguf file produced by convert_hubert_to_gguf.py
+//   model   - output model struct (will be populated)
+//   backend - ggml backend for tensor allocation (caller-owned; not freed by hubert_model_free)
 //
 // Returns:
 //   true on success, false on failure (with errors printed to stderr).
-bool hubert_model_load(const std::string & fname, hubert_model & model);
+bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_backend_t backend);
 
 // Free all resources owned by a HuBERT model.
 void hubert_model_free(hubert_model & model);

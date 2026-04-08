@@ -4,7 +4,6 @@
 #include "gguf.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
-#include "ggml-cpu.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -136,13 +135,9 @@ static bool populate_weights(struct ggml_context * ctx, hubert_model_block_weigh
 // Public API
 // ---------------------------------------------------------------------------
 
-bool hubert_model_load(const std::string & fname, hubert_model & model) {
-    // 1. Initialize a CPU backend.
-    model.backend = ggml_backend_cpu_init();
-    if (!model.backend) {
-        fprintf(stderr, "%s: ggml_backend_cpu_init() failed\n", __func__);
-        return false;
-    }
+bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_backend_t backend) {
+    GGML_ASSERT(backend != nullptr);
+    model.backend = backend;
 
     // 2. Open the GGUF file -- parse metadata and create tensor descriptors
     //    in a ggml_context (no data allocated yet).
@@ -225,10 +220,7 @@ void hubert_model_free(hubert_model & model) {
         ggml_free(model.ctx_w);
         model.ctx_w = nullptr;
     }
-    if (model.backend) {
-        ggml_backend_free(model.backend);
-        model.backend = nullptr;
-    }
+    model.backend = nullptr;
 }
 
 } // namespace gpt_sovits

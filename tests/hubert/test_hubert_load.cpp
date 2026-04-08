@@ -8,6 +8,9 @@
 
 #include "gpt_sovits/hubert.h"
 
+#include "ggml-backend.h"
+#include "ggml-cpu.h"
+
 #include <string>
 #include <vector>
 
@@ -138,31 +141,40 @@ class HubertLoadAll : public ::testing::TestWithParam<ModelVariant> {};
 
 TEST_P(HubertLoadAll, LoadsSuccessfully) {
     const auto & variant = GetParam();
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
-    ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model))
+    ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model, backend))
         << "Failed to load " << variant.path;
     EXPECT_NE(model.backend, nullptr);
     EXPECT_NE(model.buf_w, nullptr);
     EXPECT_NE(model.ctx_w, nullptr);
     gpt_sovits::hubert_model_free(model);
+    ggml_backend_free(backend);
 }
 
 TEST_P(HubertLoadAll, WeightPointersComplete) {
     const auto & variant = GetParam();
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
-    ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model))
+    ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model, backend))
         << "Failed to load " << variant.path;
     check_weight_completeness(model.weights);
     gpt_sovits::hubert_model_free(model);
+    ggml_backend_free(backend);
 }
 
 TEST_P(HubertLoadAll, TensorShapesCorrect) {
     const auto & variant = GetParam();
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
-    ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model))
+    ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model, backend))
         << "Failed to load " << variant.path;
     check_tensor_shapes(model.weights);
     gpt_sovits::hubert_model_free(model);
+    ggml_backend_free(backend);
 }
 
 INSTANTIATE_TEST_SUITE_P(
@@ -178,8 +190,11 @@ INSTANTIATE_TEST_SUITE_P(
 // ---------------------------------------------------------------------------
 
 TEST(HubertLoad, NonExistentFileReturnsFalse) {
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
-    EXPECT_FALSE(gpt_sovits::hubert_model_load("/nonexistent/path.gguf", model));
+    EXPECT_FALSE(gpt_sovits::hubert_model_load("/nonexistent/path.gguf", model, backend));
+    ggml_backend_free(backend);
 }
 
 TEST(HubertLoad, FreeOnDefaultInitializedModelIsSafe) {

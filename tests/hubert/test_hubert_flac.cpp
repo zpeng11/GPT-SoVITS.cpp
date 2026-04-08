@@ -17,6 +17,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <cmath>
 #include <cstdio>
@@ -256,15 +257,23 @@ void normalize(std::vector<float> & audio) {
 class HubertFlacParity : public ::testing::TestWithParam<ModelVariant> {
 protected:
     void SetUp() override {
+        backend_ = ggml_backend_cpu_init();
+        if (!backend_) {
+            GTEST_SKIP() << "Could not init CPU backend";
+        }
         const auto & v = GetParam();
-        if (!gpt_sovits::hubert_model_load(v.path, model_)) {
+        if (!gpt_sovits::hubert_model_load(v.path, model_, backend_)) {
             GTEST_SKIP() << "Could not load " << v.path;
         }
     }
     void TearDown() override {
         gpt_sovits::hubert_model_free(model_);
+        if (backend_) {
+            ggml_backend_free(backend_);
+        }
     }
 
+    ggml_backend_t          backend_ = nullptr;
     gpt_sovits::hubert_model model_{};
 };
 
