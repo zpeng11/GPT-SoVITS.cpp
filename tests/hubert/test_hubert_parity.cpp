@@ -6,6 +6,8 @@
 // Reference files are produced by tests/hubert/generate_reference.py and
 // stored as raw f32 little-endian binaries whose memory layout matches
 // ggml convention (ne[0] is the contiguous innermost dimension).
+//
+// Tests cover all model types: f32, f16, q8 (Q8_0), q5 (Q5_0), q4 (Q4_0).
 
 #include <gtest/gtest.h>
 
@@ -24,13 +26,27 @@
 namespace {
 
 // ---------------------------------------------------------------------------
-// Paths
+// Paths & model variants
 // ---------------------------------------------------------------------------
-static const std::string kTestDir  = HUBERT_TEST_DIR;
-static const std::string kModelF32 = kTestDir + "models/chinese-hubert-base-f32.gguf";
+static const std::string kTestDir = HUBERT_TEST_DIR;
 
-// Max nodes for the compute-graph context.  HuBERT full model needs ~1000
-// tensors; 8192 provides ample headroom.
+struct ModelVariant {
+    std::string name;
+    std::string path;
+    double      max_abs_tol;   // per-test max absolute error tolerance
+    double      rmse_tol;      // per-test RMSE tolerance
+};
+
+// Tolerances are per-FullModel; per-block tolerances are tighter.
+static const std::vector<ModelVariant> kModelVariants = {
+    {"F32", kTestDir + "models/chinese-hubert-base-f32.gguf", 1e-2, 1e-3},
+    {"F16", kTestDir + "models/chinese-hubert-base-f16.gguf", 2e-2, 2e-3},
+    {"Q8",  kTestDir + "models/chinese-hubert-base-q8.gguf",  1e-1, 1e-2},
+    {"Q5",  kTestDir + "models/chinese-hubert-base-q5.gguf",  2e-1, 3e-2},
+    {"Q4",  kTestDir + "models/chinese-hubert-base-q4.gguf",  5e-1, 8e-2},
+};
+
+// Max nodes for the compute-graph context.
 static constexpr size_t kMaxNodes = 8192;
 
 // ---------------------------------------------------------------------------
@@ -145,17 +161,23 @@ std::vector<float> eval_graph(
     return result;
 }
 
+// Scale per-block tolerances relative to the full-model tolerance.
+// Per-block tests accumulate less error, so tighten by a factor.
+static double block_max_abs(double full_tol) { return full_tol * 0.5; }
+static double block_rmse(double full_tol)    { return full_tol * 0.5; }
+
 }  // anonymous namespace
 
 // ===========================================================================
-// Fixture: loads the f32 model once per test
+// Parameterized fixture: loads each model variant
 // ===========================================================================
 
-class HubertParityF32 : public ::testing::Test {
+class HubertParity : public ::testing::TestWithParam<ModelVariant> {
 protected:
     void SetUp() override {
-        if (!gpt_sovits::hubert_model_load(kModelF32, model_)) {
-            GTEST_SKIP() << "Could not load " << kModelF32;
+        const auto & v = GetParam();
+        if (!gpt_sovits::hubert_model_load(v.path, model_)) {
+            GTEST_SKIP() << "Could not load " << v.path;
         }
     }
     void TearDown() override {
@@ -169,7 +191,8 @@ protected:
 // Per-block parity: Feature Encoder
 // ---------------------------------------------------------------------------
 
-TEST_F(HubertParityF32, FeatureEncoder) {
+TEST_P(HubertParity, FeatureEncoder) {
+    const auto & variant = GetParam();
     auto input = load_f32_bin(kTestDir + "ref_input.bin");
     auto ref   = load_f32_bin(kTestDir + "ref_feature_encoder.bin");
     ASSERT_FALSE(input.empty());
@@ -199,21 +222,21 @@ TEST_F(HubertParityF32, FeatureEncoder) {
         << "output size " << result.size() << " != ref size " << ref.size();
 
     auto err = compute_errors(result, ref);
-    printf("  Feature Encoder : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
-           err.max_abs, err.rmse, err.mean_abs);
+    printf("  [%s] Feature Encoder : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
+           variant.name.c_str(), err.max_abs, err.rmse, err.mean_abs);
 
-    // ggml_conv_1d internally uses F16 for the kernel (im2col), so there is
-    // some quantization noise even with an F32 model. After 7 conv layers the
-    // accumulated error is on the order of 1e-3 / 1e-4.
-    EXPECT_LT(err.max_abs, 5e-3) << "max abs error too large for feature encoder";
-    EXPECT_LT(err.rmse,    5e-4) << "RMSE too large for feature encoder";
+    EXPECT_LT(err.max_abs, block_max_abs(variant.max_abs_tol))
+        << variant.name << " max abs error too large for feature encoder";
+    EXPECT_LT(err.rmse,    block_rmse(variant.rmse_tol))
+        << variant.name << " RMSE too large for feature encoder";
 }
 
 // ---------------------------------------------------------------------------
 // Per-block parity: Encoder Layer 0
 // ---------------------------------------------------------------------------
 
-TEST_F(HubertParityF32, EncoderLayer0) {
+TEST_P(HubertParity, EncoderLayer0) {
+    const auto & variant = GetParam();
     auto input = load_f32_bin(kTestDir + "ref_encoder_input.bin");
     auto ref   = load_f32_bin(kTestDir + "ref_encoder_layer0.bin");
     ASSERT_FALSE(input.empty());
@@ -244,18 +267,21 @@ TEST_F(HubertParityF32, EncoderLayer0) {
         << "output size " << result.size() << " != ref size " << ref.size();
 
     auto err = compute_errors(result, ref);
-    printf("  Encoder L0      : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
-           err.max_abs, err.rmse, err.mean_abs);
+    printf("  [%s] Encoder L0      : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
+           variant.name.c_str(), err.max_abs, err.rmse, err.mean_abs);
 
-    EXPECT_LT(err.max_abs, 2e-3) << "max abs error too large for encoder layer 0";
-    EXPECT_LT(err.rmse,    5e-4) << "RMSE too large for encoder layer 0";
+    EXPECT_LT(err.max_abs, block_max_abs(variant.max_abs_tol))
+        << variant.name << " max abs error too large for encoder layer 0";
+    EXPECT_LT(err.rmse,    block_rmse(variant.rmse_tol))
+        << variant.name << " RMSE too large for encoder layer 0";
 }
 
 // ---------------------------------------------------------------------------
 // End-to-end parity: Full Model
 // ---------------------------------------------------------------------------
 
-TEST_F(HubertParityF32, FullModel) {
+TEST_P(HubertParity, FullModel) {
+    const auto & variant = GetParam();
     auto input = load_f32_bin(kTestDir + "ref_input.bin");
     auto ref   = load_f32_bin(kTestDir + "ref_model_output.bin");
     ASSERT_FALSE(input.empty());
@@ -284,11 +310,19 @@ TEST_F(HubertParityF32, FullModel) {
         << "output size " << result.size() << " != ref size " << ref.size();
 
     auto err = compute_errors(result, ref);
-    printf("  Full Model      : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
-           err.max_abs, err.rmse, err.mean_abs);
+    printf("  [%s] Full Model      : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
+           variant.name.c_str(), err.max_abs, err.rmse, err.mean_abs);
 
-    // Full model accumulates errors through 12 transformer layers, so
-    // tolerances are more relaxed than per-block tests.
-    EXPECT_LT(err.max_abs, 1e-2) << "max abs error too large for full model";
-    EXPECT_LT(err.rmse,    1e-3) << "RMSE too large for full model";
+    EXPECT_LT(err.max_abs, variant.max_abs_tol)
+        << variant.name << " max abs error too large for full model";
+    EXPECT_LT(err.rmse,    variant.rmse_tol)
+        << variant.name << " RMSE too large for full model";
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    HubertParity,
+    HubertParity,
+    ::testing::ValuesIn(kModelVariants),
+    [](const ::testing::TestParamInfo<ModelVariant> & info) {
+        return info.param.name;
+    });

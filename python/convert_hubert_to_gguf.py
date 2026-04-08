@@ -2,9 +2,14 @@
 """Convert a HuggingFace chinese-hubert-base checkpoint to GGUF format.
 
 Usage:
-    python convert_hubert_to_gguf.py <model_dir> [--output <path>] [--type f32|f16]
+    python convert_hubert_to_gguf.py <model_dir> [--output <path>] [--type f32|f16|q8|q5|q4]
 
 Where <model_dir> contains pytorch_model.bin and config.json.
+
+Quantization types (applied to 2D+ tensors only; 1D biases/norms stay f32):
+    q8  - Q8_0  (8.5 bits/weight, block size 32)
+    q5  - Q5_0  (5.5 bits/weight, block size 32)
+    q4  - Q4_0  (4.5 bits/weight, block size 32)
 """
 
 import argparse
@@ -22,7 +27,28 @@ import gguf
 GGML_TYPES = {
     "f32": gguf.GGMLQuantizationType.F32,
     "f16": gguf.GGMLQuantizationType.F16,
+    "q8":  gguf.GGMLQuantizationType.Q8_0,
+    "q5":  gguf.GGMLQuantizationType.Q5_0,
+    "q4":  gguf.GGMLQuantizationType.Q4_0,
 }
+
+# Tensors that must stay f32 regardless of the requested quantization type
+# (1D tensors are always kept f32; this set covers named exceptions).
+_F32_ONLY_NAMES = set()  # currently none beyond 1D tensors
+
+
+def should_quantize(name: str, tensor: np.ndarray, block_size: int) -> bool:
+    """Return True if this tensor should be quantized (2D+ weight, block-aligned).
+
+    Conv1d kernels (3D) are NOT quantized because ggml_conv_1d requires the
+    original 3D layout and does not support quantized kernels.  They are
+    stored as f16 instead.
+    """
+    if name in _F32_ONLY_NAMES:
+        return False
+    if tensor.ndim != 2:
+        return False
+    return tensor.shape[1] % block_size == 0
 
 
 def load_config(model_dir: str) -> dict:
@@ -77,9 +103,10 @@ def convert(model_dir: str, output_path: str, dtype_str: str) -> None:
     state_dict = load_state_dict(model_dir)
     print(f"  Found {len(state_dict)} tensors")
 
-    # Determine output dtype
-    use_f16 = (dtype_str == "f16")
-    print(f"  Output type: {'f16' if use_f16 else 'f32'}")
+    target_type = GGML_TYPES[dtype_str]
+    is_quantized = target_type not in (gguf.GGMLQuantizationType.F32, gguf.GGMLQuantizationType.F16)
+    block_size = gguf.GGML_QUANT_SIZES[target_type][0] if is_quantized else 0
+    print(f"  Output type: {dtype_str} ({target_type.name})")
 
     # Create GGUF writer
     gguf_writer = gguf.GGUFWriter(output_path, "hubert")
@@ -101,6 +128,7 @@ def convert(model_dir: str, output_path: str, dtype_str: str) -> None:
     # Process tensors
     n_skipped = 0
     n_converted = 0
+    n_quantized = 0
 
     for name, param in sorted(state_dict.items()):
         tensor_np = param.numpy()
@@ -114,26 +142,43 @@ def convert(model_dir: str, output_path: str, dtype_str: str) -> None:
         # Transpose to ggml layout
         tensor_ggml = transpose_for_ggml(name, tensor_np)
 
-        # Convert dtype
-        if use_f16:
-            # Keep 1D tensors (biases, norms) as f32 for numerical stability
-            if tensor_ggml.ndim == 1:
-                tensor_ggml = tensor_ggml.astype(np.float32)
-                data_type = gguf.GGMLQuantizationType.F32
-            else:
-                tensor_ggml = tensor_ggml.astype(np.float16)
-                data_type = gguf.GGMLQuantizationType.F16
+        if is_quantized and should_quantize(name, tensor_ggml, block_size):
+            # 2D weight: quantize row-wise.  The uint8 byte array's shape is
+            # the quantized shape; GGUFWriter recovers the float shape via
+            # quant_shape_from_byte_shape.
+            quantized = gguf.quantize(tensor_ggml, target_type)
+            gguf_writer.add_tensor(name, quantized, raw_dtype=target_type)
+            n_quantized += 1
+            data_type = target_type
+            out_shape = tensor_ggml.shape
+        elif (is_quantized and tensor_ggml.ndim >= 2 and not should_quantize(name, tensor_ggml, block_size)):
+            # 3D+ tensors (Conv1d kernels) that can't be block-quantized:
+            # store as f16 to still save space.
+            tensor_ggml = tensor_ggml.astype(np.float16)
+            data_type = gguf.GGMLQuantizationType.F16
+            gguf_writer.add_tensor(name, tensor_ggml, raw_dtype=data_type)
+            out_shape = tensor_ggml.shape
+        elif target_type == gguf.GGMLQuantizationType.F16 and tensor_ggml.ndim >= 2:
+            tensor_ggml = tensor_ggml.astype(np.float16)
+            data_type = gguf.GGMLQuantizationType.F16
+            gguf_writer.add_tensor(name, tensor_ggml, raw_dtype=data_type)
+            out_shape = tensor_ggml.shape
         else:
+            # f32 path (also used for 1D tensors when quantization is requested)
             tensor_ggml = tensor_ggml.astype(np.float32)
             data_type = gguf.GGMLQuantizationType.F32
+            gguf_writer.add_tensor(name, tensor_ggml, raw_dtype=data_type)
+            out_shape = tensor_ggml.shape
 
-        gguf_writer.add_tensor(name, tensor_ggml, raw_dtype=data_type)
         n_converted += 1
 
         if n_converted <= 5 or n_converted % 50 == 0:
-            print(f"  [{n_converted:3d}] {name:60s} {str(param.shape):20s} -> ggml {str(tensor_ggml.shape):20s} {data_type.name}")
+            print(f"  [{n_converted:3d}] {name:60s} {str(param.shape):20s} -> ggml {str(out_shape):20s} {data_type.name}")
 
-    print(f"\nConverted {n_converted} tensors, skipped {n_skipped}")
+    if n_quantized > 0:
+        print(f"\nConverted {n_converted} tensors (quantized {n_quantized}), skipped {n_skipped}")
+    else:
+        print(f"\nConverted {n_converted} tensors, skipped {n_skipped}")
     print(f"Writing GGUF to {output_path}...")
 
     gguf_writer.write_header_to_file()
@@ -149,7 +194,7 @@ def main():
     parser = argparse.ArgumentParser(description="Convert HuggingFace chinese-hubert-base to GGUF")
     parser.add_argument("model_dir", help="Path to HF model directory (containing pytorch_model.bin and config.json)")
     parser.add_argument("--output", "-o", default=None, help="Output GGUF file path (default: <model_dir>/chinese-hubert-base-<type>.gguf)")
-    parser.add_argument("--type", "-t", dest="dtype", default="f32", choices=["f32", "f16"], help="Output data type (default: f32)")
+    parser.add_argument("--type", "-t", dest="dtype", default="f32", choices=list(GGML_TYPES.keys()), help="Output data type (default: f32)")
     args = parser.parse_args()
 
     if args.output is None:
