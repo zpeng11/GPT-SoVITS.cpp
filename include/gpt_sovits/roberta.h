@@ -5,6 +5,7 @@
 
 #include <array>
 #include <cstdint>
+#include <string>
 
 namespace gpt_sovits {
 
@@ -182,5 +183,34 @@ struct ggml_tensor * roberta_model_block_forward(
     struct ggml_tensor                   * input_ids,
     struct ggml_tensor                   * token_type_ids,
     const roberta_model_block_weights    & weights);
+
+// ---------------------------------------------------------------------------
+// RoBERTa model: owns loaded GGUF weights and ggml resources
+// (except backend, which is borrowed from the caller).
+// ---------------------------------------------------------------------------
+
+struct roberta_model {
+    // Populated weight struct (all tensor pointers are owned by ctx_w).
+    roberta_model_block_weights weights = {};
+
+    // ggml resources -- managed by roberta_model_free().
+    ggml_backend_t            backend = nullptr;  // borrowed
+    ggml_backend_buffer_t     buf_w   = nullptr;  // owned
+    struct ggml_context     * ctx_w   = nullptr;  // owned
+};
+
+// Load a RoBERTa model from a GGUF file.
+//
+// Parameters:
+//   fname   - path to the .gguf file produced by convert_roberta_to_gguf.py
+//   model   - output model struct (will be populated)
+//   backend - ggml backend for tensor allocation (caller-owned; not freed by roberta_model_free)
+//
+// Returns:
+//   true on success, false on failure (with errors printed to stderr).
+bool roberta_model_load(const std::string & fname, roberta_model & model, ggml_backend_t backend);
+
+// Free all resources owned by a RoBERTa model.
+void roberta_model_free(roberta_model & model);
 
 } // namespace gpt_sovits
