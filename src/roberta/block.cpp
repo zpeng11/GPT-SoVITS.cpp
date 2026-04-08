@@ -109,7 +109,8 @@ static ::ggml_tensor * linear_2d(
         kHiddenSize, T,
         /* nb1 = */ kHiddenSize * esz,
         /* offset = */ 0);
-    // pos_embed: {1024, T}
+    // pos_embed: {1024, T} — cast to f32 to match ggml_get_rows output type.
+    pos_embed = ggml_cast(ctx, pos_embed, GGML_TYPE_F32);
 
     x = ggml_add(ctx, x, pos_embed);
 
@@ -127,7 +128,8 @@ static ::ggml_tensor * linear_2d(
             kHiddenSize, 1,
             /* nb1 = */ kHiddenSize * tesz,
             /* offset = */ 0);
-        // type_zero: {1024, 1} — ggml_add will broadcast along dim 1.
+        // type_zero: {1024, 1} — cast to f32, then ggml_add broadcasts along dim 1.
+        type_zero = ggml_cast(ctx, type_zero, GGML_TYPE_F32);
         x = ggml_add(ctx, x, type_zero);
     } else {
         GGML_ASSERT(token_type_ids->type == GGML_TYPE_I32);

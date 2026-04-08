@@ -39,6 +39,10 @@ struct ModelVariant {
 
 static const std::vector<ModelVariant> kModelVariants = {
     {"F32", kTestDir + "chinese-roberta-wwm-ext-large-f32.gguf", 5e-2, 5e-3},
+    {"F16", kTestDir + "chinese-roberta-wwm-ext-large-f16.gguf", 1e-1, 1e-2},
+    {"Q8",  kTestDir + "chinese-roberta-wwm-ext-large-q8.gguf",  5e-1, 3e-2},
+    {"Q5",  kTestDir + "chinese-roberta-wwm-ext-large-q5.gguf",  1.5,  1e-1},
+    {"Q4",  kTestDir + "chinese-roberta-wwm-ext-large-q4.gguf",  3.0,  2.5e-1},
 };
 
 static constexpr size_t kMaxNodes = 8192;

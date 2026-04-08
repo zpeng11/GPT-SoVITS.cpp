@@ -34,10 +34,21 @@ GGML_TYPES = {
 # Tensor name prefixes that are not needed for inference.
 _SKIP_PREFIXES = ("bert.pooler.", "cls.")
 
+# Embedding tables must NOT be quantized — they are accessed via ggml_get_rows
+# which dequantizes one row at a time, producing unacceptable error for the
+# large dynamic range of embedding values.  Keep them as f16 instead.
+_EMBEDDING_NAMES = (
+    "bert.embeddings.word_embeddings.weight",
+    "bert.embeddings.position_embeddings.weight",
+    "bert.embeddings.token_type_embeddings.weight",
+)
+
 
 def should_quantize(name: str, tensor: np.ndarray, block_size: int) -> bool:
     """Return True if this tensor should be quantized (2D weight, block-aligned)."""
     if tensor.ndim != 2:
+        return False
+    if name in _EMBEDDING_NAMES:
         return False
     return tensor.shape[1] % block_size == 0
 
