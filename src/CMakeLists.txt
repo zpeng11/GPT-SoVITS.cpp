@@ -2,6 +2,7 @@ set(GPTSOVITS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/block.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/roberta/block.cpp
 )
 
 set(GPTSOVITS_PUBLIC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)
