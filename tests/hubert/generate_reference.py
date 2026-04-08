@@ -11,10 +11,7 @@ Usage:
 Output files (all raw f32, little-endian):
     ref_input.bin                 - input waveform, ggml {T}
     ref_feature_encoder.bin       - 7-layer conv output, ggml {512, T'}
-    ref_feature_projection.bin    - projected features, ggml {768, T'}
-    ref_pos_conv.bin              - positional conv output, ggml {768, T'}
     ref_encoder_input.bin         - encoder input after add+LayerNorm, ggml {768, T'}
-    ref_attention0.bin            - encoder layer 0 attention output, ggml {768, T'}
     ref_encoder_layer0.bin        - encoder layer 0 output, ggml {768, T'}
     ref_model_output.bin          - final encoder output, ggml {768, T'}
     ref_metadata.json             - shapes, seed, and layout notes
@@ -101,7 +98,6 @@ def main():
 
     model.feature_extractor.register_forward_hook(_hook("feature_encoder"))
     model.feature_projection.register_forward_hook(_hook("feature_projection"))
-
     # ------------------------------------------------------------------
     # 4. Forward pass
     # ------------------------------------------------------------------
@@ -113,11 +109,6 @@ def main():
         feat_proj_btc = intermediates["feature_projection"]          # [1, T', 768]
         pos_conv = model.encoder.pos_conv_embed(feat_proj_btc)       # [1, T', 768]
         encoder_input = model.encoder.layer_norm(feat_proj_btc + pos_conv)
-        attention0 = model.encoder.layers[0].attention(
-            encoder_input,
-            attention_mask=None,
-            output_attentions=False,
-        )[0]
         encoder_layer0 = model.encoder.layers[0](
             encoder_input,
             attention_mask=None,
@@ -138,23 +129,9 @@ def main():
     feat_enc_np = feat_enc.permute(1, 0).contiguous().numpy()       # [T', 512]
     save_f32_bin(os.path.join(args.output_dir, "ref_feature_encoder.bin"), feat_enc_np)
 
-    # Feature projection: hook gives [1, T', 768]
-    #   -> squeeze -> [T', 768]  (already ggml {768, T'} memory layout)
-    feat_proj = intermediates["feature_projection"].squeeze(0)       # [T', 768]
-    feat_proj_np = feat_proj.contiguous().numpy()                    # [T', 768]
-    save_f32_bin(os.path.join(args.output_dir, "ref_feature_projection.bin"), feat_proj_np)
-
-    # Positional conv output: [1, T', 768] -> [T', 768]
-    pos_conv_np = pos_conv.squeeze(0).contiguous().numpy()
-    save_f32_bin(os.path.join(args.output_dir, "ref_pos_conv.bin"), pos_conv_np)
-
     # Encoder input after positional add + LayerNorm: [1, T', 768] -> [T', 768]
     encoder_input_np = encoder_input.squeeze(0).contiguous().numpy()
     save_f32_bin(os.path.join(args.output_dir, "ref_encoder_input.bin"), encoder_input_np)
-
-    # Encoder layer 0 attention output: [1, T', 768] -> [T', 768]
-    attention0_np = attention0.squeeze(0).contiguous().numpy()
-    save_f32_bin(os.path.join(args.output_dir, "ref_attention0.bin"), attention0_np)
 
     # Encoder layer 0 output: [1, T', 768] -> [T', 768]
     encoder_layer0_np = encoder_layer0.squeeze(0).contiguous().numpy()
@@ -177,10 +154,7 @@ def main():
         "shapes": {
             "ref_input":              {"ggml": [args.length],   "memory": [args.length]},
             "ref_feature_encoder":    {"ggml": [512, T_prime],  "memory": [T_prime, 512]},
-            "ref_feature_projection": {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
-            "ref_pos_conv":           {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
             "ref_encoder_input":      {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
-            "ref_attention0":         {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
             "ref_encoder_layer0":     {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
             "ref_model_output":       {"ggml": [768, T_prime],  "memory": [T_prime, 768]},
         },

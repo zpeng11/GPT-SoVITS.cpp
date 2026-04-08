@@ -11,10 +11,12 @@ FetchContent_MakeAvailable(googletest)
 
 include(GoogleTest)
 
-# Collect all test source files
-file(GLOB TEST_SOURCES ${CMAKE_CURRENT_SOURCE_DIR}/hubert/*.cpp)
+set(HUBERT_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_load.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_parity.cpp
+)
 
-foreach(test_src ${TEST_SOURCES})
+foreach(test_src ${HUBERT_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
     target_link_libraries(${test_name} PRIVATE

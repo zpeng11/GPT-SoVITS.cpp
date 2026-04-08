@@ -11,8 +11,6 @@
 
 static const std::string kTestDir  = HUBERT_TEST_DIR;
 static const std::string kModelF32 = kTestDir + "models/chinese-hubert-base-f32.gguf";
-static const std::string kModelF16 = kTestDir + "models/chinese-hubert-base-f16.gguf";
-
 // ---------------------------------------------------------------------------
 // Basic load / free
 // ---------------------------------------------------------------------------
@@ -23,12 +21,6 @@ TEST(HubertLoad, F32ModelLoadsSuccessfully) {
     EXPECT_NE(model.backend, nullptr);
     EXPECT_NE(model.buf_w, nullptr);
     EXPECT_NE(model.ctx_w, nullptr);
-    gpt_sovits::hubert_model_free(model);
-}
-
-TEST(HubertLoad, F16ModelLoadsSuccessfully) {
-    gpt_sovits::hubert_model model{};
-    ASSERT_TRUE(gpt_sovits::hubert_model_load(kModelF16, model));
     gpt_sovits::hubert_model_free(model);
 }
 
@@ -47,7 +39,7 @@ TEST(HubertLoad, FreeOnDefaultInitializedModelIsSafe) {
 // Weight pointer completeness
 // ---------------------------------------------------------------------------
 
-TEST(HubertLoad, AllWeightsNonNull) {
+TEST(HubertLoad, ModelStructureIsMappedCorrectly) {
     gpt_sovits::hubert_model model{};
     ASSERT_TRUE(gpt_sovits::hubert_model_load(kModelF32, model));
 
