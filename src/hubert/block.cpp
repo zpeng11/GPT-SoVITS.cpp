@@ -256,7 +256,7 @@ static ::ggml_tensor * linear_2d(
     GGML_ASSERT(weight->ne[1] == bias->ne[0]);
 
     ::ggml_tensor * y = ggml_mul_mat(ctx, weight, x);
-    return ggml_add(ctx, y, ggml_reshape_2d(ctx, bias, bias->ne[0], 1));
+    return ggml_add(ctx, y, bias);
 }
 
 } // namespace

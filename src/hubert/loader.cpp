@@ -139,8 +139,8 @@ bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_bac
     GGML_ASSERT(backend != nullptr);
     model.backend = backend;
 
-    // 2. Open the GGUF file -- parse metadata and create tensor descriptors
-    //    in a ggml_context (no data allocated yet).
+    // Open the GGUF file -- parse metadata and create tensor descriptors
+    // in a ggml_context (no data allocated yet).
     struct gguf_init_params params = {
         /*.no_alloc =*/ true,
         /*.ctx      =*/ &model.ctx_w,
@@ -152,26 +152,29 @@ bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_bac
         return false;
     }
 
-    // 3. Allocate backend buffers for all tensors.
+    // Allocate backend buffers for all tensors.
     model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
     if (!model.buf_w) {
         fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() failed\n", __func__);
         gguf_free(ctx_gguf);
+        hubert_model_free(model);
         return false;
     }
 
-    // 4. Populate the weight struct (look up tensors by name).
+    // Populate the weight struct (look up tensors by name).
     if (!populate_weights(model.ctx_w, model.weights)) {
         fprintf(stderr, "%s: populate_weights() failed -- missing tensors\n", __func__);
         gguf_free(ctx_gguf);
+        hubert_model_free(model);
         return false;
     }
 
-    // 5. Load tensor data from disk into backend buffers.
+    // Load tensor data from disk into backend buffers.
     FILE * f = fopen(fname.c_str(), "rb");
     if (!f) {
         fprintf(stderr, "%s: fopen('%s') failed\n", __func__, fname.c_str());
         gguf_free(ctx_gguf);
+        hubert_model_free(model);
         return false;
     }
 
@@ -192,12 +195,14 @@ bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_bac
             fprintf(stderr, "%s: fseek() failed for tensor '%s'\n", __func__, name);
             fclose(f);
             gguf_free(ctx_gguf);
+            hubert_model_free(model);
             return false;
         }
         if (fread(buf.data(), 1, nbytes, f) != nbytes) {
             fprintf(stderr, "%s: fread() failed for tensor '%s' (%zu bytes)\n", __func__, name, nbytes);
             fclose(f);
             gguf_free(ctx_gguf);
+            hubert_model_free(model);
             return false;
         }
 

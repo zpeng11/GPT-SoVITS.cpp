@@ -207,7 +207,8 @@ struct ggml_tensor * hubert_model_block_forward(
     const hubert_model_block_weights   & weights);
 
 // ---------------------------------------------------------------------------
-// HuBERT model: owns the loaded GGUF weights and ggml resources.
+// HuBERT model: owns the loaded GGUF weights and ggml resources
+// (except backend, which is borrowed from the caller).
 // ---------------------------------------------------------------------------
 
 struct hubert_model {
