@@ -37,26 +37,6 @@ static ::ggml_tensor * ensure_waveform_1d(
     return ggml_cont(ctx, flat);
 }
 
-static ::ggml_tensor * apply_affine_2d(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * x,
-    ::ggml_tensor  * weight,
-    ::ggml_tensor  * bias)
-{
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(weight != nullptr);
-    GGML_ASSERT(bias != nullptr);
-    GGML_ASSERT(weight->ne[0] == x->ne[0]);
-    GGML_ASSERT(bias->ne[0] == x->ne[0]);
-
-    ::ggml_tensor * weight_2d = ggml_reshape_2d(ctx, weight, weight->ne[0], 1);
-    ::ggml_tensor * bias_2d = ggml_reshape_2d(ctx, bias, bias->ne[0], 1);
-
-    x = ggml_mul(ctx, x, weight_2d);
-    x = ggml_add(ctx, x, bias_2d);
-    return x;
-}
-
 static ::ggml_tensor * layer_norm_last_dim_2d(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
@@ -69,7 +49,8 @@ static ::ggml_tensor * layer_norm_last_dim_2d(
     GGML_ASSERT(weight->ne[0] == bias->ne[0]);
 
     ::ggml_tensor * normed = ggml_norm(ctx, x, eps);
-    return apply_affine_2d(ctx, normed, weight, bias);
+    normed = ggml_mul(ctx, normed, weight);
+    return ggml_add(ctx, normed, bias);
 }
 
 static ::ggml_tensor * to_conv_input_layout(
@@ -82,18 +63,6 @@ static ::ggml_tensor * to_conv_input_layout(
 
     ::ggml_tensor * conv = ggml_permute(ctx, x, 1, 0, 2, 3);
     return ggml_cont(ctx, conv);
-}
-
-static ::ggml_tensor * from_conv_output_layout(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * x)
-{
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(x->ne[2] == 1);
-    GGML_ASSERT(x->ne[3] == 1);
-
-    ::ggml_tensor * seq = ggml_permute(ctx, x, 1, 0, 2, 3);
-    return ggml_cont(ctx, seq);
 }
 
 static ::ggml_tensor * conv1d_forward_channels_first(
@@ -290,23 +259,6 @@ static ::ggml_tensor * linear_2d(
     return ggml_add(ctx, y, ggml_reshape_2d(ctx, bias, bias->ne[0], 1));
 }
 
-static ::ggml_tensor * reshape_heads_for_attention(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * x)
-{
-    ::ggml_tensor * q = ggml_reshape_3d(ctx, x, kHubertHeadDim, kHubertNumHeads, x->ne[1]);
-    q = ggml_permute(ctx, q, 0, 2, 1, 3);
-    return ggml_cont(ctx, q);
-}
-
-static ::ggml_tensor * transpose_sequence_and_head_dim(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * x)
-{
-    ::ggml_tensor * y = ggml_permute(ctx, x, 1, 0, 2, 3);
-    return ggml_cont(ctx, y);
-}
-
 } // namespace
 
 ::ggml_tensor * hubert_feature_encoder_block_forward(
@@ -443,27 +395,52 @@ static ::ggml_tensor * transpose_sequence_and_head_dim(
     GGML_ASSERT(weights.out_proj_w != nullptr);
     GGML_ASSERT(weights.out_proj_b != nullptr);
 
-    ::ggml_tensor * q = linear_2d(ctx, x, weights.q_proj_w, weights.q_proj_b);
-    ::ggml_tensor * k = linear_2d(ctx, x, weights.k_proj_w, weights.k_proj_b);
-    ::ggml_tensor * v = linear_2d(ctx, x, weights.v_proj_w, weights.v_proj_b);
+    const int64_t T   = x->ne[1];
+    const size_t  esz = ggml_element_size(x);
 
-    q = reshape_heads_for_attention(ctx, q); // {head_dim, T, n_head}
-    k = reshape_heads_for_attention(ctx, k); // {head_dim, T, n_head}
-    v = reshape_heads_for_attention(ctx, v); // {head_dim, T, n_head}
+    // ── Q/K/V projections ────────────────────────────────────────
+    ::ggml_tensor * Q = linear_2d(ctx, x, weights.q_proj_w, weights.q_proj_b);
+    ::ggml_tensor * K = linear_2d(ctx, x, weights.k_proj_w, weights.k_proj_b);
+    ::ggml_tensor * V = linear_2d(ctx, x, weights.v_proj_w, weights.v_proj_b);
 
-    ::ggml_tensor * attn_scores = ggml_mul_mat(ctx, k, q); // {T, T, n_head}
-    attn_scores = ggml_soft_max_ext(
+    // ── Reshape to multi-head layout for flash_attn_ext ──────────
+    //   view_3d → {head_dim, n_head, T}   then permute → {head_dim, T, n_head}
+    ::ggml_tensor * q_3d = ggml_view_3d(ctx, Q,
+        kHubertHeadDim, kHubertNumHeads, T,
+        /* nb1 = */ esz * kHubertHeadDim,
+        /* nb2 = */ Q->nb[1],
+        /* off = */ 0);
+    q_3d = ggml_permute(ctx, q_3d, 0, 2, 1, 3);  // {64, T, 12}
+
+    ::ggml_tensor * k_3d = ggml_view_3d(ctx, K,
+        kHubertHeadDim, kHubertNumHeads, T,
+        /* nb1 = */ esz * kHubertHeadDim,
+        /* nb2 = */ K->nb[1],
+        /* off = */ 0);
+    k_3d = ggml_permute(ctx, k_3d, 0, 2, 1, 3);  // {64, T, 12}
+
+    ::ggml_tensor * v_3d = ggml_view_3d(ctx, V,
+        kHubertHeadDim, kHubertNumHeads, T,
+        /* nb1 = */ esz * kHubertHeadDim,
+        /* nb2 = */ V->nb[1],
+        /* off = */ 0);
+    v_3d = ggml_permute(ctx, v_3d, 0, 2, 1, 3);  // {64, T, 12}
+
+    // ── Flash attention ──────────────────────────────────────────
+    const float scale = 1.0f / sqrtf(static_cast<float>(kHubertHeadDim));
+
+    ::ggml_tensor * attn = ggml_flash_attn_ext(
         ctx,
-        attn_scores,
-        /*mask=*/nullptr,
-        1.0f / std::sqrt(static_cast<float>(kHubertHeadDim)),
-        /*max_bias=*/0.0f);
+        q_3d, k_3d, v_3d,
+        /* mask = */ nullptr,
+        scale,
+        /* max_bias      = */ 0.0f,
+        /* logit_softcap = */ 0.0f);
 
-    ::ggml_tensor * v_rhs = transpose_sequence_and_head_dim(ctx, v);  // {T, head_dim, n_head}
-    ::ggml_tensor * attn = ggml_mul_mat(ctx, v_rhs, attn_scores);     // {head_dim, T, n_head}
-    attn = ggml_permute(ctx, attn, 0, 2, 1, 3);                       // {head_dim, n_head, T}
-    attn = ggml_cont_2d(ctx, attn, kHubertHiddenSize, x->ne[1]);
+    // ── Reshape back to {768, T} ─────────────────────────────────
+    attn = ggml_reshape_2d(ctx, attn, kHubertHiddenSize, T);
 
+    // ── Output projection ────────────────────────────────────────
     return linear_2d(ctx, attn, weights.out_proj_w, weights.out_proj_b);
 }
 
