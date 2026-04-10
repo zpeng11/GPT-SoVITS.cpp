@@ -4,6 +4,8 @@
 #include "ggml-backend.h"
 
 #include <cstdint>
+#include <string>
+#include <vector>
 
 namespace gpt_sovits {
 
@@ -219,5 +221,68 @@ struct ggml_tensor * t2s_attention_block_forward(
     int                         n_past,
     int                         n_head,
     float                       eps);
+
+// ---------------------------------------------------------------------------
+// T2S model hyperparameters (read from GGUF KV metadata)
+// ---------------------------------------------------------------------------
+
+struct t2s_hparams {
+    uint32_t embedding_dim      = 512;
+    uint32_t hidden_dim         = 512;
+    uint32_t n_head             = 16;
+    uint32_t linear_units       = 2048;
+    uint32_t n_layer            = 24;
+    uint32_t vocab_size         = 1025;
+    uint32_t phoneme_vocab_size = 732;
+    uint32_t eos                = 1024;
+    uint32_t inter_channels     = 192;   // SoVITS extract-latent
+};
+
+// ---------------------------------------------------------------------------
+// Aggregate weight struct for all T2S + extract-latent blocks
+// ---------------------------------------------------------------------------
+
+struct t2s_model_weights {
+    // SoVITS extract-latent path
+    sovits_extract_latent_block_weights extract_latent;
+
+    // T2S encoder embedding path
+    t2s_encoder_block_weights encoder;
+
+    // T2S transformer attention layers
+    std::vector<t2s_attention_block_weights> attention;
+
+    // T2S sampler (lm_head projection)
+    struct ggml_tensor * lm_head_w;      // {d_model, vocab}
+};
+
+// ---------------------------------------------------------------------------
+// T2S model: owns loaded GGUF weights and ggml resources
+// (except backend, which is borrowed from the caller).
+// ---------------------------------------------------------------------------
+
+struct t2s_model {
+    t2s_hparams         hparams = {};
+    t2s_model_weights   weights = {};
+
+    // ggml resources -- managed by t2s_model_free().
+    ggml_backend_t         backend = nullptr;  // borrowed
+    ggml_backend_buffer_t  buf_w   = nullptr;  // owned
+    struct ggml_context  * ctx_w   = nullptr;  // owned
+};
+
+// Load a T2S model from a GGUF file.
+//
+// Parameters:
+//   fname   - path to the .gguf file produced by convert_t2s_to_gguf.py
+//   model   - output model struct (will be populated)
+//   backend - ggml backend for tensor allocation (caller-owned; not freed)
+//
+// Returns:
+//   true on success, false on failure (with errors printed to stderr).
+bool t2s_model_load(const std::string & fname, t2s_model & model, ggml_backend_t backend);
+
+// Free all resources owned by a T2S model.
+void t2s_model_free(t2s_model & model);
 
 } // namespace gpt_sovits
