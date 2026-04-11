@@ -131,28 +131,34 @@ struct t2s_encoder_block_weights {
     struct ggml_tensor * audio_pos_alpha; // scalar or {1}
 };
 
-// Build the computation graph for the prefill embedding block up to xy_pos.
+// Build the computation graph that prepares the full input sequence for
+// the T2S attention layers.  Combines extract-latent (reference audio →
+// semantic tokens) with text embedding (phonemes + BERT + positional) and
+// audio embedding (semantic tokens + positional), concatenating everything
+// into a single xy_pos tensor.
 //
 // Parameters:
-//   ctx          - ggml context for tensor/op allocation
-//   x_tokens     - phoneme token ids                 {T_x} (i32)
-//   bert_feature - BERT features                     {1024, T_x}
-//   prompt_tokens- semantic prompt token ids         {T_y} (i32), or nullptr
-//   weights      - encoder weights (see t2s_encoder_block_weights)
+//   ctx                - ggml context for tensor/op allocation
+//   ref_token          - reference phoneme token ids       {T_ref}  (i32)
+//   ref_bert_feature   - reference BERT features           {1024, T_ref}
+//   input_token        - input phoneme token ids           {T_in}   (i32)
+//   input_bert_feature - input BERT features               {1024, T_in}
+//   hubert_feature     - HuBERT features from ref audio    {768, T_hub}
+//   extract_latent_weights - weights for the SoVITS extract-latent block
+//   encoder_weights        - weights for the T2S encoder block
 //
 // Returns:
-//   xy_pos {d_model, T_x + T_y} when prompt_tokens is present,
-//          {d_model, T_x} otherwise.
-//
-// Positional embeddings are generated inside the block using the same
-// frequency schedule as SinePositionalEmbedding.extend_pe() in GPT-SoVITS,
-// with x_scale = 1.0 (the current model configuration uses scale=False).
-struct ggml_tensor * t2s_encoder_block_forward(
-    struct ggml_context              * ctx,
-    struct ggml_tensor               * x_tokens,
-    struct ggml_tensor               * bert_feature,
-    struct ggml_tensor               * prompt_tokens,
-    const t2s_encoder_block_weights  & weights);
+//   xy_pos {d_model, T_ref + T_in + T_prompt}
+//   Layout: [ref_text_emb | input_text_emb | prompt_audio_emb]
+struct ggml_tensor * t2s_embed_inputs_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * ref_token,
+    struct ggml_tensor  * ref_bert_feature,
+    struct ggml_tensor  * input_token,
+    struct ggml_tensor  * input_bert_feature,
+    struct ggml_tensor  * hubert_feature,
+    const sovits_extract_latent_block_weights & extract_latent_weights,
+    const t2s_encoder_block_weights  & encoder_weights);
 
 // Per-layer weights for a T2S (Text-to-Semantic) attention block.
 //

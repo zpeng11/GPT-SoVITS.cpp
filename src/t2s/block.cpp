@@ -415,28 +415,40 @@ static ::ggml_tensor * embed_text_forward(
     return add_positional_embedding(ctx, y, audio_pos_alpha, start_position);
 }
 
-::ggml_tensor * t2s_encoder_block_forward(
-    ::ggml_context                    * ctx,
-    ::ggml_tensor                     * x_tokens,
-    ::ggml_tensor                     * bert_feature,
-    ::ggml_tensor                     * prompt_tokens,
-    const t2s_encoder_block_weights  & weights)
+::ggml_tensor * t2s_embed_inputs_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * ref_token,
+    ::ggml_tensor  * ref_bert_feature,
+    ::ggml_tensor  * input_token,
+    ::ggml_tensor  * input_bert_feature,
+    ::ggml_tensor  * hubert_feature,
+    const sovits_extract_latent_block_weights & extract_latent_weights,
+    const t2s_encoder_block_weights  & encoder_weights)
 {
-    ::ggml_tensor * x = embed_text_forward(ctx, x_tokens, bert_feature, weights);
+    // 1. Extract prompt semantic tokens from reference audio HuBERT features.
+    ::ggml_tensor * prompt_tokens = sovits_extract_latent_block_forward(
+        ctx, hubert_feature, extract_latent_weights);
 
-    if (prompt_tokens == nullptr || prompt_tokens->ne[0] == 0) {
-        return x;
-    }
+    // 2. Concatenate ref + input text tokens and BERT features along the
+    //    sequence dimension.
+    ::ggml_tensor * all_tokens = ggml_concat(ctx, ref_token, input_token, 0);
+    ::ggml_tensor * all_bert   = ggml_concat(ctx, ref_bert_feature, input_bert_feature, 1);
 
-    GGML_ASSERT(weights.audio_embedding != nullptr);
-    GGML_ASSERT(weights.audio_pos_alpha != nullptr);
+    // 3. Text embedding: token embed + BERT projection + positional encoding.
+    ::ggml_tensor * x = embed_text_forward(ctx, all_tokens, all_bert, encoder_weights);
+
+    // 4. Audio embedding: semantic tokens + positional encoding.
+    GGML_ASSERT(encoder_weights.audio_embedding != nullptr);
+    GGML_ASSERT(encoder_weights.audio_pos_alpha != nullptr);
     GGML_ASSERT(prompt_tokens->type == GGML_TYPE_I32);
 
     ::ggml_tensor * y = t2s_audio_embed_block_forward(
-        ctx, prompt_tokens, weights.audio_embedding, weights.audio_pos_alpha,
+        ctx, prompt_tokens, encoder_weights.audio_embedding,
+        encoder_weights.audio_pos_alpha,
         /*start_position=*/0);
 
-    // Concatenate text and prompt sequence along the token dimension.
+    // 5. Concatenate text and prompt audio → xy_pos.
+    //    Layout: [ref_text_emb | input_text_emb | prompt_audio_emb]
     return ggml_concat(ctx, x, y, 1);
 }
 
