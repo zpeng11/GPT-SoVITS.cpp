@@ -65,9 +65,9 @@ static bool populate_weights(struct ggml_context * ctx,
         if (!el.ssl_proj_w || !el.ssl_proj_b || !el.codebook) return false;
     }
 
-    // ---- T2S encoder --------------------------------------------------
+    // ---- T2S embedding ------------------------------------------------
     {
-        auto & enc = w.encoder;
+        auto & enc = w.embed;
         enc.text_embedding = checked_get_tensor(ctx, "encoder.text_embedding");
         enc.bert_proj_w    = checked_get_tensor(ctx, "encoder.bert_proj_w");
         enc.bert_proj_b    = checked_get_tensor(ctx, "encoder.bert_proj_b");

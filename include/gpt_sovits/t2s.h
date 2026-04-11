@@ -119,7 +119,7 @@ struct ggml_tensor * t2s_audio_embed_block_forward(
 //
 // All tensors use ggml's shape convention (ne[0] = innermost dim).
 // This block currently targets single-sample inference.
-struct t2s_encoder_block_weights {
+struct t2s_embed_block_weights {
     // Text path
     struct ggml_tensor * text_embedding;  // {d_model, phoneme_vocab}
     struct ggml_tensor * bert_proj_w;     // {1024, d_model}
@@ -145,7 +145,7 @@ struct t2s_encoder_block_weights {
 //   input_bert_feature - input BERT features               {1024, T_in}
 //   hubert_feature     - HuBERT features from ref audio    {768, T_hub}
 //   extract_latent_weights - weights for the SoVITS extract-latent block
-//   encoder_weights        - weights for the T2S encoder block
+//   embed_weights           - weights for the T2S embedding block
 //
 // Returns:
 //   xy_pos {d_model, T_ref + T_in + T_prompt}
@@ -158,7 +158,7 @@ struct ggml_tensor * t2s_embed_inputs_forward(
     struct ggml_tensor  * input_bert_feature,
     struct ggml_tensor  * hubert_feature,
     const sovits_extract_latent_block_weights & extract_latent_weights,
-    const t2s_encoder_block_weights  & encoder_weights);
+    const t2s_embed_block_weights    & embed_weights);
 
 // Per-layer weights for a T2S (Text-to-Semantic) attention block.
 //
@@ -253,7 +253,7 @@ struct t2s_model_weights {
     sovits_extract_latent_block_weights extract_latent;
 
     // T2S encoder embedding path
-    t2s_encoder_block_weights encoder;
+    t2s_embed_block_weights embed;
 
     // T2S transformer attention layers
     std::vector<t2s_attention_block_weights> attention;

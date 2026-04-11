@@ -60,7 +60,7 @@ TEST(T2SLoader, LoadF16Model) {
     expect_shape(el.codebook,   {768, 1024});
 
     // --- encoder ---
-    auto & enc = model.weights.encoder;
+    auto & enc = model.weights.embed;
     expect_shape(enc.text_embedding, {512, 732});
     expect_shape(enc.bert_proj_w,    {1024, 512});
     expect_shape(enc.bert_proj_b,    {512});

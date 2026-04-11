@@ -374,7 +374,7 @@ static ::ggml_tensor * embed_text_forward(
     ::ggml_context                    * ctx,
     ::ggml_tensor                     * x_tokens,
     ::ggml_tensor                     * bert_feature,
-    const t2s_encoder_block_weights  & weights)
+    const t2s_embed_block_weights  & weights)
 {
     GGML_ASSERT(x_tokens != nullptr);
     GGML_ASSERT(bert_feature != nullptr);
@@ -423,7 +423,7 @@ static ::ggml_tensor * embed_text_forward(
     ::ggml_tensor  * input_bert_feature,
     ::ggml_tensor  * hubert_feature,
     const sovits_extract_latent_block_weights & extract_latent_weights,
-    const t2s_encoder_block_weights  & encoder_weights)
+    const t2s_embed_block_weights  & embed_weights)
 {
     // 1. Extract prompt semantic tokens from reference audio HuBERT features.
     ::ggml_tensor * prompt_tokens = sovits_extract_latent_block_forward(
@@ -435,16 +435,16 @@ static ::ggml_tensor * embed_text_forward(
     ::ggml_tensor * all_bert   = ggml_concat(ctx, ref_bert_feature, input_bert_feature, 1);
 
     // 3. Text embedding: token embed + BERT projection + positional encoding.
-    ::ggml_tensor * x = embed_text_forward(ctx, all_tokens, all_bert, encoder_weights);
+    ::ggml_tensor * x = embed_text_forward(ctx, all_tokens, all_bert, embed_weights);
 
     // 4. Audio embedding: semantic tokens + positional encoding.
-    GGML_ASSERT(encoder_weights.audio_embedding != nullptr);
-    GGML_ASSERT(encoder_weights.audio_pos_alpha != nullptr);
+    GGML_ASSERT(embed_weights.audio_embedding != nullptr);
+    GGML_ASSERT(embed_weights.audio_pos_alpha != nullptr);
     GGML_ASSERT(prompt_tokens->type == GGML_TYPE_I32);
 
     ::ggml_tensor * y = t2s_audio_embed_block_forward(
-        ctx, prompt_tokens, encoder_weights.audio_embedding,
-        encoder_weights.audio_pos_alpha,
+        ctx, prompt_tokens, embed_weights.audio_embedding,
+        embed_weights.audio_pos_alpha,
         /*start_position=*/0);
 
     // 5. Concatenate text and prompt audio → xy_pos.
