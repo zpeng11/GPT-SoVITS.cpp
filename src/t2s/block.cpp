@@ -466,14 +466,14 @@ struct ggml_tensor * t2s_attention_block_forward(
     struct ggml_tensor        * mask,
     struct ggml_tensor        * k_cache,
     struct ggml_tensor        * v_cache,
+    struct ggml_tensor        * kv_pos,
     const t2s_attention_block_weights   & weights,
-    int                         n_past,
+    int                         n_kv,
     int                         n_head,
     float                       eps)
 {
     const int64_t d_model  = x->ne[0];
     const int64_t N        = x->ne[1];
-    const int64_t n_kv     = n_past + N;
     const int64_t head_dim = d_model / n_head;
     const size_t  esz      = ggml_element_size(x);
 
@@ -482,7 +482,7 @@ struct ggml_tensor * t2s_attention_block_forward(
     struct ggml_tensor * qkv = ggml_mul_mat(ctx, weights.qkv_w, x);
     qkv = ggml_add(ctx, qkv, weights.qkv_b);
 
-    // ── 2. Split Q / K / V and populate KV cache ────────────────
+    // ── 2. Split Q / K / V and scatter-write into KV cache ──────
     //
     // qkv layout along ne[0]: [Q (d_model) | K (d_model) | V (d_model)]
     //
@@ -495,31 +495,23 @@ struct ggml_tensor * t2s_attention_block_forward(
         /*off=*/ 0);
     q = ggml_permute(ctx, q, 0, 2, 1, 3); // {head_dim, N, n_head}
 
-    // K — extract {d_model, N} (strided), copy into cache slice
+    // K — extract {d_model, N} (strided), make contiguous, scatter-write
     struct ggml_tensor * k_new = ggml_view_2d(ctx, qkv,
         d_model, N,
         /*nb1=*/ qkv->nb[1],
         /*off=*/ (size_t)(d_model * esz));
+    k_new = ggml_cont(ctx, k_new);
 
-    struct ggml_tensor * k_dst = ggml_view_2d(ctx, k_cache,
-        d_model, N,
-        /*nb1=*/ d_model * esz,
-        /*off=*/ (size_t)(n_past * d_model * esz));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, k_cache, k_new, kv_pos));
 
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, k_new, k_dst));
-
-    // V — extract {d_model, N} (strided), copy into cache slice
+    // V — extract {d_model, N} (strided), make contiguous, scatter-write
     struct ggml_tensor * v_new = ggml_view_2d(ctx, qkv,
         d_model, N,
         /*nb1=*/ qkv->nb[1],
         /*off=*/ (size_t)(2 * d_model * esz));
+    v_new = ggml_cont(ctx, v_new);
 
-    struct ggml_tensor * v_dst = ggml_view_2d(ctx, v_cache,
-        d_model, N,
-        /*nb1=*/ d_model * esz,
-        /*off=*/ (size_t)(n_past * d_model * esz));
-
-    ggml_build_forward_expand(gf, ggml_cpy(ctx, v_new, v_dst));
+    ggml_build_forward_expand(gf, ggml_set_rows(ctx, v_cache, v_new, kv_pos));
 
     // Read full K from cache → multi-head view for flash attention
     //   view_3d → {head_dim, n_head, n_kv}  then permute → {head_dim, n_kv, n_head}

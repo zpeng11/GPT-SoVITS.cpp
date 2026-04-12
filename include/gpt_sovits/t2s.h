@@ -216,20 +216,27 @@ struct t2s_attention_block_weights {
 
 // Build the computation graph for a single T2S attention block.
 //
-// Appends new K/V entries to the caches and performs self-attention
-// followed by a feed-forward network, both with post-norm residuals.
+// Writes new K/V entries into the caches (scatter-write) and performs
+// self-attention over [0, n_kv) followed by a feed-forward network,
+// both with post-norm residuals.
 //
 // Parameters:
 //   ctx       - ggml context for tensor/op allocation (typically no_alloc)
-//   gf        - computation graph; KV cache copy ops are added via
+//   gf        - computation graph; KV cache write ops are added via
 //               ggml_build_forward_expand so they execute before attention
 //   x         - input activations               {d_model, N}
 //   mask      - attention mask (f16, contiguous) {n_kv, N}
-//               0 = attend, -inf = masked
+//               0 = attend, -inf = masked; caller is responsible for
+//               masking out any invalid positions in [0, n_kv)
 //   k_cache   - key cache buffer                 {d_model, max_ctx}
 //   v_cache   - value cache buffer               {d_model, max_ctx}
+//   kv_pos    - scatter-write positions           {N} I32
+//               kv_pos[i] = cache slot (column index) for token i;
+//               positions may be non-contiguous and in any order;
+//               duplicate positions produce undefined behaviour
 //   weights   - layer weights (see t2s_attention_block_weights)
-//   n_past    - number of tokens already in the KV cache
+//   n_kv      - total KV entries for attention readback; K and V are
+//               read from cache positions [0, n_kv)
 //   n_head    - number of attention heads (head_dim = d_model / n_head)
 //   eps       - layer-norm epsilon (e.g. 1e-5)
 //
@@ -242,8 +249,9 @@ struct ggml_tensor * t2s_attention_block_forward(
     struct ggml_tensor        * mask,
     struct ggml_tensor        * k_cache,
     struct ggml_tensor        * v_cache,
+    struct ggml_tensor        * kv_pos,
     const t2s_attention_block_weights   & weights,
-    int                         n_past,
+    int                         n_kv,
     int                         n_head,
     float                       eps);
 
