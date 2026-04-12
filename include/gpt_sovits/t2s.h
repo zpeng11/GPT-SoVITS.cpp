@@ -131,34 +131,53 @@ struct t2s_embed_block_weights {
     struct ggml_tensor * audio_pos_alpha; // scalar or {1}
 };
 
-// Build the computation graph that prepares the full input sequence for
-// the T2S attention layers.  Combines extract-latent (reference audio →
-// semantic tokens) with text embedding (phonemes + BERT + positional) and
-// audio embedding (semantic tokens + positional), concatenating everything
-// into a single xy_pos tensor.
+// Precompute the reference portion of the T2S input sequence.
+//
+// Processes reference text (phonemes + BERT + positional) and reference
+// audio (HuBERT → semantic tokens → audio embed + positional), producing
+// a single concatenated tensor.  The result is deterministic for a given
+// reference and can be cached across inference calls.
 //
 // Parameters:
 //   ctx                - ggml context for tensor/op allocation
 //   ref_token          - reference phoneme token ids       {T_ref}  (i32)
 //   ref_bert_feature   - reference BERT features           {1024, T_ref}
-//   input_token        - input phoneme token ids           {T_in}   (i32)
-//   input_bert_feature - input BERT features               {1024, T_in}
 //   hubert_feature     - HuBERT features from ref audio    {768, T_hub}
 //   extract_latent_weights - weights for the SoVITS extract-latent block
 //   embed_weights           - weights for the T2S embedding block
 //
 // Returns:
-//   xy_pos {d_model, T_ref + T_in + T_prompt}
-//   Layout: [ref_text_emb | input_text_emb | prompt_audio_emb]
-struct ggml_tensor * t2s_embed_inputs_forward(
+//   ref_emb {d_model, T_ref + T_prompt}
+//   Layout: [ref_text_emb | prompt_audio_emb]
+struct ggml_tensor * t2s_embed_ref_forward(
     struct ggml_context * ctx,
     struct ggml_tensor  * ref_token,
     struct ggml_tensor  * ref_bert_feature,
-    struct ggml_tensor  * input_token,
-    struct ggml_tensor  * input_bert_feature,
     struct ggml_tensor  * hubert_feature,
     const sovits_extract_latent_block_weights & extract_latent_weights,
     const t2s_embed_block_weights    & embed_weights);
+
+// Compute the input text embedding portion of the T2S sequence.
+//
+// Embeds input text tokens with BERT projection and positional encoding
+// starting at position T_ref, so the positions continue seamlessly
+// after the reference text portion.
+//
+// Parameters:
+//   ctx                - ggml context for tensor/op allocation
+//   input_token        - input phoneme token ids           {T_in}   (i32)
+//   input_bert_feature - input BERT features               {1024, T_in}
+//   T_ref              - number of reference text tokens (position offset)
+//   embed_weights      - weights for the T2S embedding block
+//
+// Returns:
+//   input_text_emb {d_model, T_in}
+struct ggml_tensor * t2s_embed_input_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * input_token,
+    struct ggml_tensor  * input_bert_feature,
+    int64_t               T_ref,
+    const t2s_embed_block_weights & embed_weights);
 
 // Per-layer weights for a T2S (Text-to-Semantic) attention block.
 //
