@@ -66,7 +66,7 @@ bool t2s_session_init(t2s_session      & session,
         session.v_caches[i] = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, d_model, max_ctx);
     }
 
-    session.kv_pos = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, slot_size);
+    session.kv_pos = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, n_batch);
     session.mask   = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F16, max_ctx, n_batch);
 
     // Decode input tensor: {d_model, n_batch}
@@ -83,8 +83,8 @@ bool t2s_session_init(t2s_session      & session,
 
     // Zero-initialize kv_pos.
     {
-        std::vector<int32_t> zeros(slot_size, 0);
-        ggml_backend_tensor_set(session.kv_pos, zeros.data(), 0, slot_size * sizeof(int32_t));
+        std::vector<int32_t> zeros(n_batch, 0);
+        ggml_backend_tensor_set(session.kv_pos, zeros.data(), 0, n_batch * sizeof(int32_t));
     }
 
     // Initialize mask_host to all -inf and upload.
@@ -243,10 +243,6 @@ bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & mod
 
     session.gf_dec = ggml_new_graph_custom(session.ctx_graph, graph_size, false);
 
-    // kv_pos view: {n_batch} from the full {slot_size}
-    struct ggml_tensor * kv_pos_view = ggml_view_1d(
-        session.ctx_graph, session.kv_pos, session.n_batch, 0);
-
     // Build 24-layer decode graph.
     struct ggml_tensor * x = session.x_dec;
     for (int i = 0; i < n_layer; i++) {
@@ -254,7 +250,7 @@ bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & mod
             session.ctx_graph, session.gf_dec, x,
             session.mask,
             session.k_caches[i], session.v_caches[i],
-            kv_pos_view,
+            session.kv_pos,
             model.weights.attention[i],
             n_kv, n_head, 1e-5f);
     }

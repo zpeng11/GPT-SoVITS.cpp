@@ -348,7 +348,7 @@ struct t2s_session {
     std::vector<struct ggml_tensor *> v_caches;  // [n_layer]
 
     // Shared input tensors (caller fills before graph build)
-    struct ggml_tensor * kv_pos = nullptr;  // {slot_size} I32
+    struct ggml_tensor * kv_pos = nullptr;  // {n_batch} I32
     // Decode-only mask. Each column corresponds to one query token and masks
     // out all KV positions outside that query's own slot, providing per-slot
     // isolation during batch decode. NOT suitable for prefill.

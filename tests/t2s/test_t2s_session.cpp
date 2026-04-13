@@ -59,7 +59,7 @@ TEST(T2SSession, InitAndFree) {
         expect_shape(session.v_caches[i], {d_model, max_ctx});
     }
 
-    expect_shape(session.kv_pos, {slot_size});
+    expect_shape(session.kv_pos, {n_batch});
     expect_shape(session.mask,   {max_ctx, n_batch});
     expect_shape(session.x_dec,  {d_model, n_batch});
 
@@ -185,7 +185,7 @@ TEST(T2SSession, Accessors) {
     // kv_pos
     struct ggml_tensor * kv_pos = gpt_sovits::t2s_session_get_kv_pos(session);
     ASSERT_NE(kv_pos, nullptr);
-    EXPECT_EQ(kv_pos->ne[0], (int64_t)slot_size);
+    EXPECT_EQ(kv_pos->ne[0], (int64_t)n_batch);
 
     // mask
     struct ggml_tensor * mask = gpt_sovits::t2s_session_get_mask(session);
