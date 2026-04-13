@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <vector>
 
 namespace gpt_sovits {
 
@@ -110,6 +111,18 @@ bool t2s_session_init(t2s_session      & session,
 }
 
 void t2s_session_free(t2s_session & session) {
+    // Free ref_emb cache.
+    if (session.buf_ref) {
+        ggml_backend_buffer_free(session.buf_ref);
+        session.buf_ref = nullptr;
+    }
+    if (session.ctx_ref) {
+        ggml_free(session.ctx_ref);
+        session.ctx_ref = nullptr;
+    }
+    session.ref_emb   = nullptr;
+    session.ref_T_ref = 0;
+
     if (session.alloc_dec) {
         ggml_gallocr_free(session.alloc_dec);
         session.alloc_dec = nullptr;
@@ -292,6 +305,162 @@ struct ggml_tensor * t2s_session_get_y_dec(const t2s_session & session) {
 
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session) {
     return session.gf_dec;
+}
+
+// ---------------------------------------------------------------------------
+// Reference embedding
+// ---------------------------------------------------------------------------
+
+struct ggml_tensor * t2s_session_get_ref_emb(const t2s_session & session) {
+    return session.ref_emb;
+}
+
+int64_t t2s_session_get_ref_T_ref(const t2s_session & session) {
+    return session.ref_T_ref;
+}
+
+bool t2s_session_compute_ref_emb(t2s_session       & session,
+                                  const t2s_model   & model,
+                                  const int32_t     * ref_token_data,
+                                  int64_t             T_ref,
+                                  const float       * ref_bert_data,
+                                  const float       * hubert_data,
+                                  int64_t             T_hub)
+{
+    GGML_ASSERT(session.backend != nullptr);
+    GGML_ASSERT(ref_token_data != nullptr);
+    GGML_ASSERT(ref_bert_data  != nullptr);
+    GGML_ASSERT(hubert_data    != nullptr);
+    GGML_ASSERT(T_ref > 0);
+    GGML_ASSERT(T_hub > 0);
+
+    const int64_t d_model    = (int64_t) model.hparams.hidden_dim;
+    const int64_t bert_dim   = 1024;
+    const int64_t hubert_dim = 768;
+
+    // --- Temporary graph context ---
+    const size_t n_intermediates = 64;
+    const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 4) +
+                         ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    struct ggml_context * ctx_tmp = ggml_init(params);
+    if (!ctx_tmp) {
+        fprintf(stderr, "%s: ggml_init() for temp context failed\n", __func__);
+        return false;
+    }
+
+    // --- Input tensors ---
+    struct ggml_tensor * ref_token_tensor = ggml_new_tensor_1d(ctx_tmp, GGML_TYPE_I32, T_ref);
+    ggml_set_name(ref_token_tensor, "ref_token");
+    ggml_set_input(ref_token_tensor);
+
+    struct ggml_tensor * ref_bert_tensor = ggml_new_tensor_2d(ctx_tmp, GGML_TYPE_F32, bert_dim, T_ref);
+    ggml_set_name(ref_bert_tensor, "ref_bert");
+    ggml_set_input(ref_bert_tensor);
+
+    struct ggml_tensor * hubert_tensor = ggml_new_tensor_2d(ctx_tmp, GGML_TYPE_F32, hubert_dim, T_hub);
+    ggml_set_name(hubert_tensor, "hubert");
+    ggml_set_input(hubert_tensor);
+
+    // --- Build graph ---
+    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx_tmp, graph_size, false);
+
+    struct ggml_tensor * result = t2s_embed_ref_forward(
+        ctx_tmp,
+        ref_token_tensor,
+        ref_bert_tensor,
+        hubert_tensor,
+        model.weights.extract_latent,
+        model.weights.embed);
+
+    ggml_set_name(result, "ref_emb_out");
+    ggml_set_output(result);
+    ggml_build_forward_expand(gf, result);
+
+    // --- Allocate and execute ---
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
+    ggml_gallocr_t alloc = ggml_gallocr_new(buft);
+    if (!alloc) {
+        fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
+        ggml_free(ctx_tmp);
+        return false;
+    }
+
+    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
+        fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx_tmp);
+        return false;
+    }
+
+    ggml_backend_tensor_set(ref_token_tensor, ref_token_data,
+                            0, (size_t) T_ref * sizeof(int32_t));
+    ggml_backend_tensor_set(ref_bert_tensor, ref_bert_data,
+                            0, (size_t) bert_dim * T_ref * sizeof(float));
+    ggml_backend_tensor_set(hubert_tensor, hubert_data,
+                            0, (size_t) hubert_dim * T_hub * sizeof(float));
+
+    if (ggml_backend_graph_compute(session.backend, gf) != GGML_STATUS_SUCCESS) {
+        fprintf(stderr, "%s: ggml_backend_graph_compute() failed\n", __func__);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx_tmp);
+        return false;
+    }
+
+    // --- Create persistent tensor and copy result ---
+    const int64_t out_d = result->ne[0];
+    const int64_t out_T = result->ne[1];
+
+    struct ggml_init_params ref_params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    session.ctx_ref = ggml_init(ref_params);
+    if (!session.ctx_ref) {
+        fprintf(stderr, "%s: ggml_init() for ref context failed\n", __func__);
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx_tmp);
+        return false;
+    }
+
+    session.ref_emb = ggml_new_tensor_2d(session.ctx_ref, GGML_TYPE_F32, out_d, out_T);
+    ggml_set_name(session.ref_emb, "ref_emb");
+
+    session.buf_ref = ggml_backend_alloc_ctx_tensors(session.ctx_ref, session.backend);
+    if (!session.buf_ref) {
+        fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() for ref failed\n", __func__);
+        session.ctx_ref = nullptr;
+        session.ref_emb = nullptr;
+        ggml_gallocr_free(alloc);
+        ggml_free(ctx_tmp);
+        return false;
+    }
+
+    // Copy: result (temp alloc) -> session.ref_emb (persistent alloc).
+    {
+        const size_t nbytes = ggml_nbytes(result);
+        std::vector<uint8_t> tmp_buf(nbytes);
+        ggml_backend_tensor_get(result, tmp_buf.data(), 0, nbytes);
+        ggml_backend_tensor_set(session.ref_emb, tmp_buf.data(), 0, nbytes);
+    }
+
+    session.ref_T_ref = T_ref;
+
+    // --- Free temporaries ---
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx_tmp);
+
+    fprintf(stderr, "%s: cached ref_emb {%lld, %lld} (T_ref=%lld)\n",
+            __func__, (long long) out_d, (long long) out_T, (long long) T_ref);
+    return true;
 }
 
 } // namespace gpt_sovits

@@ -35,8 +35,8 @@ Tensor mapping (checkpoint name → GGUF name):
     model.ar_predict_layer.weight                  → sampler.lm_head_w
 
   SoVITS extract latent:
-    enc_p.ssl_proj.weight                          → extract_latent.ssl_proj_w
-    enc_p.ssl_proj.bias                            → extract_latent.ssl_proj_b
+    ssl_proj.weight                                → extract_latent.ssl_proj_w
+    ssl_proj.bias                                  → extract_latent.ssl_proj_b
     quantizer.vq.layers.0._codebook.embed          → extract_latent.codebook
 
 All tensors are stored as-is (PyTorch layout); GGUF's dim-reversal produces
@@ -121,8 +121,8 @@ T2S_SAMPLER_MAP = [
 ]
 
 SOVITS_EXTRACT_LATENT_MAP = [
-    ("extract_latent.ssl_proj_w", "enc_p.ssl_proj.weight"),
-    ("extract_latent.ssl_proj_b", "enc_p.ssl_proj.bias"),
+    ("extract_latent.ssl_proj_w", "ssl_proj.weight"),
+    ("extract_latent.ssl_proj_b", "ssl_proj.bias"),
     ("extract_latent.codebook",   "quantizer.vq.layers.0._codebook.embed"),
 ]
 
@@ -211,9 +211,13 @@ def convert(t2s_path: str, sovits_path: str, output_path: str, dtype_str: str) -
             gguf_writer.add_tensor(gguf_name, quantized, raw_dtype=target_type)
             n_quantized += 1
             data_type = target_type
-        elif (is_quantized or target_type == gguf.GGMLQuantizationType.F16) and tensor_np.ndim >= 2:
+        elif ((is_quantized or target_type == gguf.GGMLQuantizationType.F16)
+              and tensor_np.ndim >= 2
+              and gguf_name != "extract_latent.codebook"):
             # 2D+ tensors: store as f16 to save space.
             # This covers embedding tables, Linear weights, and Conv1d kernels.
+            # Exception: codebook stays F32 because ggml_sum_rows (used for
+            # nearest-code distance computation) only supports F32.
             tensor_np = tensor_np.astype(np.float16)
             data_type = gguf.GGMLQuantizationType.F16
             gguf_writer.add_tensor(gguf_name, tensor_np, raw_dtype=data_type)

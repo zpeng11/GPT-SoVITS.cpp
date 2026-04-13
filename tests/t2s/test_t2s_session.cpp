@@ -536,3 +536,134 @@ TEST(T2SSession, InitQuantizedKVCache) {
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
 }
+
+// ---------------------------------------------------------------------------
+// Reference embedding caching
+// ---------------------------------------------------------------------------
+
+TEST(T2SSession, RefEmbNotCachedInitially) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, 2, 16));
+
+    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_emb(session), nullptr);
+    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_ref(session), 0);
+
+    gpt_sovits::t2s_session_free(session);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SSession, ComputeRefEmbWithModel) {
+    const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) GTEST_SKIP() << "Model file not found: " << path;
+    fclose(f);
+
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_model model;
+    ASSERT_TRUE(gpt_sovits::t2s_model_load(path, model, backend));
+
+    // Skip if model extract_latent weights are incompatible (e.g. kernel_size != 2).
+    if (model.weights.extract_latent.ssl_proj_w->ne[0] != 2) {
+        gpt_sovits::t2s_model_free(model);
+        ggml_backend_free(backend);
+        GTEST_SKIP() << "Model extract_latent weights have incompatible shape";
+    }
+
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, 2, 32));
+
+    const int64_t T_ref       = 5;
+    const int64_t T_hub       = 50;
+    const int64_t d_model     = model.hparams.hidden_dim;
+    const int64_t bert_dim    = 1024;
+    const int64_t hubert_dim  = 768;
+
+    std::vector<int32_t> ref_tokens(T_ref, 1);
+    std::vector<float>   ref_bert(bert_dim * T_ref, 0.1f);
+    std::vector<float>   hubert(hubert_dim * T_hub, 0.5f);
+
+    bool ok = gpt_sovits::t2s_session_compute_ref_emb(
+        session, model,
+        ref_tokens.data(), T_ref,
+        ref_bert.data(),
+        hubert.data(), T_hub);
+    ASSERT_TRUE(ok);
+
+    // Verify cached tensor shape.
+    struct ggml_tensor * ref_emb = gpt_sovits::t2s_session_get_ref_emb(session);
+    ASSERT_NE(ref_emb, nullptr);
+    EXPECT_EQ(ref_emb->ne[0], d_model);
+
+    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_ref(session), T_ref);
+
+    // T_prompt = floor((T_hub - kernel_size) / stride) + 1 = (50-2)/2+1 = 25
+    int64_t T_prompt = (T_hub - 2) / 2 + 1;
+    EXPECT_EQ(ref_emb->ne[1], T_ref + T_prompt);
+
+    // Verify data is non-zero after computation.
+    const size_t nbytes = ggml_nbytes(ref_emb);
+    std::vector<float> data(nbytes / sizeof(float));
+    ggml_backend_tensor_get(ref_emb, data.data(), 0, nbytes);
+    bool any_nonzero = false;
+    for (float v : data) {
+        if (v != 0.0f) { any_nonzero = true; break; }
+    }
+    EXPECT_TRUE(any_nonzero) << "ref_emb should have non-zero values after computation";
+
+    // Cleanup.
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SSession, SessionFreeCleansRefEmb) {
+    const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) GTEST_SKIP() << "Model file not found: " << path;
+    fclose(f);
+
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_model model;
+    ASSERT_TRUE(gpt_sovits::t2s_model_load(path, model, backend));
+
+    // Skip if model extract_latent weights are incompatible.
+    if (model.weights.extract_latent.ssl_proj_w->ne[0] != 2) {
+        gpt_sovits::t2s_model_free(model);
+        ggml_backend_free(backend);
+        GTEST_SKIP() << "Model extract_latent weights have incompatible shape";
+    }
+
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, 2, 32));
+
+    const int64_t T_ref      = 3;
+    const int64_t T_hub      = 20;
+    const int64_t bert_dim   = 1024;
+    const int64_t hubert_dim = 768;
+
+    std::vector<int32_t> tokens(T_ref, 1);
+    std::vector<float>   bert(bert_dim * T_ref, 0.1f);
+    std::vector<float>   hubert(hubert_dim * T_hub, 0.5f);
+
+    ASSERT_TRUE(gpt_sovits::t2s_session_compute_ref_emb(
+        session, model, tokens.data(), T_ref, bert.data(), hubert.data(), T_hub));
+
+    EXPECT_NE(gpt_sovits::t2s_session_get_ref_emb(session), nullptr);
+
+    // session_free should clean up ref_emb without crash.
+    gpt_sovits::t2s_session_free(session);
+
+    // Double free should also be safe.
+    gpt_sovits::t2s_session_free(session);
+
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}

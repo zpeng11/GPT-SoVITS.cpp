@@ -372,6 +372,12 @@ struct t2s_session {
     struct ggml_tensor  * x_dec     = nullptr;  // input  {d_model, n_batch} F32
     struct ggml_tensor  * y_dec     = nullptr;  // output {d_model, n_batch} F32
     ggml_gallocr_t        alloc_dec = nullptr;  // owned — pre-allocates intermediate storage
+
+    // Reference embedding (owned, computed once per session)
+    struct ggml_context  * ctx_ref    = nullptr;  // owned - holds ref_emb tensor
+    ggml_backend_buffer_t  buf_ref    = nullptr;  // owned - data buffer for ref_emb
+    struct ggml_tensor   * ref_emb    = nullptr;  // cached {d_model, T_ref + T_prompt}
+    int64_t                ref_T_ref  = 0;        // ref text token count (input pos offset)
 };
 
 // Initialize a T2S inference session with pre-allocated KV caches.
@@ -432,5 +438,35 @@ bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & mod
 struct ggml_tensor * t2s_session_get_x_dec(const t2s_session & session);
 struct ggml_tensor * t2s_session_get_y_dec(const t2s_session & session);
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session);
+
+// Compute and cache the reference embedding in the session.
+//
+// Accepts raw host data pointers for all inputs. Internally builds a temporary
+// graph, executes it, and copies the result to a session-owned persistent tensor.
+// Call once after session init; one session = one ref.
+//
+// Parameters:
+//   session     - initialized T2S session
+//   model       - loaded T2S model (weights are read, not modified)
+//   ref_token   - reference phoneme token ids       {T_ref}  (i32), host pointer
+//   T_ref       - number of reference text tokens
+//   ref_bert    - reference BERT features            {1024, T_ref}, host pointer (F32)
+//   hubert_data - HuBERT features from ref audio     {768, T_hub}, host pointer (F32)
+//   T_hub       - number of HuBERT time frames
+//
+// Returns true on success, false on failure.
+bool t2s_session_compute_ref_emb(t2s_session       & session,
+                                  const t2s_model   & model,
+                                  const int32_t     * ref_token,
+                                  int64_t             T_ref,
+                                  const float       * ref_bert,
+                                  const float       * hubert_data,
+                                  int64_t             T_hub);
+
+// Get the cached reference embedding tensor, or nullptr if not computed.
+struct ggml_tensor * t2s_session_get_ref_emb(const t2s_session & session);
+
+// Get the cached T_ref (number of reference text tokens), or 0 if not computed.
+int64_t t2s_session_get_ref_T_ref(const t2s_session & session);
 
 } // namespace gpt_sovits
