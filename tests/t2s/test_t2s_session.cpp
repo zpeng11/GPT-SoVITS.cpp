@@ -496,3 +496,43 @@ TEST(T2SSession, MultiSlotKvPos) {
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
 }
+
+// ---------------------------------------------------------------------------
+// Quantized KV cache
+// ---------------------------------------------------------------------------
+
+TEST(T2SSession, InitQuantizedKVCache) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 16;
+
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend,
+                                              n_batch, slot_size, GGML_TYPE_Q8_0));
+
+    const int64_t d_model = hparams.hidden_dim;
+    const int64_t max_ctx = (int64_t) n_batch * slot_size;
+
+    // Shapes are unchanged (ne[] counts elements, not bytes).
+    for (uint32_t i = 0; i < hparams.n_layer; i++) {
+        expect_shape(session.k_caches[i], {d_model, max_ctx});
+        expect_shape(session.v_caches[i], {d_model, max_ctx});
+        EXPECT_EQ(session.k_caches[i]->type, GGML_TYPE_Q8_0);
+        EXPECT_EQ(session.v_caches[i]->type, GGML_TYPE_Q8_0);
+    }
+
+    EXPECT_EQ(session.kv_cache_type, GGML_TYPE_Q8_0);
+
+    // Slot management should work the same.
+    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
+    ASSERT_EQ(s0, 0);
+    gpt_sovits::t2s_session_slot_decode_step(session, s0);
+    EXPECT_EQ(read_kv_pos(session, s0), 3);
+
+    gpt_sovits::t2s_session_free(session);
+    ggml_backend_free(backend);
+}

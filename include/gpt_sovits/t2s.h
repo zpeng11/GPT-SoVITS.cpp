@@ -358,6 +358,9 @@ struct t2s_session {
     // Linear indexing: mask_host[col * max_ctx + row] corresponds to mask(row, col).
     std::vector<ggml_fp16_t> mask_host;
 
+    // KV cache element type (default F32; can be set to Q8_0 etc. for memory savings)
+    enum ggml_type kv_cache_type = GGML_TYPE_F32;
+
     // ggml resources -- managed by t2s_session_free()
     ggml_backend_t        backend = nullptr;  // borrowed
     ggml_backend_buffer_t buf_kv  = nullptr;  // owned
@@ -385,7 +388,8 @@ bool t2s_session_init(t2s_session      & session,
                       const t2s_hparams & hparams,
                       ggml_backend_t     backend,
                       uint32_t           n_batch,
-                      uint32_t           slot_size);
+                      uint32_t           slot_size,
+                      enum ggml_type     kv_cache_type = GGML_TYPE_F32);
 
 // Free all resources owned by a T2S session.
 void t2s_session_free(t2s_session & session);

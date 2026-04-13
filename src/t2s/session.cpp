@@ -30,13 +30,16 @@ bool t2s_session_init(t2s_session      & session,
                       const t2s_hparams & hparams,
                       ggml_backend_t     backend,
                       uint32_t           n_batch,
-                      uint32_t           slot_size)
+                      uint32_t           slot_size,
+                      enum ggml_type     kv_cache_type)
 {
     GGML_ASSERT(backend != nullptr);
     if (n_batch == 0 || slot_size == 0) {
         fprintf(stderr, "%s: n_batch and slot_size must be > 0\n", __func__);
         return false;
     }
+
+    session.kv_cache_type = kv_cache_type;
 
     const uint32_t n_layer  = hparams.n_layer;
     const int64_t  d_model  = (int64_t) hparams.hidden_dim;
@@ -62,8 +65,8 @@ bool t2s_session_init(t2s_session      & session,
     session.v_caches.resize(n_layer);
 
     for (uint32_t i = 0; i < n_layer; i++) {
-        session.k_caches[i] = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, d_model, max_ctx);
-        session.v_caches[i] = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, d_model, max_ctx);
+        session.k_caches[i] = ggml_new_tensor_2d(session.ctx_kv, session.kv_cache_type, d_model, max_ctx);
+        session.v_caches[i] = ggml_new_tensor_2d(session.ctx_kv, session.kv_cache_type, d_model, max_ctx);
     }
 
     session.kv_pos = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, n_batch);
