@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "ggml-alloc.h"
 #include "ggml-backend.h"
 
 #include <cstdint>
@@ -317,5 +318,104 @@ bool t2s_model_load(const std::string & fname, t2s_model & model, ggml_backend_t
 
 // Free all resources owned by a T2S model.
 void t2s_model_free(t2s_model & model);
+
+// ---------------------------------------------------------------------------
+// T2S session: pre-allocated KV caches and slot management
+// ---------------------------------------------------------------------------
+
+// Manages pre-allocated KV caches for all transformer layers, designed for
+// CUDA Graph compatibility (fixed tensor shapes across all steps).
+//
+// Layout:
+//   K/V cache per layer:  {d_model, n_batch * slot_size}
+//   Slot i occupies:      columns [i * slot_size, (i+1) * slot_size)
+//   kv_pos:               {slot_size} I32
+//   mask:                 {n_batch * slot_size, n_batch} F16
+struct t2s_session {
+    // Configuration (set at init, immutable)
+    uint32_t n_batch   = 0;
+    uint32_t slot_size = 0;
+
+    // Per-slot state
+    struct slot_state {
+        bool in_use = false;
+        int  n_pos  = 0;
+    };
+    std::vector<slot_state> slots;
+
+    // Per-layer KV caches
+    std::vector<struct ggml_tensor *> k_caches;  // [n_layer]
+    std::vector<struct ggml_tensor *> v_caches;  // [n_layer]
+
+    // Shared input tensors (caller fills before graph build)
+    struct ggml_tensor * kv_pos = nullptr;  // {slot_size} I32
+    // Decode-only mask. Each column corresponds to one query token and masks
+    // out all KV positions outside that query's own slot, providing per-slot
+    // isolation during batch decode. NOT suitable for prefill.
+    struct ggml_tensor * mask   = nullptr;  // {n_batch * slot_size, n_batch} F16
+
+    // ggml resources -- managed by t2s_session_free()
+    ggml_backend_t        backend = nullptr;  // borrowed
+    ggml_backend_buffer_t buf_kv  = nullptr;  // owned
+    struct ggml_context * ctx_kv  = nullptr;  // owned
+
+    // Decode computation graph (built by t2s_session_build_decode_graph)
+    struct ggml_context * ctx_graph = nullptr;  // owned
+    struct ggml_cgraph  * gf_dec    = nullptr;  // owned
+    struct ggml_tensor  * x_dec     = nullptr;  // input  {d_model, n_batch} F32
+    struct ggml_tensor  * y_dec     = nullptr;  // output {d_model, n_batch} F32
+    ggml_gallocr_t        alloc_dec = nullptr;  // owned — pre-allocates intermediate storage
+};
+
+// Initialize a T2S inference session with pre-allocated KV caches.
+//
+// Parameters:
+//   session   - output session struct (will be populated)
+//   hparams   - model hyperparameters (d_model, n_layer, etc.)
+//   backend   - ggml backend for tensor allocation (borrowed, not freed)
+//   n_batch   - number of concurrent request slots
+//   slot_size - maximum tokens per request slot
+//
+// Returns true on success, false on failure (with errors printed to stderr).
+bool t2s_session_init(t2s_session      & session,
+                      const t2s_hparams & hparams,
+                      ggml_backend_t     backend,
+                      uint32_t           n_batch,
+                      uint32_t           slot_size);
+
+// Free all resources owned by a T2S session.
+void t2s_session_free(t2s_session & session);
+
+// Allocate an available slot. Returns slot ID (0-based) or -1 if full.
+int t2s_session_slot_alloc(t2s_session & session);
+
+// Release a slot, making it available for reuse.
+void t2s_session_slot_release(t2s_session & session, int slot_id);
+
+// Get the current number of valid tokens in a slot.
+int t2s_session_slot_n_pos(const t2s_session & session, int slot_id);
+
+// Accessor helpers for graph building.
+struct t2s_layer_caches {
+    struct ggml_tensor * k;
+    struct ggml_tensor * v;
+};
+
+t2s_layer_caches  t2s_session_get_layer_caches(const t2s_session & session, int layer);
+struct ggml_tensor * t2s_session_get_kv_pos(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_mask(const t2s_session & session);
+
+// Total KV entries for attention readback (always n_batch * slot_size).
+int t2s_session_get_n_kv(const t2s_session & session);
+
+// Build the 24-layer decode computation graph.
+// Must be called after t2s_session_init. Takes t2s_model for attention weights.
+// N = n_batch (one token per slot per step).
+bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & model);
+
+// Accessors for the decode graph.
+struct ggml_tensor * t2s_session_get_x_dec(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_y_dec(const t2s_session & session);
+struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session);
 
 } // namespace gpt_sovits
