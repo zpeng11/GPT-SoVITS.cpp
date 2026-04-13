@@ -431,3 +431,68 @@ TEST(T2SSession, SlotReuseMask) {
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
 }
+
+// ---------------------------------------------------------------------------
+// kv_pos management
+// ---------------------------------------------------------------------------
+
+static int32_t read_kv_pos(const gpt_sovits::t2s_session & session, int slot_id) {
+    int32_t val = -1;
+    ggml_backend_tensor_get(session.kv_pos, &val,
+                            slot_id * sizeof(int32_t), sizeof(int32_t));
+    return val;
+}
+
+TEST(T2SSession, SlotDecodeStepKvPos) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 16;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
+    ASSERT_EQ(s0, 0);
+
+    // First decode step: kv_pos[0] = 0 * slot_size + 3 = 3
+    gpt_sovits::t2s_session_slot_decode_step(session, s0);
+    EXPECT_EQ(read_kv_pos(session, s0), 3);
+
+    // Second decode step: kv_pos[0] = 0 * slot_size + 4 = 4
+    gpt_sovits::t2s_session_slot_decode_step(session, s0);
+    EXPECT_EQ(read_kv_pos(session, s0), 4);
+
+    gpt_sovits::t2s_session_free(session);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SSession, MultiSlotKvPos) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 16;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 2);
+    ASSERT_EQ(s0, 0);
+    int s1 = gpt_sovits::t2s_session_slot_alloc(session, 5);
+    ASSERT_EQ(s1, 1);
+
+    gpt_sovits::t2s_session_slot_decode_step(session, s0);
+    gpt_sovits::t2s_session_slot_decode_step(session, s1);
+
+    // slot 0: kv_pos[0] = 0 * 16 + 2 = 2
+    EXPECT_EQ(read_kv_pos(session, s0), 2);
+    // slot 1: kv_pos[1] = 1 * 16 + 5 = 21
+    EXPECT_EQ(read_kv_pos(session, s1), 21);
+
+    gpt_sovits::t2s_session_free(session);
+    ggml_backend_free(backend);
+}

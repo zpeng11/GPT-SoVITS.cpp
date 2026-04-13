@@ -197,6 +197,11 @@ void t2s_session_slot_decode_step(t2s_session & session, int slot_id) {
     session.mask_host[slot_id * max_ctx + row] = ggml_fp32_to_fp16(0.0f);
     mask_upload_range(session, slot_id, row, 1);
 
+    // Set kv_pos for this slot so the graph scatter-writes at the correct column.
+    const int32_t write_pos = row;
+    ggml_backend_tensor_set(session.kv_pos, &write_pos,
+                            slot_id * sizeof(int32_t), sizeof(int32_t));
+
     session.slots[slot_id].n_pos++;
 }
 
