@@ -4,9 +4,27 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <cmath>
 #include <cstdio>
 
 namespace gpt_sovits {
+
+// ---------------------------------------------------------------------------
+// Mask helpers (internal)
+// ---------------------------------------------------------------------------
+
+// mask_host linear indexing: mask_host[col * max_ctx + row] corresponds to
+// tensor element mask(row, col).  Column col is contiguous in memory.
+
+static void mask_upload_range(t2s_session & session, int slot_id,
+                              int64_t start_row, int64_t count) {
+    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+    const size_t  offset  = (size_t)(slot_id * max_ctx + start_row) * sizeof(ggml_fp16_t);
+    const size_t  size    = (size_t) count * sizeof(ggml_fp16_t);
+    ggml_backend_tensor_set(session.mask,
+                            &session.mask_host[slot_id * max_ctx + start_row],
+                            offset, size);
+}
 
 bool t2s_session_init(t2s_session      & session,
                       const t2s_hparams & hparams,
@@ -69,6 +87,16 @@ bool t2s_session_init(t2s_session      & session,
         ggml_backend_tensor_set(session.kv_pos, zeros.data(), 0, slot_size * sizeof(int32_t));
     }
 
+    // Initialize mask_host to all -inf and upload.
+    {
+        const size_t mask_n = (size_t) max_ctx * n_batch;
+        session.mask_host.resize(mask_n);
+        ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        std::fill(session.mask_host.begin(), session.mask_host.end(), neg_inf);
+        ggml_backend_tensor_set(session.mask, session.mask_host.data(),
+                                0, mask_n * sizeof(ggml_fp16_t));
+    }
+
     session.n_batch   = n_batch;
     session.slot_size = slot_size;
     session.slots.resize(n_batch);
@@ -107,14 +135,29 @@ void t2s_session_free(t2s_session & session) {
     session.kv_pos = nullptr;
     session.mask   = nullptr;
     session.x_dec  = nullptr;
+    session.mask_host.clear();
 }
 
-int t2s_session_slot_alloc(t2s_session & session) {
+int t2s_session_slot_alloc(t2s_session & session, int n_pos) {
     for (size_t i = 0; i < session.slots.size(); i++) {
         if (!session.slots[i].in_use) {
-            session.slots[i].in_use = true;
-            session.slots[i].n_pos  = 0;
-            return (int) i;
+            const int slot_id = (int) i;
+            session.slots[slot_id].in_use = true;
+            session.slots[slot_id].n_pos  = n_pos;
+
+            // Update mask_host: reveal [slot_id*slot_size, slot_id*slot_size+n_pos)
+            // in column slot_id.
+            if (n_pos > 0) {
+                const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+                const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+                for (int k = 0; k < n_pos; k++) {
+                    session.mask_host[slot_id * max_ctx + slot_id * session.slot_size + k] = zero;
+                }
+                mask_upload_range(session, slot_id,
+                                  slot_id * session.slot_size, n_pos);
+            }
+
+            return slot_id;
         }
     }
     return -1;
@@ -122,6 +165,18 @@ int t2s_session_slot_alloc(t2s_session & session) {
 
 void t2s_session_slot_release(t2s_session & session, int slot_id) {
     GGML_ASSERT(slot_id >= 0 && (size_t) slot_id < session.slots.size());
+
+    // Mask out the slot's entire region in column slot_id.
+    {
+        const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        for (uint32_t k = 0; k < session.slot_size; k++) {
+            session.mask_host[slot_id * max_ctx + slot_id * session.slot_size + k] = neg_inf;
+        }
+        mask_upload_range(session, slot_id,
+                          slot_id * session.slot_size, session.slot_size);
+    }
+
     session.slots[slot_id].in_use = false;
     session.slots[slot_id].n_pos  = 0;
 }
@@ -129,6 +184,20 @@ void t2s_session_slot_release(t2s_session & session, int slot_id) {
 int t2s_session_slot_n_pos(const t2s_session & session, int slot_id) {
     GGML_ASSERT(slot_id >= 0 && (size_t) slot_id < session.slots.size());
     return session.slots[slot_id].n_pos;
+}
+
+void t2s_session_slot_decode_step(t2s_session & session, int slot_id) {
+    GGML_ASSERT(slot_id >= 0 && (size_t) slot_id < session.slots.size());
+    GGML_ASSERT(session.slots[slot_id].in_use);
+    GGML_ASSERT(session.slots[slot_id].n_pos < (int) session.slot_size);
+
+    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+    const int     row     = slot_id * session.slot_size + session.slots[slot_id].n_pos;
+
+    session.mask_host[slot_id * max_ctx + row] = ggml_fp32_to_fp16(0.0f);
+    mask_upload_range(session, slot_id, row, 1);
+
+    session.slots[slot_id].n_pos++;
 }
 
 t2s_layer_caches t2s_session_get_layer_caches(const t2s_session & session, int layer) {

@@ -354,6 +354,10 @@ struct t2s_session {
     // isolation during batch decode. NOT suitable for prefill.
     struct ggml_tensor * mask   = nullptr;  // {n_batch * slot_size, n_batch} F16
 
+    // CPU-side mask mirror for incremental updates.
+    // Linear indexing: mask_host[col * max_ctx + row] corresponds to mask(row, col).
+    std::vector<ggml_fp16_t> mask_host;
+
     // ggml resources -- managed by t2s_session_free()
     ggml_backend_t        backend = nullptr;  // borrowed
     ggml_backend_buffer_t buf_kv  = nullptr;  // owned
@@ -386,11 +390,18 @@ bool t2s_session_init(t2s_session      & session,
 // Free all resources owned by a T2S session.
 void t2s_session_free(t2s_session & session);
 
-// Allocate an available slot. Returns slot ID (0-based) or -1 if full.
-int t2s_session_slot_alloc(t2s_session & session);
+// Allocate an available slot with n_pos prefilled tokens.
+// Updates mask to allow attending to the prefilled positions.
+// Returns slot ID (0-based) or -1 if full.
+int t2s_session_slot_alloc(t2s_session & session, int n_pos);
 
 // Release a slot, making it available for reuse.
+// Masks out the slot's entire column in the decode mask.
 void t2s_session_slot_release(t2s_session & session, int slot_id);
+
+// Advance a slot by one decode step.
+// Increments n_pos and reveals the newly written KV position in the mask.
+void t2s_session_slot_decode_step(t2s_session & session, int slot_id);
 
 // Get the current number of valid tokens in a slot.
 int t2s_session_slot_n_pos(const t2s_session & session, int slot_id);
