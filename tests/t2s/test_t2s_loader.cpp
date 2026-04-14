@@ -53,10 +53,10 @@ TEST(T2SLoader, LoadF16Model) {
     EXPECT_EQ(model.hparams.eos, 1024u);
 
     // --- extract latent ---
-    // v2ProPlus uses inter_channels=192 (not 768)
+    // ssl_proj: Conv1d(768, 768, kernel=2, stride=2) from top-level ssl_proj.weight
     auto & el = model.weights.extract_latent;
-    expect_shape(el.ssl_proj_w, {1, 768, 192});
-    expect_shape(el.ssl_proj_b, {192});
+    expect_shape(el.ssl_proj_w, {2, 768, 768});
+    expect_shape(el.ssl_proj_b, {768});
     expect_shape(el.codebook,   {768, 1024});
 
     // --- encoder ---
