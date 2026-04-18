@@ -429,9 +429,14 @@ struct ggml_tensor * t2s_session_get_mask(const t2s_session & session);
 // Total KV entries for attention readback (always n_batch * slot_size).
 int t2s_session_get_n_kv(const t2s_session & session);
 
-// Build the 24-layer decode computation graph.
-// Must be called after t2s_session_init. Takes t2s_model for attention weights.
-// N = n_batch (one token per slot per step).
+// Build a *persistent* decode graph for this session.  Call exactly once
+// after t2s_session_init; the graph is stored in the session and reused for
+// every subsequent decode step.
+//
+// IMPORTANT — this graph assumes **all** `n_batch` slots are occupied and
+// every slot is in the single-token decode phase (one new token per slot
+// per invocation).  It is NOT suitable for prefill where a slot may consume
+// many tokens at once.
 bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & model);
 
 // Accessors for the decode graph.
