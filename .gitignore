@@ -24,6 +24,7 @@ Thumbs.db
 
 # Generated
 compile_commands.json
+.cache/
 
 # Python
 __pycache__/
