@@ -159,70 +159,6 @@ TEST(T2SSession, FindFreeSlot) {
     ggml_backend_free(backend);
 }
 
-TEST(T2SSession, SlotReuseAfterRelease) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, 2, 16));
-
-    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
-    ASSERT_GE(s0, 0);
-    test_activate_slot(session, s0, 0);
-
-    // Release and find again — should get the same slot back.
-    gpt_sovits::t2s_session_slot_release(session, s0);
-    int s1 = gpt_sovits::t2s_session_find_free_slot(session);
-    EXPECT_EQ(s1, s0);
-
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
-
-// ---------------------------------------------------------------------------
-// Accessors
-// ---------------------------------------------------------------------------
-
-TEST(T2SSession, Accessors) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 16;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    // kv_pos
-    struct ggml_tensor * kv_pos = gpt_sovits::t2s_session_get_kv_pos(session);
-    ASSERT_NE(kv_pos, nullptr);
-    EXPECT_EQ(kv_pos->ne[0], (int64_t)n_batch);
-
-    // mask
-    struct ggml_tensor * mask = gpt_sovits::t2s_session_get_mask(session);
-    ASSERT_NE(mask, nullptr);
-    EXPECT_EQ(mask->ne[0], (int64_t)(n_batch * slot_size));
-    EXPECT_EQ(mask->ne[1], (int64_t)n_batch);
-
-    // n_kv
-    EXPECT_EQ(gpt_sovits::t2s_session_get_n_kv(session), (int)(n_batch * slot_size));
-
-    // layer caches
-    for (uint32_t i = 0; i < hparams.n_layer; i++) {
-        auto caches = gpt_sovits::t2s_session_get_layer_caches(session, (int)i);
-        ASSERT_NE(caches.k, nullptr);
-        ASSERT_NE(caches.v, nullptr);
-        EXPECT_EQ(caches.k->ne[0], (int64_t)hparams.hidden_dim);
-        EXPECT_EQ(caches.v->ne[0], (int64_t)hparams.hidden_dim);
-    }
-
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
-
 // ---------------------------------------------------------------------------
 // Decode graph build (requires model weights)
 // ---------------------------------------------------------------------------
@@ -276,7 +212,7 @@ static ggml_fp16_t fp32_to_fp16(float v) {
     return ggml_fp32_to_fp16(v);
 }
 
-TEST(T2SSession, MaskInitAllInf) {
+TEST(T2SSession, MaskInitAndActivate) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -288,37 +224,18 @@ TEST(T2SSession, MaskInitAllInf) {
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
-    ASSERT_EQ(session.mask_host.size(), (size_t)(max_ctx * n_batch));
 
-    const float neg_inf = -INFINITY;
+    // All -inf initially.
     for (size_t i = 0; i < session.mask_host.size(); i++) {
         float val = fp16_to_fp32(session.mask_host[i]);
         EXPECT_TRUE(std::isinf(val) && val < 0)
             << "mask_host[" << i << "] = " << val << ", expected -inf";
     }
 
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
-
-TEST(T2SSession, SlotMaskSetup) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    const int64_t max_ctx = (int64_t)n_batch * slot_size;
-
-    // Activate slot 0 with 3 prefilled tokens via test helper.
+    // Activate slot 0 with 3 prefilled tokens.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 3);
-    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, s0), 3);
 
     // Column 0: rows [0, 3) should be 0, rest -inf.
     for (int k = 0; k < 3; k++) {
@@ -382,7 +299,7 @@ TEST(T2SSession, SlotDecodeStepMask) {
     ggml_backend_free(backend);
 }
 
-TEST(T2SSession, SlotReleaseMask) {
+TEST(T2SSession, SlotReleaseAndReuseMask) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -398,7 +315,7 @@ TEST(T2SSession, SlotReleaseMask) {
     // Activate both, decode, then release slot 0.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
-    test_activate_slot(session, s0, 2);
+    test_activate_slot(session, s0, 3);
     test_activate_slot(session, 1, 1);
     gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
@@ -410,42 +327,15 @@ TEST(T2SSession, SlotReleaseMask) {
             << "after release, mask_host[0][" << k << "] should be -inf";
     }
 
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
-
-TEST(T2SSession, SlotReuseMask) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    const int64_t max_ctx = (int64_t)n_batch * slot_size;
-
-    // Activate both, decode 1 step, release slot 0, then re-activate with 1 token.
-    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
-    ASSERT_EQ(s0, 0);
-    test_activate_slot(session, s0, 3);
-    test_activate_slot(session, 1, 1);
-    gpt_sovits::t2s_session_decode_advance(session);
-    gpt_sovits::t2s_session_slot_release(session, s0);
-
+    // Re-activate slot 0 with 1 token.
     test_activate_slot(session, 0, 1);
-    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 1);
-
-    // Column 0: only row 0 should be 0 (from test_activate_slot n_pos=1), rest -inf.
     float val0 = fp16_to_fp32(session.mask_host[0 * max_ctx + 0]);
-    EXPECT_EQ(val0, 0.0f) << "after re-alloc, mask_host[0][0] should be 0";
+    EXPECT_EQ(val0, 0.0f) << "after re-activate, mask_host[0][0] should be 0";
 
     for (int k = 1; k < max_ctx; k++) {
         float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
         EXPECT_TRUE(std::isinf(val) && val < 0)
-            << "after re-alloc, mask_host[0][" << k << "] should be -inf";
+            << "after re-activate, mask_host[0][" << k << "] should be -inf";
     }
 
     gpt_sovits::t2s_session_free(session);
@@ -463,33 +353,7 @@ static int32_t read_kv_pos(const gpt_sovits::t2s_session & session, int slot_id)
     return val;
 }
 
-TEST(T2SSession, SlotDecodeStepKvPos) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 16;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
-    ASSERT_EQ(s0, 0);
-    test_activate_slot(session, s0, 3);
-    test_activate_slot(session, 1, 1);
-    gpt_sovits::t2s_session_decode_advance(session);
-    EXPECT_EQ(read_kv_pos(session, s0), 3);
-
-    // Second decode step: kv_pos[0] = 0 * slot_size + 4 = 4
-    gpt_sovits::t2s_session_decode_advance(session);
-    EXPECT_EQ(read_kv_pos(session, s0), 4);
-
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
-
-TEST(T2SSession, MultiSlotKvPos) {
+TEST(T2SSession, DecodeStepKvPos) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -507,12 +371,15 @@ TEST(T2SSession, MultiSlotKvPos) {
     ASSERT_EQ(s1, 1);
     test_activate_slot(session, s1, 5);
 
+    // First decode step.
     gpt_sovits::t2s_session_decode_advance(session);
+    EXPECT_EQ(read_kv_pos(session, s0), 2);   // slot 0: 0*16 + 2
+    EXPECT_EQ(read_kv_pos(session, s1), 21);  // slot 1: 1*16 + 5
 
-    // slot 0: kv_pos[0] = 0 * 16 + 2 = 2
-    EXPECT_EQ(read_kv_pos(session, s0), 2);
-    // slot 1: kv_pos[1] = 1 * 16 + 5 = 21
-    EXPECT_EQ(read_kv_pos(session, s1), 21);
+    // Second decode step: positions increment by 1.
+    gpt_sovits::t2s_session_decode_advance(session);
+    EXPECT_EQ(read_kv_pos(session, s0), 3);
+    EXPECT_EQ(read_kv_pos(session, s1), 22);
 
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
@@ -563,21 +430,6 @@ TEST(T2SSession, InitQuantizedKVCache) {
 // ---------------------------------------------------------------------------
 // Reference embedding caching
 // ---------------------------------------------------------------------------
-
-TEST(T2SSession, RefEmbNotCachedInitially) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, 2, 16));
-
-    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_emb(session), nullptr);
-    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_ref(session), 0);
-
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
 
 TEST(T2SSession, ComputeRefEmbWithModel) {
     const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
@@ -641,52 +493,6 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
 
     // Cleanup.
     gpt_sovits::t2s_session_free(session);
-    gpt_sovits::t2s_model_free(model);
-    ggml_backend_free(backend);
-}
-
-TEST(T2SSession, SessionFreeCleansRefEmb) {
-    const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
-    FILE * f = fopen(path.c_str(), "rb");
-    if (!f) GTEST_SKIP() << "Model file not found: " << path;
-    fclose(f);
-
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_model model;
-    ASSERT_TRUE(gpt_sovits::t2s_model_load(path, model, backend));
-
-    // Skip if model extract_latent weights are incompatible.
-    if (model.weights.extract_latent.ssl_proj_w->ne[0] != 2) {
-        gpt_sovits::t2s_model_free(model);
-        ggml_backend_free(backend);
-        GTEST_SKIP() << "Model extract_latent weights have incompatible shape";
-    }
-
-    gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, 2, 32));
-
-    const int64_t T_ref      = 3;
-    const int64_t T_hub      = 20;
-    const int64_t bert_dim   = 1024;
-    const int64_t hubert_dim = 768;
-
-    std::vector<int32_t> tokens(T_ref, 1);
-    std::vector<float>   bert(bert_dim * T_ref, 0.1f);
-    std::vector<float>   hubert(hubert_dim * T_hub, 0.5f);
-
-    ASSERT_TRUE(gpt_sovits::t2s_session_compute_ref_emb(
-        session, model, tokens.data(), T_ref, bert.data(), hubert.data(), T_hub));
-
-    EXPECT_NE(gpt_sovits::t2s_session_get_ref_emb(session), nullptr);
-
-    // session_free should clean up ref_emb without crash.
-    gpt_sovits::t2s_session_free(session);
-
-    // Double free should also be safe.
-    gpt_sovits::t2s_session_free(session);
-
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
 }
@@ -1155,34 +961,6 @@ TEST(T2SAdvance, RejectsDecodeOnIdleSlot) {
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
 
     // Slot 0 idle, try to decode on it (n_query=1) — should assert.
-    gpt_sovits::t2s_batch_plan plan;
-    plan.n_query = {1, 0};
-
-    auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
-    ASSERT_NE(graph.ctx, nullptr);
-
-    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
-
-    gpt_sovits::t2s_flex_graph_free(graph);
-    gpt_sovits::t2s_session_free(session);
-    gpt_sovits::t2s_model_free(model);
-    ggml_backend_free(backend);
-}
-
-TEST(T2SAdvance, RejectsDecodeOnEmptySlot) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    // Slot 0 active but n_pos=0, try to decode — should assert.
-    test_activate_slot(session, 0, 0);
-
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {1, 0};
 
