@@ -115,7 +115,7 @@ TEST(T2SSession, DoubleFreeSafe) {
 // ---------------------------------------------------------------------------
 
 // Test helper: activate a slot with given n_pos for testing purposes.
-// In production code, activation happens via t2s_session_advance.
+// In production code, activation happens via t2s_session_flex_advance.
 static void test_activate_slot(gpt_sovits::t2s_session & session, int slot_id, int n_pos) {
     const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
     const int slot_start  = slot_id * session.slot_size;
@@ -692,7 +692,7 @@ TEST(T2SSession, SessionFreeCleansRefEmb) {
 }
 
 // ---------------------------------------------------------------------------
-// Flexible computation graph (t2s_session_build_graph)
+// Flexible computation graph (t2s_session_build_flex_graph)
 // ---------------------------------------------------------------------------
 
 TEST(T2SBatchPlan, Total) {
@@ -717,10 +717,10 @@ TEST(T2SBuildGraph, RejectsEmptyPlan) {
 
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {0, 0, 0, 0};
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     EXPECT_EQ(graph.ctx, nullptr) << "should fail for empty plan";
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
 }
@@ -738,10 +738,10 @@ TEST(T2SBuildGraph, RejectsWrongPlanSize) {
 
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {1, 0};  // wrong size
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     EXPECT_EQ(graph.ctx, nullptr) << "should fail for wrong plan size";
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
 }
@@ -813,7 +813,7 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {5, 0, 3, 1};
 
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
     EXPECT_EQ(graph.N, 9);
 
@@ -821,10 +821,9 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     expect_shape(graph.y,      {d_model, 9});
     expect_shape(graph.kv_pos, {9});
     expect_shape(graph.mask,   {max_ctx, 9});
-    EXPECT_NE(graph.alloc, nullptr);
     EXPECT_NE(graph.gf, nullptr);
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -848,10 +847,10 @@ TEST(T2SBuildGraph, KvPosCorrectness) {
     plan.n_query = {1, 0, 4};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    gpt_sovits::t2s_session_advance(session, plan, graph);
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
 
     // kv_pos: slot0*8 + 5 = 5, slot2*8 + 0..3 = 16,17,18,19
     const int N = 5;
@@ -865,7 +864,7 @@ TEST(T2SBuildGraph, KvPosCorrectness) {
     EXPECT_EQ(kv_pos_read[3], 18);
     EXPECT_EQ(kv_pos_read[4], 19);
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -890,10 +889,10 @@ TEST(T2SBuildGraph, MaskCorrectness) {
     plan.n_query = {2, 3};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    gpt_sovits::t2s_session_advance(session, plan, graph);
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
 
     const int N = 5;
     ASSERT_EQ(graph.N, N);
@@ -935,20 +934,20 @@ TEST(T2SBuildGraph, MaskCorrectness) {
     EXPECT_EQ(fp16_to_fp32(mask_read[4 * max_ctx + 9]), 0.0f);
     EXPECT_EQ(fp16_to_fp32(mask_read[4 * max_ctx + 10]), 0.0f);
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
 }
 
 TEST(T2SBuildGraph, GraphFreeSafe) {
-    gpt_sovits::t2s_graph graph;  // default-constructed
-    gpt_sovits::t2s_graph_free(graph);
-    gpt_sovits::t2s_graph_free(graph);  // double free
+    gpt_sovits::t2s_flex_graph graph;  // default-constructed
+    gpt_sovits::t2s_flex_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);  // double free
 }
 
 // ---------------------------------------------------------------------------
-// t2s_session_advance
+// t2s_session_flex_advance
 // ---------------------------------------------------------------------------
 
 TEST(T2SAdvance, UpdatesNPos) {
@@ -968,18 +967,18 @@ TEST(T2SAdvance, UpdatesNPos) {
     plan.n_query = {1, 3, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 2);
 
-    gpt_sovits::t2s_session_advance(session, plan, graph);
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
 
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);   // 2 + 1 (decode)
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 3);   // 0 + 3 (prefill, activated)
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 2), 0);   // idle, unchanged
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -1003,10 +1002,10 @@ TEST(T2SAdvance, UpdatesPersistentMask) {
     plan.n_query = {3, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    gpt_sovits::t2s_session_advance(session, plan, graph);
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
 
     // Positions [0,3) should now be revealed in persistent mask
     EXPECT_EQ(fp16_to_fp32(session.mask_host[0 * max_ctx + 0]), 0.0f);
@@ -1019,7 +1018,7 @@ TEST(T2SAdvance, UpdatesPersistentMask) {
     // n_pos should be 3
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -1052,10 +1051,10 @@ TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
     plan.n_query = {1, 1};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    gpt_sovits::t2s_session_advance(session, plan, graph);
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
 
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 4);   // 3 + 1 (decode)
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 5);   // 4 + 1 (decode)
@@ -1086,7 +1085,7 @@ TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
     EXPECT_EQ(kv_pos_read[0], 4);   // slot 0: write at pos 4
     EXPECT_EQ(kv_pos_read[1], 13);  // slot 1: write at pos 13
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -1112,13 +1111,13 @@ TEST(T2SAdvance, ActivatesIdleSlot) {
     plan.n_query = {1, 4, 0};  // slot 0: decode, slot 1: prefill (activates), slot 2: idle
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     // Slot 1 should be idle before advance
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 0);
 
-    gpt_sovits::t2s_session_advance(session, plan, graph);
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
 
     // Slot 1 should now have n_pos > 0 (activated by prefill)
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);   // 2 + 1
@@ -1139,7 +1138,7 @@ TEST(T2SAdvance, ActivatesIdleSlot) {
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 4);   // 3 + 1
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 5);   // 4 + 1
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -1160,12 +1159,12 @@ TEST(T2SAdvance, RejectsDecodeOnIdleSlot) {
     plan.n_query = {1, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    EXPECT_DEATH(gpt_sovits::t2s_session_advance(session, plan, graph), "");
+    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -1188,12 +1187,12 @@ TEST(T2SAdvance, RejectsDecodeOnEmptySlot) {
     plan.n_query = {1, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    EXPECT_DEATH(gpt_sovits::t2s_session_advance(session, plan, graph), "");
+    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
@@ -1216,12 +1215,12 @@ TEST(T2SAdvance, RejectsPrefillOnActiveSlot) {
     plan.n_query = {5, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
-    EXPECT_DEATH(gpt_sovits::t2s_session_advance(session, plan, graph), "");
+    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
 
-    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);

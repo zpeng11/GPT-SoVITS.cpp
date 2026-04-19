@@ -127,6 +127,10 @@ void t2s_session_free(t2s_session & session) {
         ggml_gallocr_free(session.alloc_dec);
         session.alloc_dec = nullptr;
     }
+    if (session.alloc_flex) {
+        ggml_gallocr_free(session.alloc_flex);
+        session.alloc_flex = nullptr;
+    }
     if (session.ctx_graph) {
         ggml_free(session.ctx_graph);
         session.ctx_graph = nullptr;
@@ -309,30 +313,29 @@ int t2s_batch_plan::total() const {
     return sum;
 }
 
-void t2s_graph_free(t2s_graph & graph) {
-    if (graph.alloc) {
-        ggml_gallocr_free(graph.alloc);
-        graph.alloc = nullptr;
-    }
+void t2s_flex_graph_free(t2s_flex_graph & graph) {
+    // Note: allocator is owned by the session and reused across builds.
+    // ggml_free(graph.ctx) releases tensor metadata; the underlying
+    // data buffer stays alive inside session.alloc_flex.
     if (graph.ctx) {
         ggml_free(graph.ctx);
         graph.ctx = nullptr;
     }
-    graph.gf     = nullptr;
-    graph.x      = nullptr;
-    graph.y      = nullptr;
-    graph.kv_pos = nullptr;
-    graph.mask   = nullptr;
+    graph.gf      = nullptr;
+    graph.x       = nullptr;
+    graph.y       = nullptr;
+    graph.kv_pos  = nullptr;
+    graph.mask    = nullptr;
     graph.backend = nullptr;
-    graph.N      = 0;
+    graph.N       = 0;
 }
 
-t2s_graph t2s_session_build_graph(
-    const t2s_session    & session,
+t2s_flex_graph t2s_session_build_flex_graph(
+    t2s_session          & session,
     const t2s_model      & model,
     const t2s_batch_plan & plan)
 {
-    t2s_graph graph;
+    t2s_flex_graph graph;
 
     const int N = plan.total();
     if (N <= 0) {
@@ -398,17 +401,19 @@ t2s_graph t2s_session_build_graph(
     ggml_set_name(graph.y, "y_out");
     ggml_set_output(graph.y);
 
-    // --- 3. Allocate intermediate storage ---
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
-    graph.alloc = ggml_gallocr_new(buft);
-    if (!graph.alloc) {
-        fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
-        t2s_graph_free(graph);
-        return graph;
+    // --- 3. Allocate intermediate storage (reuse session allocator) ---
+    if (!session.alloc_flex) {
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
+        session.alloc_flex = ggml_gallocr_new(buft);
+        if (!session.alloc_flex) {
+            fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
+            t2s_flex_graph_free(graph);
+            return graph;
+        }
     }
-    if (!ggml_gallocr_alloc_graph(graph.alloc, graph.gf)) {
+    if (!ggml_gallocr_alloc_graph(session.alloc_flex, graph.gf)) {
         fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
-        t2s_graph_free(graph);
+        t2s_flex_graph_free(graph);
         return graph;
     }
 
@@ -418,9 +423,9 @@ t2s_graph t2s_session_build_graph(
     return graph;
 }
 
-void t2s_session_advance(t2s_session       & session,
+void t2s_session_flex_advance(t2s_session       & session,
                           const t2s_batch_plan & plan,
-                          t2s_graph            & graph)
+                          t2s_flex_graph            & graph)
 {
     GGML_ASSERT(graph.ctx != nullptr);
     GGML_ASSERT(graph.N == plan.total());
