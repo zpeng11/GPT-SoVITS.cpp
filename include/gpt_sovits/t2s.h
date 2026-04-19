@@ -148,8 +148,9 @@ struct t2s_embed_block_weights {
 //   embed_weights           - weights for the T2S embedding block
 //
 // Returns:
-//   ref_emb {d_model, T_ref + T_prompt}
-//   Layout: [ref_text_emb | prompt_audio_emb]
+//   Combined embedding {d_model, T_ref + T_prompt}.
+//   Layout: [ref_text_emb | prompt_audio_emb].
+//   The caller may split this into separate tensors for storage.
 struct ggml_tensor * t2s_embed_ref_forward(
     struct ggml_context * ctx,
     struct ggml_tensor  * ref_token,
@@ -373,10 +374,12 @@ struct t2s_session {
     ggml_gallocr_t        alloc_dec = nullptr;  // owned — pre-allocates intermediate storage
 
     // Reference embedding (owned, computed once per session)
-    struct ggml_context  * ctx_ref    = nullptr;  // owned - holds ref_emb tensor
-    ggml_backend_buffer_t  buf_ref    = nullptr;  // owned - data buffer for ref_emb
-    struct ggml_tensor   * ref_emb    = nullptr;  // cached {d_model, T_ref + T_prompt}
-    int64_t                ref_T_ref  = 0;        // ref text token count (input pos offset)
+    struct ggml_context  * ctx_ref        = nullptr;  // owned - holds ref text/audio tensors
+    ggml_backend_buffer_t  buf_ref        = nullptr;  // owned - data buffer for ref tensors
+    struct ggml_tensor   * ref_text_emb   = nullptr;  // cached {d_model, T_ref}
+    struct ggml_tensor   * ref_audio_emb  = nullptr;  // cached {d_model, T_prompt}
+    int64_t                ref_T_ref      = 0;        // ref text token count (input pos offset)
+    int64_t                ref_T_prompt   = 0;        // ref prompt audio token count
 
     // Shared allocator for flexible computation graphs (owned).
     // Reused across t2s_session_build_flex_graph calls to avoid repeated
@@ -465,11 +468,17 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
                                   const float       * hubert_data,
                                   int64_t             T_hub);
 
-// Get the cached reference embedding tensor, or nullptr if not computed.
-struct ggml_tensor * t2s_session_get_ref_emb(const t2s_session & session);
+// Get the cached reference text embedding tensor, or nullptr if not computed.
+struct ggml_tensor * t2s_session_get_ref_text_emb(const t2s_session & session);
+
+// Get the cached reference audio/prompt embedding tensor, or nullptr if not computed.
+struct ggml_tensor * t2s_session_get_ref_audio_emb(const t2s_session & session);
 
 // Get the cached T_ref (number of reference text tokens), or 0 if not computed.
 int64_t t2s_session_get_ref_T_ref(const t2s_session & session);
+
+// Get the cached T_prompt (number of reference prompt audio tokens), or 0 if not computed.
+int64_t t2s_session_get_ref_T_prompt(const t2s_session & session);
 
 // Build a *persistent* decode graph for this session.  Call exactly once
 // after t2s_session_init; the graph is stored in the session and reused for

@@ -111,7 +111,7 @@ bool t2s_session_init(t2s_session      & session,
 }
 
 void t2s_session_free(t2s_session & session) {
-    // Free ref_emb cache.
+    // Free ref embedding cache.
     if (session.buf_ref) {
         ggml_backend_buffer_free(session.buf_ref);
         session.buf_ref = nullptr;
@@ -120,8 +120,10 @@ void t2s_session_free(t2s_session & session) {
         ggml_free(session.ctx_ref);
         session.ctx_ref = nullptr;
     }
-    session.ref_emb   = nullptr;
-    session.ref_T_ref = 0;
+    session.ref_text_emb  = nullptr;
+    session.ref_audio_emb = nullptr;
+    session.ref_T_ref     = 0;
+    session.ref_T_prompt  = 0;
 
     if (session.alloc_dec) {
         ggml_gallocr_free(session.alloc_dec);
@@ -521,12 +523,20 @@ void t2s_session_flex_advance(t2s_session       & session,
 // Reference embedding
 // ---------------------------------------------------------------------------
 
-struct ggml_tensor * t2s_session_get_ref_emb(const t2s_session & session) {
-    return session.ref_emb;
+struct ggml_tensor * t2s_session_get_ref_text_emb(const t2s_session & session) {
+    return session.ref_text_emb;
+}
+
+struct ggml_tensor * t2s_session_get_ref_audio_emb(const t2s_session & session) {
+    return session.ref_audio_emb;
 }
 
 int64_t t2s_session_get_ref_T_ref(const t2s_session & session) {
     return session.ref_T_ref;
+}
+
+int64_t t2s_session_get_ref_T_prompt(const t2s_session & session) {
+    return session.ref_T_prompt;
 }
 
 bool t2s_session_compute_ref_emb(t2s_session       & session,
@@ -623,12 +633,13 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
         return false;
     }
 
-    // --- Create persistent tensor and copy result ---
-    const int64_t out_d = result->ne[0];
-    const int64_t out_T = result->ne[1];
+    // --- Create persistent tensors and copy result ---
+    const int64_t out_d    = result->ne[0];
+    const int64_t out_T    = result->ne[1];
+    const int64_t T_prompt = out_T - T_ref;
 
     struct ggml_init_params ref_params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * 2,
+        /*.mem_size   =*/ ggml_tensor_overhead() * 3,
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -641,35 +652,55 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
         return false;
     }
 
-    session.ref_emb = ggml_new_tensor_2d(session.ctx_ref, GGML_TYPE_F32, out_d, out_T);
-    ggml_set_name(session.ref_emb, "ref_emb");
+    session.ref_text_emb = ggml_new_tensor_2d(session.ctx_ref, GGML_TYPE_F32, out_d, T_ref);
+    ggml_set_name(session.ref_text_emb, "ref_text_emb");
+
+    session.ref_audio_emb = ggml_new_tensor_2d(session.ctx_ref, GGML_TYPE_F32, out_d, T_prompt);
+    ggml_set_name(session.ref_audio_emb, "ref_audio_emb");
 
     session.buf_ref = ggml_backend_alloc_ctx_tensors(session.ctx_ref, session.backend);
     if (!session.buf_ref) {
         fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() for ref failed\n", __func__);
-        session.ctx_ref = nullptr;
-        session.ref_emb = nullptr;
+        session.ctx_ref       = nullptr;
+        session.ref_text_emb  = nullptr;
+        session.ref_audio_emb = nullptr;
         ggml_gallocr_free(alloc);
         ggml_free(ctx_tmp);
         return false;
     }
 
-    // Copy: result (temp alloc) -> session.ref_emb (persistent alloc).
+    // Copy: split result (temp alloc) into two persistent tensors.
     {
-        const size_t nbytes = ggml_nbytes(result);
-        std::vector<uint8_t> tmp_buf(nbytes);
-        ggml_backend_tensor_get(result, tmp_buf.data(), 0, nbytes);
-        ggml_backend_tensor_set(session.ref_emb, tmp_buf.data(), 0, nbytes);
+        const size_t row_bytes = (size_t) out_d * sizeof(float);
+
+        // Text portion: columns [0, T_ref)
+        {
+            const size_t nbytes = row_bytes * T_ref;
+            std::vector<uint8_t> tmp_buf(nbytes);
+            ggml_backend_tensor_get(result, tmp_buf.data(), 0, nbytes);
+            ggml_backend_tensor_set(session.ref_text_emb, tmp_buf.data(), 0, nbytes);
+        }
+
+        // Audio portion: columns [T_ref, T_ref + T_prompt)
+        {
+            const size_t offset = row_bytes * T_ref;
+            const size_t nbytes = row_bytes * T_prompt;
+            std::vector<uint8_t> tmp_buf(nbytes);
+            ggml_backend_tensor_get(result, tmp_buf.data(), offset, nbytes);
+            ggml_backend_tensor_set(session.ref_audio_emb, tmp_buf.data(), 0, nbytes);
+        }
     }
 
-    session.ref_T_ref = T_ref;
+    session.ref_T_ref    = T_ref;
+    session.ref_T_prompt = T_prompt;
 
     // --- Free temporaries ---
     ggml_gallocr_free(alloc);
     ggml_free(ctx_tmp);
 
-    fprintf(stderr, "%s: cached ref_emb {%lld, %lld} (T_ref=%lld)\n",
-            __func__, (long long) out_d, (long long) out_T, (long long) T_ref);
+    fprintf(stderr, "%s: cached ref_text_emb {%lld, %lld}, ref_audio_emb {%lld, %lld}\n",
+            __func__, (long long) out_d, (long long) T_ref,
+                    (long long) out_d, (long long) T_prompt);
     return true;
 }
 

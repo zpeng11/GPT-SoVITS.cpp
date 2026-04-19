@@ -470,26 +470,35 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
         hubert.data(), T_hub);
     ASSERT_TRUE(ok);
 
-    // Verify cached tensor shape.
-    struct ggml_tensor * ref_emb = gpt_sovits::t2s_session_get_ref_emb(session);
-    ASSERT_NE(ref_emb, nullptr);
-    EXPECT_EQ(ref_emb->ne[0], d_model);
+    // Verify cached tensor shapes.
+    struct ggml_tensor * ref_text_emb = gpt_sovits::t2s_session_get_ref_text_emb(session);
+    struct ggml_tensor * ref_audio_emb = gpt_sovits::t2s_session_get_ref_audio_emb(session);
+    ASSERT_NE(ref_text_emb, nullptr);
+    ASSERT_NE(ref_audio_emb, nullptr);
+    EXPECT_EQ(ref_text_emb->ne[0], d_model);
+    EXPECT_EQ(ref_audio_emb->ne[0], d_model);
 
     EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_ref(session), T_ref);
 
     // T_prompt = floor((T_hub - kernel_size) / stride) + 1 = (50-2)/2+1 = 25
     int64_t T_prompt = (T_hub - 2) / 2 + 1;
-    EXPECT_EQ(ref_emb->ne[1], T_ref + T_prompt);
+    EXPECT_EQ(ref_text_emb->ne[1], T_ref);
+    EXPECT_EQ(ref_audio_emb->ne[1], T_prompt);
+    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_prompt(session), T_prompt);
 
     // Verify data is non-zero after computation.
-    const size_t nbytes = ggml_nbytes(ref_emb);
-    std::vector<float> data(nbytes / sizeof(float));
-    ggml_backend_tensor_get(ref_emb, data.data(), 0, nbytes);
-    bool any_nonzero = false;
-    for (float v : data) {
-        if (v != 0.0f) { any_nonzero = true; break; }
-    }
-    EXPECT_TRUE(any_nonzero) << "ref_emb should have non-zero values after computation";
+    auto check_nonzero = [](struct ggml_tensor * t, const char * name) {
+        const size_t nbytes = ggml_nbytes(t);
+        std::vector<float> data(nbytes / sizeof(float));
+        ggml_backend_tensor_get(t, data.data(), 0, nbytes);
+        bool any_nonzero = false;
+        for (float v : data) {
+            if (v != 0.0f) { any_nonzero = true; break; }
+        }
+        EXPECT_TRUE(any_nonzero) << name << " should have non-zero values after computation";
+    };
+    check_nonzero(ref_text_emb, "ref_text_emb");
+    check_nonzero(ref_audio_emb, "ref_audio_emb");
 
     // Cleanup.
     gpt_sovits::t2s_session_free(session);
