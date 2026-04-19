@@ -156,7 +156,7 @@ void t2s_session_free(t2s_session & session) {
 
 int t2s_session_find_free_slot(const t2s_session & session) {
     for (size_t i = 0; i < session.slots.size(); i++) {
-        if (!session.slots[i].in_use) {
+        if (session.slots[i].n_pos == 0) {
             return (int) i;
         }
     }
@@ -177,8 +177,7 @@ void t2s_session_slot_release(t2s_session & session, int slot_id) {
                           slot_id * session.slot_size, session.slot_size);
     }
 
-    session.slots[slot_id].in_use = false;
-    session.slots[slot_id].n_pos  = 0;
+    session.slots[slot_id].n_pos = 0;
 }
 
 int t2s_session_slot_n_pos(const t2s_session & session, int slot_id) {
@@ -191,7 +190,7 @@ void t2s_session_decode_advance(t2s_session & session) {
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
 
     for (uint32_t i = 0; i < session.n_batch; i++) {
-        if (!session.slots[i].in_use) continue;
+        if (session.slots[i].n_pos == 0) continue;
         GGML_ASSERT(session.slots[i].n_pos < (int) session.slot_size);
 
         const int row = (int)(i * session.slot_size) + session.slots[i].n_pos;
@@ -429,23 +428,18 @@ void t2s_session_advance(t2s_session       & session,
     const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
     const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
 
-    // --- 0. Validate plan and activate idle slots ---
+    // --- 0. Validate plan ---
     for (uint32_t i = 0; i < session.n_batch; i++) {
         const int nq = plan.n_query[i];
         if (nq <= 0) continue;
-        const bool in_use = session.slots[i].in_use;
-        const int  n_pos  = session.slots[i].n_pos;
+        const int n_pos = session.slots[i].n_pos;
 
         if (nq == 1) {
-            // Decode: slot must be active with existing context.
-            GGML_ASSERT(in_use && n_pos > 0);
+            // Decode: slot must have existing context.
+            GGML_ASSERT(n_pos > 0);
         } else {
-            // Prefill: slot must be clean (inactive, no residual state).
-            GGML_ASSERT(!in_use && n_pos == 0);
-        }
-
-        if (!in_use) {
-            session.slots[i].in_use = true;
+            // Prefill: slot must be clean.
+            GGML_ASSERT(n_pos == 0);
         }
     }
 

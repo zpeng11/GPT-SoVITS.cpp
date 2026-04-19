@@ -121,8 +121,7 @@ static void test_activate_slot(gpt_sovits::t2s_session & session, int slot_id, i
     const int slot_start  = slot_id * session.slot_size;
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
 
-    session.slots[slot_id].in_use = true;
-    session.slots[slot_id].n_pos  = n_pos;
+    session.slots[slot_id].n_pos = n_pos;
 
     for (int k = 0; k < n_pos; k++) {
         session.mask_host[slot_id * max_ctx + slot_start + k] = zero;
@@ -139,12 +138,12 @@ TEST(T2SSession, FindFreeSlot) {
     const uint32_t n_batch = 3;
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, 32));
 
-    // Find and activate all slots.
+    // Find and claim all slots.
     std::vector<int> ids;
     for (uint32_t i = 0; i < n_batch; i++) {
         int id = gpt_sovits::t2s_session_find_free_slot(session);
         EXPECT_EQ(id, (int)i);
-        test_activate_slot(session, id, 0);
+        test_activate_slot(session, id, 1);
         ids.push_back(id);
     }
 
@@ -1112,12 +1111,11 @@ TEST(T2SAdvance, ActivatesIdleSlot) {
     ASSERT_NE(graph.ctx, nullptr);
 
     // Slot 1 should be idle before advance
-    EXPECT_FALSE(session.slots[1].in_use);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 0);
 
     gpt_sovits::t2s_session_advance(session, plan, graph);
 
-    // Slot 1 should now be active
-    EXPECT_TRUE(session.slots[1].in_use);
+    // Slot 1 should now have n_pos > 0 (activated by prefill)
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);   // 2 + 1
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 4);   // 0 + 4 (activated)
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 2), 0);   // still idle

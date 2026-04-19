@@ -338,8 +338,7 @@ struct t2s_session {
 
     // Per-slot state
     struct slot_state {
-        bool in_use = false;
-        int  n_pos  = 0;
+        int n_pos = 0;
     };
     std::vector<slot_state> slots;
 
@@ -410,7 +409,7 @@ int t2s_session_find_free_slot(const t2s_session & session);
 // Masks out the slot's entire column in the decode mask.
 void t2s_session_slot_release(t2s_session & session, int slot_id);
 
-// Advance all active (in_use) slots by one decode step.
+// Advance all active (n_pos > 0) slots by one decode step.
 // Increments n_pos for each active slot and reveals the newly written KV
 // positions in the session decode mask.  Updates kv_pos so that the
 // persistent decode graph scatter-writes at the correct columns.
@@ -514,7 +513,7 @@ void t2s_graph_free(t2s_graph & graph);
 // Call after t2s_session_build_graph and before ggml_backend_graph_compute.
 //
 // For each slot with n_query[i] > 0:
-//   0. Activates the slot if idle (sets in_use = true; n_pos must be 0)
+//   0. Validates slot state (decode: n_pos > 0; prefill: n_pos == 0)
 //   1. Fills graph.kv_pos with scatter-write positions
 //   2. Fills graph.mask with causal attention mask
 //   3. Reveals newly written KV positions in the session decode mask
