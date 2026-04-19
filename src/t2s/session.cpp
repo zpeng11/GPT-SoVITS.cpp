@@ -189,8 +189,13 @@ void t2s_session_decode_advance(t2s_session & session) {
     const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
     const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
 
+    // The persistent decode graph processes all n_batch slots.
+    // Every slot must be in the decode phase (n_pos > 0).
     for (uint32_t i = 0; i < session.n_batch; i++) {
-        if (session.slots[i].n_pos == 0) continue;
+        GGML_ASSERT(session.slots[i].n_pos > 0);
+    }
+
+    for (uint32_t i = 0; i < session.n_batch; i++) {
         GGML_ASSERT(session.slots[i].n_pos < (int) session.slot_size);
 
         const int row = (int)(i * session.slot_size) + session.slots[i].n_pos;

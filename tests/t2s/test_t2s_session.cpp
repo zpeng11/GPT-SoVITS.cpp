@@ -355,10 +355,11 @@ TEST(T2SSession, SlotDecodeStepMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Activate slot 0 with 2 prefilled tokens, then do 3 decode steps.
+    // Activate both slots, then do 3 decode steps on slot 0's column.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 2);
+    test_activate_slot(session, 1, 1);
 
     for (int step = 0; step < 3; step++) {
         gpt_sovits::t2s_session_decode_advance(session);
@@ -394,10 +395,11 @@ TEST(T2SSession, SlotReleaseMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Activate, decode, then release.
+    // Activate both, decode, then release slot 0.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 2);
+    test_activate_slot(session, 1, 1);
     gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
 
@@ -425,10 +427,11 @@ TEST(T2SSession, SlotReuseMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Activate with 3 tokens, decode 1 step, release, then re-activate with 1 token.
+    // Activate both, decode 1 step, release slot 0, then re-activate with 1 token.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 3);
+    test_activate_slot(session, 1, 1);
     gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
 
@@ -474,6 +477,7 @@ TEST(T2SSession, SlotDecodeStepKvPos) {
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 3);
+    test_activate_slot(session, 1, 1);
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 3);
 
@@ -548,6 +552,7 @@ TEST(T2SSession, InitQuantizedKVCache) {
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 3);
+    test_activate_slot(session, 1, 1);
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 3);
 
@@ -1128,7 +1133,8 @@ TEST(T2SAdvance, ActivatesIdleSlot) {
     EXPECT_TRUE(std::isinf(fp16_to_fp32(session.mask_host[1 * max_ctx + 12])) &&
                 fp16_to_fp32(session.mask_host[1 * max_ctx + 12]) < 0);
 
-    // decode_advance should now include slot 1
+    // decode_advance requires all slots active
+    test_activate_slot(session, 2, 1);
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 4);   // 3 + 1
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 5);   // 4 + 1
