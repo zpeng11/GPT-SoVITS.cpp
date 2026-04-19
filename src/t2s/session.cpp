@@ -154,26 +154,10 @@ void t2s_session_free(t2s_session & session) {
     session.mask_host.clear();
 }
 
-int t2s_session_slot_alloc(t2s_session & session, int n_pos) {
+int t2s_session_find_free_slot(const t2s_session & session) {
     for (size_t i = 0; i < session.slots.size(); i++) {
         if (!session.slots[i].in_use) {
-            const int slot_id = (int) i;
-            session.slots[slot_id].in_use = true;
-            session.slots[slot_id].n_pos  = n_pos;
-
-            // Update mask_host: reveal [slot_id*slot_size, slot_id*slot_size+n_pos)
-            // in column slot_id.
-            if (n_pos > 0) {
-                const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
-                const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
-                for (int k = 0; k < n_pos; k++) {
-                    session.mask_host[slot_id * max_ctx + slot_id * session.slot_size + k] = zero;
-                }
-                mask_upload_range(session, slot_id,
-                                  slot_id * session.slot_size, n_pos);
-            }
-
-            return slot_id;
+            return (int) i;
         }
     }
     return -1;
@@ -427,14 +411,52 @@ t2s_graph t2s_session_build_graph(
     graph.backend = session.backend;
     graph.N = N;
 
-    // --- 4. Fill kv_pos ---
+    return graph;
+}
+
+void t2s_session_advance(t2s_session       & session,
+                          const t2s_batch_plan & plan,
+                          t2s_graph            & graph)
+{
+    GGML_ASSERT(graph.ctx != nullptr);
+    GGML_ASSERT(graph.N == plan.total());
+    GGML_ASSERT(plan.n_query.size() == session.n_batch);
+
+    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+    const int     n_kv    = t2s_session_get_n_kv(session);
+    const int     N       = graph.N;
+
+    const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
+    const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+
+    // --- 0. Validate plan and activate idle slots ---
+    for (uint32_t i = 0; i < session.n_batch; i++) {
+        const int nq = plan.n_query[i];
+        if (nq <= 0) continue;
+        const bool in_use = session.slots[i].in_use;
+        const int  n_pos  = session.slots[i].n_pos;
+
+        if (nq == 1) {
+            // Decode: slot must be active with existing context.
+            GGML_ASSERT(in_use && n_pos > 0);
+        } else {
+            // Prefill: slot must be clean (inactive, no residual state).
+            GGML_ASSERT(!in_use && n_pos == 0);
+        }
+
+        if (!in_use) {
+            session.slots[i].in_use = true;
+        }
+    }
+
+    // --- 1. Fill graph.kv_pos ---
     {
         std::vector<int32_t> kv_pos_host(N);
         int offset = 0;
         for (uint32_t i = 0; i < session.n_batch; i++) {
             const int nq = plan.n_query[i];
             if (nq <= 0) continue;
-            const int n_pos     = session.slots[i].n_pos;
+            const int n_pos      = session.slots[i].n_pos;
             const int slot_start = (int)(i * session.slot_size);
             GGML_ASSERT(n_pos + nq <= (int)session.slot_size);
             const int base_pos = slot_start + n_pos;
@@ -447,10 +469,8 @@ t2s_graph t2s_session_build_graph(
                                 0, (size_t) N * sizeof(int32_t));
     }
 
-    // --- 5. Fill mask ---
+    // --- 2. Fill graph.mask ---
     {
-        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
-        const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
         std::vector<ggml_fp16_t> mask_buf((size_t) n_kv * N, neg_inf);
 
         int col = 0;
@@ -461,9 +481,6 @@ t2s_graph t2s_session_build_graph(
             const int n_pos      = session.slots[i].n_pos;
 
             for (int j = 0; j < nq; j++) {
-                // Column (col + j) corresponds to slot i, token j.
-                // Attend to rows in [slot_start, slot_start + n_pos + j + 1)
-                // i.e. all previously valid positions + positions [0..j] of this step.
                 const int attend_up_to = n_pos + j + 1;
                 for (int r = 0; r < attend_up_to && r < (int)session.slot_size; r++) {
                     mask_buf[(size_t)(col + j) * n_kv + slot_start + r] = zero;
@@ -476,7 +493,24 @@ t2s_graph t2s_session_build_graph(
                                 0, (size_t) n_kv * N * sizeof(ggml_fp16_t));
     }
 
-    return graph;
+    // --- 3. Update persistent decode mask ---
+    for (uint32_t i = 0; i < session.n_batch; i++) {
+        const int nq = plan.n_query[i];
+        if (nq <= 0) continue;
+        const int old_n_pos  = session.slots[i].n_pos;
+        const int slot_start = (int)(i * session.slot_size);
+        for (int k = 0; k < nq; k++) {
+            session.mask_host[i * max_ctx + slot_start + old_n_pos + k] = zero;
+        }
+        mask_upload_range(session, (int)i, slot_start + old_n_pos, nq);
+    }
+
+    // --- 4. Advance n_pos ---
+    for (uint32_t i = 0; i < session.n_batch; i++) {
+        if (plan.n_query[i] > 0) {
+            session.slots[i].n_pos += plan.n_query[i];
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

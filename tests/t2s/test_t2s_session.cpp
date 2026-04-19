@@ -114,7 +114,22 @@ TEST(T2SSession, DoubleFreeSafe) {
 // Slot management
 // ---------------------------------------------------------------------------
 
-TEST(T2SSession, SlotAllocRelease) {
+// Test helper: activate a slot with given n_pos for testing purposes.
+// In production code, activation happens via t2s_session_advance.
+static void test_activate_slot(gpt_sovits::t2s_session & session, int slot_id, int n_pos) {
+    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+    const int slot_start  = slot_id * session.slot_size;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+
+    session.slots[slot_id].in_use = true;
+    session.slots[slot_id].n_pos  = n_pos;
+
+    for (int k = 0; k < n_pos; k++) {
+        session.mask_host[slot_id * max_ctx + slot_start + k] = zero;
+    }
+}
+
+TEST(T2SSession, FindFreeSlot) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -124,23 +139,22 @@ TEST(T2SSession, SlotAllocRelease) {
     const uint32_t n_batch = 3;
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, 32));
 
-    // Allocate all slots.
+    // Find and activate all slots.
     std::vector<int> ids;
     for (uint32_t i = 0; i < n_batch; i++) {
-        int id = gpt_sovits::t2s_session_slot_alloc(session, 0);
+        int id = gpt_sovits::t2s_session_find_free_slot(session);
         EXPECT_EQ(id, (int)i);
-        EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, id), 0);
+        test_activate_slot(session, id, 0);
         ids.push_back(id);
     }
 
-    // No more slots.
-    EXPECT_EQ(gpt_sovits::t2s_session_slot_alloc(session, 0), -1);
+    // No more free slots.
+    EXPECT_EQ(gpt_sovits::t2s_session_find_free_slot(session), -1);
 
-    // Release one and re-allocate.
+    // Release one and find again.
     gpt_sovits::t2s_session_slot_release(session, ids[1]);
-    int id = gpt_sovits::t2s_session_slot_alloc(session, 0);
+    int id = gpt_sovits::t2s_session_find_free_slot(session);
     EXPECT_EQ(id, (int)ids[1]);
-    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, id), 0);
 
     gpt_sovits::t2s_session_free(session);
     ggml_backend_free(backend);
@@ -155,12 +169,13 @@ TEST(T2SSession, SlotReuseAfterRelease) {
 
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, 2, 16));
 
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 0);
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_GE(s0, 0);
+    test_activate_slot(session, s0, 0);
 
-    // Release and re-alloc — should get the same slot back.
+    // Release and find again — should get the same slot back.
     gpt_sovits::t2s_session_slot_release(session, s0);
-    int s1 = gpt_sovits::t2s_session_slot_alloc(session, 0);
+    int s1 = gpt_sovits::t2s_session_find_free_slot(session);
     EXPECT_EQ(s1, s0);
 
     gpt_sovits::t2s_session_free(session);
@@ -287,7 +302,7 @@ TEST(T2SSession, MaskInitAllInf) {
     ggml_backend_free(backend);
 }
 
-TEST(T2SSession, SlotAllocMask) {
+TEST(T2SSession, SlotMaskSetup) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -300,9 +315,10 @@ TEST(T2SSession, SlotAllocMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Allocate slot 0 with 3 prefilled tokens.
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
+    // Activate slot 0 with 3 prefilled tokens via test helper.
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
+    test_activate_slot(session, s0, 3);
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, s0), 3);
 
     // Column 0: rows [0, 3) should be 0, rest -inf.
@@ -340,9 +356,10 @@ TEST(T2SSession, SlotDecodeStepMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Allocate slot 0 with 2 prefilled tokens, then do 3 decode steps.
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 2);
+    // Activate slot 0 with 2 prefilled tokens, then do 3 decode steps.
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
+    test_activate_slot(session, s0, 2);
 
     for (int step = 0; step < 3; step++) {
         gpt_sovits::t2s_session_decode_advance(session);
@@ -378,9 +395,10 @@ TEST(T2SSession, SlotReleaseMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Allocate, decode, then release.
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 2);
+    // Activate, decode, then release.
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
+    test_activate_slot(session, s0, 2);
     gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
 
@@ -408,17 +426,17 @@ TEST(T2SSession, SlotReuseMask) {
 
     const int64_t max_ctx = (int64_t)n_batch * slot_size;
 
-    // Allocate with 3 tokens, decode 1 step, release, then re-alloc with 1 token.
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
+    // Activate with 3 tokens, decode 1 step, release, then re-activate with 1 token.
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
+    test_activate_slot(session, s0, 3);
     gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
 
-    int s1 = gpt_sovits::t2s_session_slot_alloc(session, 1);
-    ASSERT_EQ(s1, 0);
-    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, s1), 1);
+    test_activate_slot(session, 0, 1);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 1);
 
-    // Column 0: only row 0 should be 0 (from new n_pos=1), rest -inf.
+    // Column 0: only row 0 should be 0 (from test_activate_slot n_pos=1), rest -inf.
     float val0 = fp16_to_fp32(session.mask_host[0 * max_ctx + 0]);
     EXPECT_EQ(val0, 0.0f) << "after re-alloc, mask_host[0][0] should be 0";
 
@@ -454,10 +472,9 @@ TEST(T2SSession, SlotDecodeStepKvPos) {
     const uint32_t slot_size = 16;
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
 
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
-
-    // First decode step: kv_pos[0] = 0 * slot_size + 3 = 3
+    test_activate_slot(session, s0, 3);
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 3);
 
@@ -480,10 +497,12 @@ TEST(T2SSession, MultiSlotKvPos) {
     const uint32_t slot_size = 16;
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
 
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 2);
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
-    int s1 = gpt_sovits::t2s_session_slot_alloc(session, 5);
+    test_activate_slot(session, s0, 2);
+    int s1 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s1, 1);
+    test_activate_slot(session, s1, 5);
 
     gpt_sovits::t2s_session_decode_advance(session);
 
@@ -527,8 +546,9 @@ TEST(T2SSession, InitQuantizedKVCache) {
     EXPECT_EQ(session.kv_cache_type, GGML_TYPE_Q8_0);
 
     // Slot management should work the same.
-    int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
+    int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
+    test_activate_slot(session, s0, 3);
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 3);
 
@@ -782,7 +802,8 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     const int64_t max_ctx = (int64_t) n_batch * slot_size;
 
     for (uint32_t i = 0; i < n_batch; i++) {
-        gpt_sovits::t2s_session_slot_alloc(session, 0);
+        int id = gpt_sovits::t2s_session_find_free_slot(session);
+        test_activate_slot(session, id, 0);
     }
 
     gpt_sovits::t2s_batch_plan plan;
@@ -815,9 +836,9 @@ TEST(T2SBuildGraph, KvPosCorrectness) {
     const uint32_t slot_size = 8;
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
 
-    // slot 0: n_pos=5, slot 1: idle, slot 2: n_pos=3
-    gpt_sovits::t2s_session_slot_alloc(session, 5);  // slot 0
-    gpt_sovits::t2s_session_slot_alloc(session, 3);  // slot 2
+    // slot 0: n_pos=5, slot 1: n_pos=3 (idle in plan), slot 2: idle
+    test_activate_slot(session, 0, 5);
+    test_activate_slot(session, 1, 3);
 
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {1, 0, 4};
@@ -825,6 +846,8 @@ TEST(T2SBuildGraph, KvPosCorrectness) {
     auto model = create_minimal_model(hparams, backend);
     auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
+
+    gpt_sovits::t2s_session_advance(session, plan, graph);
 
     // kv_pos: slot0*8 + 5 = 5, slot2*8 + 0..3 = 16,17,18,19
     const int N = 5;
@@ -856,9 +879,8 @@ TEST(T2SBuildGraph, MaskCorrectness) {
 
     const int64_t max_ctx = (int64_t) n_batch * slot_size;
 
-    // slot 0: n_pos=3, slot 1: n_pos=0
-    gpt_sovits::t2s_session_slot_alloc(session, 3);
-    gpt_sovits::t2s_session_slot_alloc(session, 0);
+    // Both slots idle — prefill scenario.
+    // slot 0: idle, n_query=2; slot 1: idle, n_query=3.
 
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {2, 3};
@@ -866,6 +888,8 @@ TEST(T2SBuildGraph, MaskCorrectness) {
     auto model = create_minimal_model(hparams, backend);
     auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
+
+    gpt_sovits::t2s_session_advance(session, plan, graph);
 
     const int N = 5;
     ASSERT_EQ(graph.N, N);
@@ -876,25 +900,16 @@ TEST(T2SBuildGraph, MaskCorrectness) {
     // mask(row, col) at mask_read[col * max_ctx + row]
     // Slot 0 region: rows [0,8), slot 1 region: rows [8,16)
 
-    // Column 0: slot 0, j=0, n_pos=3 -> attend rows [0,4)
-    for (int r = 0; r < 4; r++) {
-        float val = fp16_to_fp32(mask_read[0 * max_ctx + r]);
-        EXPECT_EQ(val, 0.0f) << "col0 row" << r;
-    }
-    for (int r = 4; r < max_ctx; r++) {
+    // Column 0: slot 0, j=0, n_pos=0 -> attend row 0 only
+    EXPECT_EQ(fp16_to_fp32(mask_read[0 * max_ctx + 0]), 0.0f);
+    for (int r = 1; r < max_ctx; r++) {
         float val = fp16_to_fp32(mask_read[0 * max_ctx + r]);
         EXPECT_TRUE(std::isinf(val) && val < 0) << "col0 row" << r;
     }
 
-    // Column 1: slot 0, j=1, n_pos=3 -> attend rows [0,5)
-    for (int r = 0; r < 5; r++) {
-        float val = fp16_to_fp32(mask_read[1 * max_ctx + r]);
-        EXPECT_EQ(val, 0.0f) << "col1 row" << r;
-    }
-    for (int r = 5; r < max_ctx; r++) {
-        float val = fp16_to_fp32(mask_read[1 * max_ctx + r]);
-        EXPECT_TRUE(std::isinf(val) && val < 0) << "col1 row" << r;
-    }
+    // Column 1: slot 0, j=1, n_pos=0 -> attend rows 0,1
+    EXPECT_EQ(fp16_to_fp32(mask_read[1 * max_ctx + 0]), 0.0f);
+    EXPECT_EQ(fp16_to_fp32(mask_read[1 * max_ctx + 1]), 0.0f);
 
     // Column 2: slot 1, j=0, n_pos=0 -> attend row 8 only
     EXPECT_EQ(fp16_to_fp32(mask_read[2 * max_ctx + 8]), 0.0f);
@@ -926,5 +941,285 @@ TEST(T2SBuildGraph, GraphFreeSafe) {
     gpt_sovits::t2s_graph graph;  // default-constructed
     gpt_sovits::t2s_graph_free(graph);
     gpt_sovits::t2s_graph_free(graph);  // double free
+}
+
+// ---------------------------------------------------------------------------
+// t2s_session_advance
+// ---------------------------------------------------------------------------
+
+TEST(T2SAdvance, UpdatesNPos) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 3;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    // slot 0: active, n_pos=2 (decode); slot 1: idle (prefill); slot 2: idle
+    test_activate_slot(session, 0, 2);
+
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {1, 3, 0};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 2);
+
+    gpt_sovits::t2s_session_advance(session, plan, graph);
+
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);   // 2 + 1 (decode)
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 3);   // 0 + 3 (prefill, activated)
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 2), 0);   // idle, unchanged
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SAdvance, UpdatesPersistentMask) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    const int64_t max_ctx = (int64_t) n_batch * slot_size;
+
+    // slot 0: idle — will be prefilled by advance
+
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {3, 0};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    gpt_sovits::t2s_session_advance(session, plan, graph);
+
+    // Positions [0,3) should now be revealed in persistent mask
+    EXPECT_EQ(fp16_to_fp32(session.mask_host[0 * max_ctx + 0]), 0.0f);
+    EXPECT_EQ(fp16_to_fp32(session.mask_host[0 * max_ctx + 1]), 0.0f);
+    EXPECT_EQ(fp16_to_fp32(session.mask_host[0 * max_ctx + 2]), 0.0f);
+    // Position 3 still masked
+    EXPECT_TRUE(std::isinf(fp16_to_fp32(session.mask_host[0 * max_ctx + 3])) &&
+                fp16_to_fp32(session.mask_host[0 * max_ctx + 3]) < 0);
+
+    // n_pos should be 3
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    const int64_t max_ctx = (int64_t) n_batch * slot_size;
+
+    // Both slots active
+    test_activate_slot(session, 0, 2);
+    test_activate_slot(session, 1, 3);
+
+    // Simulate persistent decode advance on slot 0
+    // decode_advance reveals position at current n_pos and increments
+    gpt_sovits::t2s_session_decode_advance(session);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 4);
+
+    // Now use flexible graph for decode on both slots
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {1, 1};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    gpt_sovits::t2s_session_advance(session, plan, graph);
+
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 4);   // 3 + 1 (decode)
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 5);   // 4 + 1 (decode)
+
+    // Persistent mask: slot 0 has [0,4), slot 1 has [8,13)
+    for (int r = 0; r < 4; r++) {
+        EXPECT_EQ(fp16_to_fp32(session.mask_host[0 * max_ctx + r]), 0.0f)
+            << "slot0 row" << r;
+    }
+    EXPECT_TRUE(std::isinf(fp16_to_fp32(session.mask_host[0 * max_ctx + 4])) &&
+                fp16_to_fp32(session.mask_host[0 * max_ctx + 4]) < 0);
+
+    for (int r = 0; r < 5; r++) {
+        EXPECT_EQ(fp16_to_fp32(session.mask_host[1 * max_ctx + 8 + r]), 0.0f)
+            << "slot1 row" << r;
+    }
+    EXPECT_TRUE(std::isinf(fp16_to_fp32(session.mask_host[1 * max_ctx + 13])) &&
+                fp16_to_fp32(session.mask_host[1 * max_ctx + 13]) < 0);
+
+    // Resume persistent decode: decode_advance should work correctly
+    gpt_sovits::t2s_session_decode_advance(session);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 5);   // 4 + 1
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 6);   // 5 + 1
+
+    // kv_pos should point to the correct positions
+    std::vector<int32_t> kv_pos_read(2);
+    ggml_backend_tensor_get(session.kv_pos, kv_pos_read.data(), 0, 2 * sizeof(int32_t));
+    EXPECT_EQ(kv_pos_read[0], 4);   // slot 0: write at pos 4
+    EXPECT_EQ(kv_pos_read[1], 13);  // slot 1: write at pos 13
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SAdvance, ActivatesIdleSlot) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 3;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    const int64_t max_ctx = (int64_t) n_batch * slot_size;
+
+    // Slot 0 active, slots 1 and 2 idle
+    test_activate_slot(session, 0, 2);
+
+    // Plan uses slot 1 (idle) for prefill and slot 0 for decode
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {1, 4, 0};  // slot 0: decode, slot 1: prefill (activates), slot 2: idle
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    // Slot 1 should be idle before advance
+    EXPECT_FALSE(session.slots[1].in_use);
+
+    gpt_sovits::t2s_session_advance(session, plan, graph);
+
+    // Slot 1 should now be active
+    EXPECT_TRUE(session.slots[1].in_use);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 3);   // 2 + 1
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 4);   // 0 + 4 (activated)
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 2), 0);   // still idle
+
+    // Persistent mask: slot 1's positions [8, 12) should be revealed
+    for (int k = 0; k < 4; k++) {
+        EXPECT_EQ(fp16_to_fp32(session.mask_host[1 * max_ctx + 8 + k]), 0.0f)
+            << "slot1 row" << k;
+    }
+    EXPECT_TRUE(std::isinf(fp16_to_fp32(session.mask_host[1 * max_ctx + 12])) &&
+                fp16_to_fp32(session.mask_host[1 * max_ctx + 12]) < 0);
+
+    // decode_advance should now include slot 1
+    gpt_sovits::t2s_session_decode_advance(session);
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 0), 4);   // 3 + 1
+    EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, 1), 5);   // 4 + 1
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SAdvance, RejectsDecodeOnIdleSlot) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    // Slot 0 idle, try to decode on it (n_query=1) — should assert.
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {1, 0};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    EXPECT_DEATH(gpt_sovits::t2s_session_advance(session, plan, graph), "");
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SAdvance, RejectsDecodeOnEmptySlot) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    // Slot 0 active but n_pos=0, try to decode — should assert.
+    test_activate_slot(session, 0, 0);
+
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {1, 0};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    EXPECT_DEATH(gpt_sovits::t2s_session_advance(session, plan, graph), "");
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SAdvance, RejectsPrefillOnActiveSlot) {
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+    const uint32_t n_batch   = 2;
+    const uint32_t slot_size = 8;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+
+    // Slot 0 active with n_pos=3, try to prefill (n_query>1) — should assert.
+    test_activate_slot(session, 0, 3);
+
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {5, 0};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+
+    EXPECT_DEATH(gpt_sovits::t2s_session_advance(session, plan, graph), "");
+
+    gpt_sovits::t2s_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
 }
 

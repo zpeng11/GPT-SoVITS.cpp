@@ -400,10 +400,11 @@ bool t2s_session_init(t2s_session      & session,
 // Free all resources owned by a T2S session.
 void t2s_session_free(t2s_session & session);
 
-// Allocate an available slot with n_pos prefilled tokens.
-// Updates mask to allow attending to the prefilled positions.
-// Returns slot ID (0-based) or -1 if full.
-int t2s_session_slot_alloc(t2s_session & session, int n_pos);
+// Find the first free slot without modifying session state.
+// Returns slot ID (0-based) or -1 if all slots are in use.
+// The caller activates the slot via t2s_session_advance by including
+// it in the batch plan; no separate activation step is needed.
+int t2s_session_find_free_slot(const t2s_session & session);
 
 // Release a slot, making it available for reuse.
 // Masks out the slot's entire column in the decode mask.
@@ -466,15 +467,6 @@ struct t2s_batch_plan {
     int total() const;
 };
 
-// Advance session state for all active slots described by plan.
-// For each slot with n_query[i] > 0: increments n_pos by n_query[i] and
-// reveals the corresponding KV positions in the session decode mask.
-//
-// Use after t2s_session_build_graph execution to reconcile session state
-// before returning to the persistent decode loop, or as the unified
-// state-advance primitive in mixed workflows.
-void t2s_session_advance(t2s_session & session, const t2s_batch_plan & plan);
-
 // A built computation graph with variable shapes.
 // Owns all per-graph resources (tensors, allocator).  Borrows KV caches from
 // the session and weight tensors from the model.  The caller must ensure the
@@ -483,8 +475,8 @@ struct t2s_graph {
     // Input/output tensors (caller fills x, reads y)
     struct ggml_tensor * x      = nullptr;   // {d_model, N} F32
     struct ggml_tensor * y      = nullptr;   // {d_model, N} F32
-    struct ggml_tensor * kv_pos = nullptr;   // {N} I32  (filled by builder)
-    struct ggml_tensor * mask   = nullptr;   // {n_kv, N} F16  (filled by builder)
+    struct ggml_tensor * kv_pos = nullptr;   // {N} I32  (filled by t2s_session_advance)
+    struct ggml_tensor * mask   = nullptr;   // {n_kv, N} F16  (filled by t2s_session_advance)
 
     // ggml resources (all owned, freed by t2s_graph_free)
     struct ggml_context * ctx    = nullptr;
@@ -498,11 +490,35 @@ struct t2s_graph {
 // Build a flexible computation graph for the given batch plan.
 //
 // The graph borrows the session's KV caches and the model's weight tensors.
-// kv_pos and mask are computed and uploaded automatically based on the plan
-// and the current slot states (session.slots[i].n_pos).
+// Creates input tensors (x, kv_pos, mask) with shapes derived from the plan.
+// kv_pos and mask are left uninitialized — call t2s_session_advance to fill
+// them and advance session state before executing the graph.
 //
 // Token ordering in x: slot 0's tokens first, then slot 1's, etc.
 // Idle slots (n_query == 0) contribute zero tokens.
+//
+// Returns a t2s_graph with ctx != nullptr on success, or an empty graph
+// on failure.  Call t2s_graph_free when done.
+t2s_graph t2s_session_build_graph(
+    const t2s_session    & session,
+    const t2s_model      & model,
+    const t2s_batch_plan & plan);
+
+// Free all resources owned by a t2s_graph.
+void t2s_graph_free(t2s_graph & graph);
+
+// Advance session state and fill graph runtime inputs for the given plan.
+//
+// This is the flexible-graph counterpart to t2s_session_decode_advance:
+// it prepares runtime inputs AND updates session state before execution.
+// Call after t2s_session_build_graph and before ggml_backend_graph_compute.
+//
+// For each slot with n_query[i] > 0:
+//   0. Activates the slot if idle (sets in_use = true; n_pos must be 0)
+//   1. Fills graph.kv_pos with scatter-write positions
+//   2. Fills graph.mask with causal attention mask
+//   3. Reveals newly written KV positions in the session decode mask
+//   4. Increments n_pos by n_query[i]
 //
 // kv_pos rule (per active slot i, per token j within that slot):
 //   kv_pos[offset + j] = i * slot_size + session.slots[i].n_pos + j
@@ -514,16 +530,7 @@ struct t2s_graph {
 //
 // This unified formula gives causal masking for prefill (n_query > 1) and
 // full-range attend for decode (n_query == 1).
-//
-// Returns a t2s_graph with ctx != nullptr on success, or an empty graph
-// on failure.  Call t2s_graph_free when done.
-t2s_graph t2s_session_build_graph(
-    const t2s_session    & session,
-    const t2s_model      & model,
-    const t2s_batch_plan & plan);
-
-// Free all resources owned by a t2s_graph.
-void t2s_graph_free(t2s_graph & graph);
+void t2s_session_advance(t2s_session & session, const t2s_batch_plan & plan, t2s_graph & graph);
 
 // Compute and cache the reference embedding in the session.
 //
