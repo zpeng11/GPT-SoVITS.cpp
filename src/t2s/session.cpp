@@ -202,23 +202,27 @@ int t2s_session_slot_n_pos(const t2s_session & session, int slot_id) {
     return session.slots[slot_id].n_pos;
 }
 
-void t2s_session_slot_decode_advance(t2s_session & session, int slot_id) {
-    GGML_ASSERT(slot_id >= 0 && (size_t) slot_id < session.slots.size());
-    GGML_ASSERT(session.slots[slot_id].in_use);
-    GGML_ASSERT(session.slots[slot_id].n_pos < (int) session.slot_size);
-
+void t2s_session_decode_advance(t2s_session & session) {
     const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
-    const int     row     = slot_id * session.slot_size + session.slots[slot_id].n_pos;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
 
-    session.mask_host[slot_id * max_ctx + row] = ggml_fp32_to_fp16(0.0f);
-    mask_upload_range(session, slot_id, row, 1);
+    for (uint32_t i = 0; i < session.n_batch; i++) {
+        if (!session.slots[i].in_use) continue;
+        GGML_ASSERT(session.slots[i].n_pos < (int) session.slot_size);
 
-    // Set kv_pos for this slot so the graph scatter-writes at the correct column.
-    const int32_t write_pos = row;
-    ggml_backend_tensor_set(session.kv_pos, &write_pos,
-                            slot_id * sizeof(int32_t), sizeof(int32_t));
+        const int row = (int)(i * session.slot_size) + session.slots[i].n_pos;
 
-    session.slots[slot_id].n_pos++;
+        // Reveal the new KV position in the decode mask.
+        session.mask_host[i * max_ctx + row] = zero;
+        mask_upload_range(session, (int)i, row, 1);
+
+        // Set kv_pos for this slot so the graph scatter-writes at the correct column.
+        const int32_t write_pos = row;
+        ggml_backend_tensor_set(session.kv_pos, &write_pos,
+                                i * sizeof(int32_t), sizeof(int32_t));
+
+        session.slots[i].n_pos++;
+    }
 }
 
 t2s_layer_caches t2s_session_get_layer_caches(const t2s_session & session, int layer) {

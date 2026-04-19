@@ -345,7 +345,7 @@ TEST(T2SSession, SlotDecodeStepMask) {
     ASSERT_EQ(s0, 0);
 
     for (int step = 0; step < 3; step++) {
-        gpt_sovits::t2s_session_slot_decode_advance(session, s0);
+        gpt_sovits::t2s_session_decode_advance(session);
     }
 
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, s0), 5);
@@ -381,7 +381,7 @@ TEST(T2SSession, SlotReleaseMask) {
     // Allocate, decode, then release.
     int s0 = gpt_sovits::t2s_session_slot_alloc(session, 2);
     ASSERT_EQ(s0, 0);
-    gpt_sovits::t2s_session_slot_decode_advance(session, s0);
+    gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
 
     // Column 0 should be all -inf after release.
@@ -411,7 +411,7 @@ TEST(T2SSession, SlotReuseMask) {
     // Allocate with 3 tokens, decode 1 step, release, then re-alloc with 1 token.
     int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
     ASSERT_EQ(s0, 0);
-    gpt_sovits::t2s_session_slot_decode_advance(session, s0);
+    gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_slot_release(session, s0);
 
     int s1 = gpt_sovits::t2s_session_slot_alloc(session, 1);
@@ -458,11 +458,11 @@ TEST(T2SSession, SlotDecodeStepKvPos) {
     ASSERT_EQ(s0, 0);
 
     // First decode step: kv_pos[0] = 0 * slot_size + 3 = 3
-    gpt_sovits::t2s_session_slot_decode_advance(session, s0);
+    gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 3);
 
     // Second decode step: kv_pos[0] = 0 * slot_size + 4 = 4
-    gpt_sovits::t2s_session_slot_decode_advance(session, s0);
+    gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 4);
 
     gpt_sovits::t2s_session_free(session);
@@ -485,8 +485,7 @@ TEST(T2SSession, MultiSlotKvPos) {
     int s1 = gpt_sovits::t2s_session_slot_alloc(session, 5);
     ASSERT_EQ(s1, 1);
 
-    gpt_sovits::t2s_session_slot_decode_advance(session, s0);
-    gpt_sovits::t2s_session_slot_decode_advance(session, s1);
+    gpt_sovits::t2s_session_decode_advance(session);
 
     // slot 0: kv_pos[0] = 0 * 16 + 2 = 2
     EXPECT_EQ(read_kv_pos(session, s0), 2);
@@ -530,7 +529,7 @@ TEST(T2SSession, InitQuantizedKVCache) {
     // Slot management should work the same.
     int s0 = gpt_sovits::t2s_session_slot_alloc(session, 3);
     ASSERT_EQ(s0, 0);
-    gpt_sovits::t2s_session_slot_decode_advance(session, s0);
+    gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 3);
 
     gpt_sovits::t2s_session_free(session);

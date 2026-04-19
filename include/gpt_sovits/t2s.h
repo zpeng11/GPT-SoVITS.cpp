@@ -409,13 +409,14 @@ int t2s_session_slot_alloc(t2s_session & session, int n_pos);
 // Masks out the slot's entire column in the decode mask.
 void t2s_session_slot_release(t2s_session & session, int slot_id);
 
-// Advance a slot by one decode step.
-// Increments n_pos and reveals the newly written KV position in the mask.
-// Deprecated: prefer t2s_session_decode_step or t2s_session_advance.
-void t2s_session_slot_decode_advance(t2s_session & session, int slot_id);
-
 // Advance all active (in_use) slots by one decode step.
-// Equivalent to t2s_session_advance with a plan with n_query[i] = 1 for every active slot.
+// Increments n_pos for each active slot and reveals the newly written KV
+// positions in the session decode mask.  Updates kv_pos so that the
+// persistent decode graph scatter-writes at the correct columns.
+//
+// Designed for use with the persistent decode graph built by
+// t2s_session_build_decode_graph, which assumes all n_batch slots are
+// occupied and each processes exactly one new token per invocation.
 void t2s_session_decode_advance(t2s_session & session);
 
 // Get the current number of valid tokens in a slot.
