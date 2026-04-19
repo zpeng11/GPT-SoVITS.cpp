@@ -441,6 +441,36 @@ struct ggml_tensor * t2s_session_get_mask(const t2s_session & session);
 // Total KV entries for attention readback (always n_batch * slot_size).
 int t2s_session_get_n_kv(const t2s_session & session);
 
+// Compute and cache the reference embedding in the session.
+//
+// Accepts raw host data pointers for all inputs. Internally builds a temporary
+// graph, executes it, and copies the result to a session-owned persistent tensor.
+// Call once after session init; one session = one ref.
+//
+// Parameters:
+//   session     - initialized T2S session
+//   model       - loaded T2S model (weights are read, not modified)
+//   ref_token   - reference phoneme token ids       {T_ref}  (i32), host pointer
+//   T_ref       - number of reference text tokens
+//   ref_bert    - reference BERT features            {1024, T_ref}, host pointer (F32)
+//   hubert_data - HuBERT features from ref audio     {768, T_hub}, host pointer (F32)
+//   T_hub       - number of HuBERT time frames
+//
+// Returns true on success, false on failure.
+bool t2s_session_compute_ref_emb(t2s_session       & session,
+                                  const t2s_model   & model,
+                                  const int32_t     * ref_token,
+                                  int64_t             T_ref,
+                                  const float       * ref_bert,
+                                  const float       * hubert_data,
+                                  int64_t             T_hub);
+
+// Get the cached reference embedding tensor, or nullptr if not computed.
+struct ggml_tensor * t2s_session_get_ref_emb(const t2s_session & session);
+
+// Get the cached T_ref (number of reference text tokens), or 0 if not computed.
+int64_t t2s_session_get_ref_T_ref(const t2s_session & session);
+
 // Build a *persistent* decode graph for this session.  Call exactly once
 // after t2s_session_init; the graph is stored in the session and reused for
 // every subsequent decode step.
@@ -540,35 +570,5 @@ void t2s_flex_graph_free(t2s_flex_graph & graph);
 // This unified formula gives causal masking for prefill (n_query > 1) and
 // full-range attend for decode (n_query == 1).
 void t2s_session_flex_advance(t2s_session & session, const t2s_batch_plan & plan, t2s_flex_graph & graph);
-
-// Compute and cache the reference embedding in the session.
-//
-// Accepts raw host data pointers for all inputs. Internally builds a temporary
-// graph, executes it, and copies the result to a session-owned persistent tensor.
-// Call once after session init; one session = one ref.
-//
-// Parameters:
-//   session     - initialized T2S session
-//   model       - loaded T2S model (weights are read, not modified)
-//   ref_token   - reference phoneme token ids       {T_ref}  (i32), host pointer
-//   T_ref       - number of reference text tokens
-//   ref_bert    - reference BERT features            {1024, T_ref}, host pointer (F32)
-//   hubert_data - HuBERT features from ref audio     {768, T_hub}, host pointer (F32)
-//   T_hub       - number of HuBERT time frames
-//
-// Returns true on success, false on failure.
-bool t2s_session_compute_ref_emb(t2s_session       & session,
-                                  const t2s_model   & model,
-                                  const int32_t     * ref_token,
-                                  int64_t             T_ref,
-                                  const float       * ref_bert,
-                                  const float       * hubert_data,
-                                  int64_t             T_hub);
-
-// Get the cached reference embedding tensor, or nullptr if not computed.
-struct ggml_tensor * t2s_session_get_ref_emb(const t2s_session & session);
-
-// Get the cached T_ref (number of reference text tokens), or 0 if not computed.
-int64_t t2s_session_get_ref_T_ref(const t2s_session & session);
 
 } // namespace gpt_sovits
