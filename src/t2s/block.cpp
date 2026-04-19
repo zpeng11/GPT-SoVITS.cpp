@@ -477,6 +477,14 @@ struct ggml_tensor * t2s_attention_block_forward(
     const int64_t head_dim = d_model / n_head;
     const size_t  esz      = ggml_element_size(x);
 
+    // Cache strides — must respect quantized block layout.
+    // For F32: cache_ts=4, cache_bs=1 → same as esz.
+    // For Q8_0: cache_ts=34, cache_bs=32 → different byte counts.
+    const size_t cache_ts  = ggml_type_size(k_cache->type);
+    const size_t cache_bs  = ggml_blck_size(k_cache->type);
+    const size_t cache_nb1 = cache_ts * (head_dim / cache_bs);  // bytes per head
+    const size_t cache_nb2 = cache_ts * (d_model / cache_bs);   // bytes per row
+
     // ── 1. QKV projection ───────────────────────────────────────
     //   qkv_w {d_model, 3·d_model}  ×  x {d_model, N}  →  {3·d_model, N}
     struct ggml_tensor * qkv = ggml_mul_mat(ctx, weights.qkv_w, x);
@@ -517,16 +525,16 @@ struct ggml_tensor * t2s_attention_block_forward(
     //   view_3d → {head_dim, n_head, n_kv}  then permute → {head_dim, n_kv, n_head}
     struct ggml_tensor * k = ggml_view_3d(ctx, k_cache,
         head_dim, n_head, n_kv,
-        /*nb1=*/ esz * head_dim,
-        /*nb2=*/ d_model * esz,
+        /*nb1=*/ cache_nb1,
+        /*nb2=*/ cache_nb2,
         /*off=*/ 0);
     k = ggml_permute(ctx, k, 0, 2, 1, 3); // {head_dim, n_kv, n_head}
 
     // Read full V from cache → multi-head view for flash attention
     struct ggml_tensor * v = ggml_view_3d(ctx, v_cache,
         head_dim, n_head, n_kv,
-        /*nb1=*/ esz * head_dim,
-        /*nb2=*/ d_model * esz,
+        /*nb1=*/ cache_nb1,
+        /*nb2=*/ cache_nb2,
         /*off=*/ 0);
     v = ggml_permute(ctx, v, 0, 2, 1, 3); // {head_dim, n_kv, n_head}
 
