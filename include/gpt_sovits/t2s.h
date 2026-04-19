@@ -571,13 +571,24 @@ void t2s_flex_graph_free(t2s_flex_graph & graph);
 // kv_pos rule (per active slot i, per token j within that slot):
 //   kv_pos[offset + j] = i * slot_size + session.slots[i].n_pos + j
 //
-// mask rule (per active slot i, per token j, per cache row r):
-//   Let local_r = r - i * slot_size.
-//   mask(r, col) = 0    if r is in slot i's region AND local_r < n_pos + j + 1
-//   mask(r, col) = -inf otherwise
+// mask rules (per active slot i):
 //
-// This unified formula gives causal masking for prefill (n_query > 1) and
-// full-range attend for decode (n_query == 1).
+//   Decode (n_query == 1, n_pos > 0):
+//     The single query token attends to all valid KV positions [0, n_pos).
+//     mask(r, col) = 0    if local_r < n_pos
+//     mask(r, col) = -inf otherwise
+//
+//   Prefill (n_query > 1, n_pos == 0):
+//     Sequence layout: [T_ref (ref text) | T_in (input text) | T_prompt (ref audio)]
+//     where T_text = T_ref + T_in = n_query - session.ref_T_prompt.
+//
+//     Text tokens (j < T_text): bidirectional within text, masked to audio.
+//       mask(r, col) = 0    if local_r < T_text
+//       mask(r, col) = -inf otherwise
+//
+//     Audio tokens (j >= T_text): see all text + causal audio.
+//       mask(r, col) = 0    if local_r < j + 1
+//       mask(r, col) = -inf otherwise
 void t2s_session_flex_advance(t2s_session & session, const t2s_batch_plan & plan, t2s_flex_graph & graph);
 
 } // namespace gpt_sovits

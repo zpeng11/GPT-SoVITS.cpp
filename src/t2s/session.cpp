@@ -486,10 +486,23 @@ void t2s_session_flex_advance(t2s_session       & session,
             const int slot_start = (int)(i * session.slot_size);
             const int n_pos      = session.slots[i].n_pos;
 
-            for (int j = 0; j < nq; j++) {
-                const int attend_up_to = n_pos + j + 1;
+            if (nq > 1) {
+                // Prefill: three-part mask matching the Python model.
+                // Sequence layout: [T_ref (ref text) | T_in (input text) | T_prompt (ref audio)]
+                // Text tokens see all text bidirectionally but no audio.
+                // Audio tokens see all text + causal (autoregressive) audio.
+                const int T_text = nq - (int) session.ref_T_prompt;
+                for (int j = 0; j < nq; j++) {
+                    const int attend_up_to = (j < T_text) ? T_text : (j + 1);
+                    for (int r = 0; r < attend_up_to && r < (int)session.slot_size; r++) {
+                        mask_buf[(size_t)(col + j) * n_kv + slot_start + r] = zero;
+                    }
+                }
+            } else {
+                // Decode: single token attends to all valid KV positions in slot.
+                const int attend_up_to = n_pos + 1;
                 for (int r = 0; r < attend_up_to && r < (int)session.slot_size; r++) {
-                    mask_buf[(size_t)(col + j) * n_kv + slot_start + r] = zero;
+                    mask_buf[(size_t) col * n_kv + slot_start + r] = zero;
                 }
             }
             col += nq;
