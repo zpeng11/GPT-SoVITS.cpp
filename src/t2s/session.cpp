@@ -202,7 +202,7 @@ int t2s_session_slot_n_pos(const t2s_session & session, int slot_id) {
     return session.slots[slot_id].n_pos;
 }
 
-void t2s_session_slot_decode_step(t2s_session & session, int slot_id) {
+void t2s_session_slot_decode_advance(t2s_session & session, int slot_id) {
     GGML_ASSERT(slot_id >= 0 && (size_t) slot_id < session.slots.size());
     GGML_ASSERT(session.slots[slot_id].in_use);
     GGML_ASSERT(session.slots[slot_id].n_pos < (int) session.slot_size);
@@ -305,6 +305,174 @@ struct ggml_tensor * t2s_session_get_y_dec(const t2s_session & session) {
 
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session) {
     return session.gf_dec;
+}
+
+// ---------------------------------------------------------------------------
+// Flexible computation graph
+// ---------------------------------------------------------------------------
+
+int t2s_batch_plan::total() const {
+    int sum = 0;
+    for (int v : n_query) { sum += v; }
+    return sum;
+}
+
+void t2s_graph_free(t2s_graph & graph) {
+    if (graph.alloc) {
+        ggml_gallocr_free(graph.alloc);
+        graph.alloc = nullptr;
+    }
+    if (graph.ctx) {
+        ggml_free(graph.ctx);
+        graph.ctx = nullptr;
+    }
+    graph.gf     = nullptr;
+    graph.x      = nullptr;
+    graph.y      = nullptr;
+    graph.kv_pos = nullptr;
+    graph.mask   = nullptr;
+    graph.backend = nullptr;
+    graph.N      = 0;
+}
+
+t2s_graph t2s_session_build_graph(
+    const t2s_session    & session,
+    const t2s_model      & model,
+    const t2s_batch_plan & plan)
+{
+    t2s_graph graph;
+
+    const int N = plan.total();
+    if (N <= 0) {
+        fprintf(stderr, "%s: plan has no tokens (total=%d)\n", __func__, N);
+        return graph;
+    }
+    if (plan.n_query.size() != session.n_batch) {
+        fprintf(stderr, "%s: plan size (%zu) != n_batch (%u)\n",
+                __func__, plan.n_query.size(), session.n_batch);
+        return graph;
+    }
+
+    const auto & hparams  = model.hparams;
+    const int64_t d_model = hparams.hidden_dim;
+    const int     n_layer = (int) hparams.n_layer;
+    const int     n_head  = (int) hparams.n_head;
+    const int     n_kv    = t2s_session_get_n_kv(session);
+
+    // --- 1. Create graph context and tensors ---
+    const size_t n_intermediates = (size_t) n_layer * 32;
+    const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 4) +
+                         ggml_graph_overhead_custom(graph_size, false),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    graph.ctx = ggml_init(params);
+    if (!graph.ctx) {
+        fprintf(stderr, "%s: ggml_init() failed\n", __func__);
+        return graph;
+    }
+
+    graph.x = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, d_model, N);
+    ggml_set_name(graph.x, "x_in");
+    ggml_set_input(graph.x);
+
+    graph.kv_pos = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, N);
+    ggml_set_name(graph.kv_pos, "kv_pos");
+    ggml_set_input(graph.kv_pos);
+
+    graph.mask = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F16, n_kv, N);
+    ggml_set_name(graph.mask, "mask");
+    ggml_set_input(graph.mask);
+
+    // --- 2. Build computation graph ---
+    graph.gf = ggml_new_graph_custom(graph.ctx, graph_size, false);
+
+    struct ggml_tensor * cur = graph.x;
+    for (int i = 0; i < n_layer; i++) {
+        cur = t2s_attention_block_forward(
+            graph.ctx, graph.gf, cur,
+            graph.mask,
+            session.k_caches[i], session.v_caches[i],
+            graph.kv_pos,
+            model.weights.attention[i],
+            n_kv, n_head, 1e-5f);
+    }
+    ggml_build_forward_expand(graph.gf, cur);
+    graph.y = cur;
+    ggml_set_name(graph.y, "y_out");
+    ggml_set_output(graph.y);
+
+    // --- 3. Allocate intermediate storage ---
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
+    graph.alloc = ggml_gallocr_new(buft);
+    if (!graph.alloc) {
+        fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
+        t2s_graph_free(graph);
+        return graph;
+    }
+    if (!ggml_gallocr_alloc_graph(graph.alloc, graph.gf)) {
+        fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
+        t2s_graph_free(graph);
+        return graph;
+    }
+
+    graph.backend = session.backend;
+    graph.N = N;
+
+    // --- 4. Fill kv_pos ---
+    {
+        std::vector<int32_t> kv_pos_host(N);
+        int offset = 0;
+        for (uint32_t i = 0; i < session.n_batch; i++) {
+            const int nq = plan.n_query[i];
+            if (nq <= 0) continue;
+            const int n_pos     = session.slots[i].n_pos;
+            const int slot_start = (int)(i * session.slot_size);
+            GGML_ASSERT(n_pos + nq <= (int)session.slot_size);
+            const int base_pos = slot_start + n_pos;
+            for (int j = 0; j < nq; j++) {
+                kv_pos_host[offset + j] = base_pos + j;
+            }
+            offset += nq;
+        }
+        ggml_backend_tensor_set(graph.kv_pos, kv_pos_host.data(),
+                                0, (size_t) N * sizeof(int32_t));
+    }
+
+    // --- 5. Fill mask ---
+    {
+        const ggml_fp16_t neg_inf = ggml_fp32_to_fp16(-INFINITY);
+        const ggml_fp16_t zero    = ggml_fp32_to_fp16(0.0f);
+        std::vector<ggml_fp16_t> mask_buf((size_t) n_kv * N, neg_inf);
+
+        int col = 0;
+        for (uint32_t i = 0; i < session.n_batch; i++) {
+            const int nq = plan.n_query[i];
+            if (nq <= 0) continue;
+            const int slot_start = (int)(i * session.slot_size);
+            const int n_pos      = session.slots[i].n_pos;
+
+            for (int j = 0; j < nq; j++) {
+                // Column (col + j) corresponds to slot i, token j.
+                // Attend to rows in [slot_start, slot_start + n_pos + j + 1)
+                // i.e. all previously valid positions + positions [0..j] of this step.
+                const int attend_up_to = n_pos + j + 1;
+                for (int r = 0; r < attend_up_to && r < (int)session.slot_size; r++) {
+                    mask_buf[(size_t)(col + j) * n_kv + slot_start + r] = zero;
+                }
+            }
+            col += nq;
+        }
+
+        ggml_backend_tensor_set(graph.mask, mask_buf.data(),
+                                0, (size_t) n_kv * N * sizeof(ggml_fp16_t));
+    }
+
+    return graph;
 }
 
 // ---------------------------------------------------------------------------
