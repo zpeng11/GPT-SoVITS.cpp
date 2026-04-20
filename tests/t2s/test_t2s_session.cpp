@@ -1029,8 +1029,16 @@ ErrorStats compute_errors(const std::vector<float> & actual,
 
 } // anonymous namespace
 
-TEST(T2SPrefillParity, FullPrefill) {
-    const std::string model_path = kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf";
+// Shared prefill parity test body. `label` is used in log messages.
+// `kv_cache_type` controls KV cache element type (F32 or quantized).
+// `y_max_tol` / `y_rmse_tol` / `kv_max_tol` / `kv_rmse_tol` control pass/fail.
+static void run_prefill_parity_test(
+    const std::string & model_path,
+    const char * label,
+    double y_max_tol, double y_rmse_tol,
+    double kv_max_tol, double kv_rmse_tol,
+    enum ggml_type kv_cache_type = GGML_TYPE_F32)
+{
     FILE * f = fopen(model_path.c_str(), "rb");
     if (!f) GTEST_SKIP() << "Model file not found: " << model_path;
     fclose(f);
@@ -1069,7 +1077,7 @@ TEST(T2SPrefillParity, FullPrefill) {
     const uint32_t slot_size = 256;  // >= 193
 
     gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size));
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size, kv_cache_type));
 
     // Set reference embedding dimensions for correct mask generation
     session.ref_T_ref    = T_ref;
@@ -1098,46 +1106,171 @@ TEST(T2SPrefillParity, FullPrefill) {
     ggml_backend_tensor_get(graph.y, actual_y.data(), 0, actual_y.size() * sizeof(float));
 
     auto err_y = compute_errors(actual_y, ref_xy_dec);
-    EXPECT_LT(err_y.max_abs, 1.0)   << "Output max_abs error: " << err_y.max_abs;
-    EXPECT_LT(err_y.rmse, 0.1)      << "Output RMSE: " << err_y.rmse;
+    printf("  [%s] Output  max_abs=%.6f  RMSE=%.6f  mean_abs=%.6f\n",
+           label, err_y.max_abs, err_y.rmse, err_y.mean_abs);
+    EXPECT_LT(err_y.max_abs, y_max_tol)
+        << label << " output max_abs error: " << err_y.max_abs;
+    EXPECT_LT(err_y.rmse, y_rmse_tol)
+        << label << " output RMSE: " << err_y.rmse;
 
     // --- Verify KV caches ---
     const int64_t layer_elems = d_model * T_total;
-    const double kv_max_tol = 1.0;
-    const double kv_rmse_tol = 0.1;
+
+    // Track worst layer for summary
+    double worst_k_max = 0, worst_v_max = 0;
+    int worst_k_layer = -1, worst_v_layer = -1;
+
+    // Helper: read a KV cache tensor as F32 (handles quantized types via dequantization)
+    auto read_kv_as_f32 = [&](struct ggml_tensor * t, std::vector<float> & out) {
+        const int64_t blck = ggml_blck_size(t->type);
+        const size_t   tsz  = ggml_type_size(t->type);
+        const int64_t n_blocks = t->ne[0] / blck;
+        const size_t row_bytes = (size_t) n_blocks * tsz;
+
+        if (t->type == GGML_TYPE_F32) {
+            out.resize((size_t) layer_elems);
+            ggml_backend_tensor_get(t, out.data(), 0, (size_t) layer_elems * sizeof(float));
+        } else {
+            // Read raw quantized bytes, dequantize row-by-row
+            const auto * traits = ggml_get_type_traits(t->type);
+            ASSERT_NE(traits->to_float, nullptr) << "No dequantizer for KV type";
+            out.resize((size_t) layer_elems);
+            std::vector<uint8_t> qbuf(row_bytes);
+            for (int64_t row = 0; row < t->ne[1] && row < T_total; row++) {
+                ggml_backend_tensor_get(t, qbuf.data(), row * row_bytes, row_bytes);
+                traits->to_float(qbuf.data(), out.data() + (size_t) row * t->ne[0], t->ne[0]);
+            }
+        }
+    };
 
     for (int layer = 0; layer < n_layer; layer++) {
-        // Read first T_total columns from each cache
-        std::vector<float> actual_k((size_t) layer_elems);
-        ggml_backend_tensor_get(session.k_caches[layer], actual_k.data(), 0,
-                                (size_t) layer_elems * sizeof(float));
+        std::vector<float> actual_k;
+        read_kv_as_f32(session.k_caches[layer], actual_k);
+        ASSERT_EQ((int64_t) actual_k.size(), layer_elems);
 
         std::vector<float> expected_k(ref_k_cache.begin() + layer * layer_elems,
                                        ref_k_cache.begin() + (layer + 1) * layer_elems);
 
         auto err_k = compute_errors(actual_k, expected_k);
         EXPECT_LT(err_k.max_abs, kv_max_tol)
-            << "K cache layer " << layer << " max_abs error: " << err_k.max_abs;
+            << label << " K cache layer " << layer << " max_abs: " << err_k.max_abs;
         EXPECT_LT(err_k.rmse, kv_rmse_tol)
-            << "K cache layer " << layer << " RMSE: " << err_k.rmse;
+            << label << " K cache layer " << layer << " RMSE: " << err_k.rmse;
+        if (err_k.max_abs > worst_k_max) {
+            worst_k_max = err_k.max_abs;
+            worst_k_layer = layer;
+        }
 
-        std::vector<float> actual_v((size_t) layer_elems);
-        ggml_backend_tensor_get(session.v_caches[layer], actual_v.data(), 0,
-                                (size_t) layer_elems * sizeof(float));
+        std::vector<float> actual_v;
+        read_kv_as_f32(session.v_caches[layer], actual_v);
+        ASSERT_EQ((int64_t) actual_v.size(), layer_elems);
 
         std::vector<float> expected_v(ref_v_cache.begin() + layer * layer_elems,
                                        ref_v_cache.begin() + (layer + 1) * layer_elems);
 
         auto err_v = compute_errors(actual_v, expected_v);
         EXPECT_LT(err_v.max_abs, kv_max_tol)
-            << "V cache layer " << layer << " max_abs error: " << err_v.max_abs;
+            << label << " V cache layer " << layer << " max_abs: " << err_v.max_abs;
         EXPECT_LT(err_v.rmse, kv_rmse_tol)
-            << "V cache layer " << layer << " RMSE: " << err_v.rmse;
+            << label << " V cache layer " << layer << " RMSE: " << err_v.rmse;
+        if (err_v.max_abs > worst_v_max) {
+            worst_v_max = err_v.max_abs;
+            worst_v_layer = layer;
+        }
     }
+
+    printf("  [%s] K cache worst: layer %d max_abs=%.6f\n",
+           label, worst_k_layer, worst_k_max);
+    printf("  [%s] V cache worst: layer %d max_abs=%.6f\n",
+           label, worst_v_layer, worst_v_max);
 
     gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
+}
+
+// --- Weight-only quantization (F32 KV cache) ---
+
+TEST(T2SPrefillParity, FullPrefillF16) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf",
+        "f16",
+        /*y_max_tol=*/1.0, /*y_rmse_tol=*/0.1,
+        /*kv_max_tol=*/1.0, /*kv_rmse_tol=*/0.1);
+}
+
+TEST(T2SPrefillParity, FullPrefillQ8) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-q8.gguf",
+        "q8",
+        /*y_max_tol=*/2.0, /*y_rmse_tol=*/0.3,
+        /*kv_max_tol=*/2.0, /*kv_rmse_tol=*/0.3);
+}
+
+TEST(T2SPrefillParity, FullPrefillQ4) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-q4.gguf",
+        "q4",
+        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
+        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0);
+}
+
+// --- Weight + KV cache quantized (Q8_0 KV cache) ---
+
+TEST(T2SPrefillParity, F16WeightQ8KV) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf",
+        "f16+q8kv",
+        /*y_max_tol=*/2.0, /*y_rmse_tol=*/0.3,
+        /*kv_max_tol=*/2.0, /*kv_rmse_tol=*/0.3,
+        GGML_TYPE_Q8_0);
+}
+
+TEST(T2SPrefillParity, Q8WeightQ8KV) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-q8.gguf",
+        "q8+q8kv",
+        /*y_max_tol=*/2.0, /*y_rmse_tol=*/0.3,
+        /*kv_max_tol=*/2.0, /*kv_rmse_tol=*/0.3,
+        GGML_TYPE_Q8_0);
+}
+
+TEST(T2SPrefillParity, Q4WeightQ8KV) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-q4.gguf",
+        "q4+q8kv",
+        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
+        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0,
+        GGML_TYPE_Q8_0);
+}
+
+// --- Weight + KV cache quantized (Q4_0 KV cache) ---
+
+TEST(T2SPrefillParity, F16WeightQ4KV) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf",
+        "f16+q4kv",
+        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
+        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0,
+        GGML_TYPE_Q4_0);
+}
+
+TEST(T2SPrefillParity, Q8WeightQ4KV) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-q8.gguf",
+        "q8+q4kv",
+        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
+        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0,
+        GGML_TYPE_Q4_0);
+}
+
+TEST(T2SPrefillParity, Q4WeightQ4KV) {
+    run_prefill_parity_test(
+        kTestDir + "models/s1v3-s2Gv2Pro-q4.gguf",
+        "q4+q4kv",
+        /*y_max_tol=*/10.0, /*y_rmse_tol=*/2.0,
+        /*kv_max_tol=*/10.0, /*kv_rmse_tol=*/2.0,
+        GGML_TYPE_Q4_0);
 }
 
