@@ -78,7 +78,12 @@ struct ggml_tensor * sovits_extract_latent_block_forward(
 //     them to zero without requiring a dedicated masked_fill op.
 //   - ggml does not provide a graph RNG op, so randomized sampling requires
 //     `exp_noise` to be supplied by the caller.
-struct ggml_tensor * t2s_sampler_block_forward(
+struct t2s_sampler_result {
+    struct ggml_tensor * sampled;   // randomly sampled (or greedy) token  {1} (i32)
+    struct ggml_tensor * greedy;    // argmax token (before noise)         {1} (i32)
+};
+
+struct t2s_sampler_result t2s_sampler_block_forward(
     struct ggml_context * ctx,
     struct ggml_tensor  * y,
     struct ggml_tensor  * lm_head_w,

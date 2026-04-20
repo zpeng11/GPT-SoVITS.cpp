@@ -267,7 +267,7 @@ static ::ggml_tensor * pick_sampler_token(
     return ggml_reshape_1d(ctx, picked_token, 1);
 }
 
-::ggml_tensor * t2s_sampler_block_forward(
+t2s_sampler_result t2s_sampler_block_forward(
     ::ggml_context * ctx,
     ::ggml_tensor  * y,
     ::ggml_tensor  * lm_head_w,
@@ -289,11 +289,20 @@ static ::ggml_tensor * pick_sampler_token(
         temperature,
         repetition_penalty);
 
-    return pick_sampler_token(
+    // Greedy token: sorted_indices[0] is the argmax (highest logit after
+    // repetition penalty, before temperature/noise).
+    ::ggml_tensor * indices_vec = flatten_vector_like(ctx, probs.sorted_indices);
+    ::ggml_tensor * greedy = ggml_view_1d(ctx, indices_vec, 1, 0);
+    greedy = ggml_reshape_1d(ctx, ggml_cont(ctx, greedy), 1);
+
+    t2s_sampler_result result;
+    result.sampled = pick_sampler_token(
         ctx,
         probs.probs_sorted,
         probs.sorted_indices,
         exp_noise);
+    result.greedy = greedy;
+    return result;
 }
 
 static ::ggml_tensor * build_sine_positional_embedding(
