@@ -10,6 +10,7 @@
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <fstream>
 #include <string>
 
 static const std::string kTestDir = T2S_TEST_DIR;
@@ -977,6 +978,162 @@ TEST(T2SAdvance, RejectsPrefillOnActiveSlot) {
     ASSERT_NE(graph.ctx, nullptr);
 
     EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
+
+    gpt_sovits::t2s_flex_graph_free(graph);
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+// ---------------------------------------------------------------------------
+// Prefill parity test: compare C++ flex graph output against Python reference
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<float> load_f32_bin(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        ADD_FAILURE() << "Failed to open: " << path;
+        return {};
+    }
+    auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<float> data(size / sizeof(float));
+    f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
+    return data;
+}
+
+struct ErrorStats {
+    double max_abs;
+    double rmse;
+    double mean_abs;
+};
+
+ErrorStats compute_errors(const std::vector<float> & actual,
+                          const std::vector<float> & expected)
+{
+    ErrorStats s{0.0, 0.0, 0.0};
+    if (actual.size() != expected.size()) return s;
+    double sum_sq = 0.0, sum_abs = 0.0;
+    for (size_t i = 0; i < actual.size(); i++) {
+        double e = std::abs(static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
+        s.max_abs = std::max(s.max_abs, e);
+        sum_sq  += e * e;
+        sum_abs += e;
+    }
+    s.rmse     = std::sqrt(sum_sq / static_cast<double>(actual.size()));
+    s.mean_abs = sum_abs / static_cast<double>(actual.size());
+    return s;
+}
+
+} // anonymous namespace
+
+TEST(T2SPrefillParity, FullPrefill) {
+    const std::string model_path = kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf";
+    FILE * f = fopen(model_path.c_str(), "rb");
+    if (!f) GTEST_SKIP() << "Model file not found: " << model_path;
+    fclose(f);
+
+    // Load reference data
+    const std::string ref_dir = kTestDir + "ref/";
+    auto ref_xy_pos = load_f32_bin(ref_dir + "xy_pos.bin");
+    auto ref_xy_dec = load_f32_bin(ref_dir + "xy_dec.bin");
+    auto ref_k_cache = load_f32_bin(ref_dir + "k_cache.bin");
+    auto ref_v_cache = load_f32_bin(ref_dir + "v_cache.bin");
+    ASSERT_FALSE(ref_xy_pos.empty());
+    ASSERT_FALSE(ref_xy_dec.empty());
+    ASSERT_FALSE(ref_k_cache.empty());
+    ASSERT_FALSE(ref_v_cache.empty());
+
+    // Reference dimensions: T_ref=52, T_in=28, T_prompt=113, total=193
+    const int64_t T_ref     = 52;
+    const int64_t T_in      = 28;
+    const int64_t T_prompt  = 113;
+    const int64_t T_total   = T_ref + T_in + T_prompt;  // 193
+
+    ggml_backend_t backend = create_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_model model;
+    ASSERT_TRUE(gpt_sovits::t2s_model_load(model_path, model, backend));
+
+    const int64_t d_model = model.hparams.hidden_dim;  // 512
+    const int     n_layer = (int) model.hparams.n_layer;  // 24
+
+    ASSERT_EQ((int64_t) ref_xy_pos.size(), d_model * T_total);
+    ASSERT_EQ((int64_t) ref_xy_dec.size(), d_model * T_total);
+
+    // Create session with enough space for 193 tokens
+    const uint32_t n_batch   = 1;
+    const uint32_t slot_size = 256;  // >= 193
+
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size));
+
+    // Set reference embedding dimensions for correct mask generation
+    session.ref_T_ref    = T_ref;
+    session.ref_T_prompt = T_prompt;
+
+    // Build flex graph for full prefill
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {(int) T_total};
+
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
+    ASSERT_NE(graph.ctx, nullptr);
+    ASSERT_EQ(graph.N, (int) T_total);
+
+    // Fill input tensor
+    ggml_backend_tensor_set(graph.x, ref_xy_pos.data(), 0,
+                            (size_t)(d_model * T_total) * sizeof(float));
+
+    // Advance session state (fills kv_pos, mask, updates n_pos)
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
+
+    // Compute
+    ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
+
+    // --- Verify output ---
+    std::vector<float> actual_y((size_t)(d_model * T_total));
+    ggml_backend_tensor_get(graph.y, actual_y.data(), 0, actual_y.size() * sizeof(float));
+
+    auto err_y = compute_errors(actual_y, ref_xy_dec);
+    EXPECT_LT(err_y.max_abs, 1.0)   << "Output max_abs error: " << err_y.max_abs;
+    EXPECT_LT(err_y.rmse, 0.1)      << "Output RMSE: " << err_y.rmse;
+
+    // --- Verify KV caches ---
+    const int64_t layer_elems = d_model * T_total;
+    const double kv_max_tol = 1.0;
+    const double kv_rmse_tol = 0.1;
+
+    for (int layer = 0; layer < n_layer; layer++) {
+        // Read first T_total columns from each cache
+        std::vector<float> actual_k((size_t) layer_elems);
+        ggml_backend_tensor_get(session.k_caches[layer], actual_k.data(), 0,
+                                (size_t) layer_elems * sizeof(float));
+
+        std::vector<float> expected_k(ref_k_cache.begin() + layer * layer_elems,
+                                       ref_k_cache.begin() + (layer + 1) * layer_elems);
+
+        auto err_k = compute_errors(actual_k, expected_k);
+        EXPECT_LT(err_k.max_abs, kv_max_tol)
+            << "K cache layer " << layer << " max_abs error: " << err_k.max_abs;
+        EXPECT_LT(err_k.rmse, kv_rmse_tol)
+            << "K cache layer " << layer << " RMSE: " << err_k.rmse;
+
+        std::vector<float> actual_v((size_t) layer_elems);
+        ggml_backend_tensor_get(session.v_caches[layer], actual_v.data(), 0,
+                                (size_t) layer_elems * sizeof(float));
+
+        std::vector<float> expected_v(ref_v_cache.begin() + layer * layer_elems,
+                                       ref_v_cache.begin() + (layer + 1) * layer_elems);
+
+        auto err_v = compute_errors(actual_v, expected_v);
+        EXPECT_LT(err_v.max_abs, kv_max_tol)
+            << "V cache layer " << layer << " max_abs error: " << err_v.max_abs;
+        EXPECT_LT(err_v.rmse, kv_rmse_tol)
+            << "V cache layer " << layer << " RMSE: " << err_v.rmse;
+    }
 
     gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
