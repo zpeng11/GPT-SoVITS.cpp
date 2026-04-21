@@ -56,31 +56,31 @@ struct ggml_tensor * sovits_extract_latent_block_forward(
 //
 // Parameters:
 //   ctx                - ggml context for tensor/op allocation
-//   y                  - hidden state from last attention layer  {d_model} or {d_model, 1}
+//   y                  - hidden states from last attention layer {d_model, n_batch}
 //   lm_head_w          - projection weight (no bias)            {d_model, vocab}
-//   seen_mask          - optional seen-token mask               {vocab} or {vocab, 1}
+//   seen_mask          - optional seen-token mask               {vocab, n_batch} or nullptr
 //                        Values are treated as binary via step(mask):
 //                        > 0 means token has appeared before.
 //   top_k              - <= 0 disables top-k filtering
 //   top_p              - >= 1 disables top-p filtering
 //   temperature        - logits are divided by max(temperature, 1e-5)
 //   repetition_penalty - 1.0 disables repetition penalty
-//   exp_noise      - optional Exp(1) noise samples      {vocab} or {vocab, 1}
-//                    When null, this falls back to greedy argmax.
+//   exp_noise          - optional Exp(1) noise samples          {vocab, n_batch} or nullptr
+//                        When null, this falls back to greedy argmax.
 //
 // Returns:
-//   next token id {1} (i32)
+//   t2s_sampler_result with per-slot token ids, each {n_batch} (i32).
 //
 // Notes:
-//   - This block targets single-sample inference.
+//   - Supports batched inference: each column of y is sampled independently.
 //   - Top-p is applied in sorted-logit space exactly as in AR.models.utils.
 //   - Masked logits use a large negative finite sentinel so softmax underflows
 //     them to zero without requiring a dedicated masked_fill op.
 //   - ggml does not provide a graph RNG op, so randomized sampling requires
 //     `exp_noise` to be supplied by the caller.
 struct t2s_sampler_result {
-    struct ggml_tensor * sampled;   // randomly sampled (or greedy) token  {1} (i32)
-    struct ggml_tensor * greedy;    // argmax token (before noise)         {1} (i32)
+    struct ggml_tensor * sampled;   // randomly sampled (or greedy) tokens {n_batch} (i32)
+    struct ggml_tensor * greedy;    // argmax tokens (before noise)        {n_batch} (i32)
 };
 
 struct t2s_sampler_result t2s_sampler_block_forward(

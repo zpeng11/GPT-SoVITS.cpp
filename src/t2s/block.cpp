@@ -278,30 +278,69 @@ t2s_sampler_result t2s_sampler_block_forward(
     float            repetition_penalty,
     ::ggml_tensor  * exp_noise)
 {
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(y != nullptr);
+    GGML_ASSERT(lm_head_w != nullptr);
+
+    // Project hidden states to logits: {d_model, n_batch} → {vocab, n_batch}
     ::ggml_tensor * logits = ggml_mul_mat(ctx, lm_head_w, y);
 
-    t2s_sampler_probs_result probs = build_sampler_probs(
-        ctx,
-        logits,
-        seen_mask,
-        top_k,
-        top_p,
-        temperature,
-        repetition_penalty);
+    const int64_t vocab   = logits->ne[0];
+    const int64_t n_batch = logits->ne[1];
+    GGML_ASSERT(n_batch >= 1);
 
-    // Greedy token: sorted_indices[0] is the argmax (highest logit after
-    // repetition penalty, before temperature/noise).
-    ::ggml_tensor * indices_vec = flatten_vector_like(ctx, probs.sorted_indices);
-    ::ggml_tensor * greedy = ggml_view_1d(ctx, indices_vec, 1, 0);
-    greedy = ggml_reshape_1d(ctx, ggml_cont(ctx, greedy), 1);
+    // Process each batch element independently via 1D column views.
+    // Columns of a contiguous {vocab, n_batch} tensor are contiguous
+    // (ne[0] is the innermost dimension), so ggml_view_1d works directly.
+    std::vector<::ggml_tensor *> sampled_list;
+    std::vector<::ggml_tensor *> greedy_list;
 
+    for (int64_t b = 0; b < n_batch; b++) {
+        // Extract 1D column view for batch element b.
+        ::ggml_tensor * logits_b = ggml_view_1d(ctx, logits, vocab, b * logits->nb[1]);
+
+        ::ggml_tensor * seen_mask_b = nullptr;
+        if (seen_mask != nullptr) {
+            seen_mask_b = ggml_view_1d(ctx, seen_mask, vocab, b * seen_mask->nb[1]);
+        }
+
+        ::ggml_tensor * exp_noise_b = nullptr;
+        if (exp_noise != nullptr) {
+            exp_noise_b = ggml_view_1d(ctx, exp_noise, vocab, b * exp_noise->nb[1]);
+        }
+
+        // Run 1D sampler logic on this batch element.
+        t2s_sampler_probs_result probs = build_sampler_probs(
+            ctx, logits_b, seen_mask_b, top_k, top_p, temperature, repetition_penalty);
+
+        // Greedy token: sorted_indices[0] is the argmax (highest logit after
+        // repetition penalty, before temperature/noise).
+        ::ggml_tensor * indices_vec = flatten_vector_like(ctx, probs.sorted_indices);
+        ::ggml_tensor * greedy = ggml_view_1d(ctx, indices_vec, 1, 0);
+        greedy = ggml_reshape_1d(ctx, ggml_cont(ctx, greedy), 1);
+
+        // Sampled token.
+        ::ggml_tensor * sampled = pick_sampler_token(
+            ctx, probs.probs_sorted, probs.sorted_indices, exp_noise_b);
+
+        sampled_list.push_back(sampled);
+        greedy_list.push_back(greedy);
+    }
+
+    // Combine per-batch results via concat along dim 0.
     t2s_sampler_result result;
-    result.sampled = pick_sampler_token(
-        ctx,
-        probs.probs_sorted,
-        probs.sorted_indices,
-        exp_noise);
-    result.greedy = greedy;
+    if (n_batch == 1) {
+        result.sampled = sampled_list[0];
+        result.greedy  = greedy_list[0];
+    } else {
+        result.sampled = sampled_list[0];
+        result.greedy  = greedy_list[0];
+        for (int64_t b = 1; b < n_batch; b++) {
+            result.sampled = ggml_concat(ctx, result.sampled, sampled_list[b], 0);
+            result.greedy  = ggml_concat(ctx, result.greedy,  greedy_list[b],  0);
+        }
+    }
+
     return result;
 }
 
