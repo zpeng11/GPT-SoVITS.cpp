@@ -326,6 +326,20 @@ bool t2s_model_load(const std::string & fname, t2s_model & model, ggml_backend_t
 void t2s_model_free(t2s_model & model);
 
 // ---------------------------------------------------------------------------
+// Sampler configuration (baked into decode graph at build time)
+// ---------------------------------------------------------------------------
+
+// Controls sampling behavior for the persistent decode graph.  These values
+// determine which ggml ops are added to the graph topology, so they cannot be
+// changed without rebuilding the graph.
+struct t2s_sampler_config {
+    int   top_k              = -1;     // <= 0 disables top-k filtering
+    float top_p              = 1.0f;   // >= 1.0 disables top-p filtering
+    float temperature        = 1.0f;   // logits are divided by max(temperature, 1e-5)
+    float repetition_penalty = 1.0f;   // 1.0 disables repetition penalty
+};
+
+// ---------------------------------------------------------------------------
 // T2S session: pre-allocated KV caches and slot management
 // ---------------------------------------------------------------------------
 
@@ -375,8 +389,18 @@ struct t2s_session {
     struct ggml_context * ctx_graph = nullptr;  // owned
     struct ggml_cgraph  * gf_dec    = nullptr;  // owned
     struct ggml_tensor  * x_dec     = nullptr;  // input  {d_model, n_batch} F32
-    struct ggml_tensor  * y_dec     = nullptr;  // output {d_model, n_batch} F32
     ggml_gallocr_t        alloc_dec = nullptr;  // owned — pre-allocates intermediate storage
+
+    // Sampler configuration (baked into decode graph topology at build time)
+    t2s_sampler_config   sampler_cfg;
+
+    // Sampler graph inputs (caller fills per decode step)
+    struct ggml_tensor  * seen_mask  = nullptr;  // {vocab, n_batch} F32
+    struct ggml_tensor  * exp_noise  = nullptr;  // {vocab, n_batch} F32
+
+    // Sampler graph outputs
+    struct ggml_tensor  * sampled    = nullptr;  // {n_batch} I32 — sampled token ids
+    struct ggml_tensor  * greedy     = nullptr;  // {n_batch} I32 — argmax token ids
 
     // Reference embedding (owned, computed once per session)
     struct ggml_context  * ctx_ref        = nullptr;  // owned - holds ref text/audio tensors
@@ -489,16 +513,26 @@ int64_t t2s_session_get_ref_T_prompt(const t2s_session & session);
 // after t2s_session_init; the graph is stored in the session and reused for
 // every subsequent decode step.
 //
+// The graph includes the sampler: hidden states from the last attention layer
+// are projected to logits via lm_head_w, then filtered and sampled according
+// to `sampler_cfg`.  The outputs are `sampled` and `greedy` token id tensors.
+//
 // IMPORTANT — this graph assumes **all** `n_batch` slots are occupied and
 // every slot is in the single-token decode phase (one new token per slot
 // per invocation).  It is NOT suitable for prefill where a slot may consume
 // many tokens at once.
-bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & model);
+bool t2s_session_build_decode_graph(
+    t2s_session             & session,
+    const t2s_model         & model,
+    const t2s_sampler_config & sampler_cfg = {});
 
 // Accessors for the decode graph.
 struct ggml_tensor * t2s_session_get_x_dec(const t2s_session & session);
-struct ggml_tensor * t2s_session_get_y_dec(const t2s_session & session);
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_sampled(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_greedy(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_seen_mask(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_exp_noise(const t2s_session & session);
 
 // ---------------------------------------------------------------------------
 // Flexible computation graph for mixed prefill/decode batch steps

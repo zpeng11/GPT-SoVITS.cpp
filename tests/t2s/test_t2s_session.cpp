@@ -60,9 +60,11 @@ TEST(T2SSession, InitAndFree) {
         expect_shape(session.v_caches[i], {d_model, max_ctx});
     }
 
-    expect_shape(session.kv_pos, {n_batch});
-    expect_shape(session.mask,   {max_ctx, n_batch});
-    expect_shape(session.x_dec,  {d_model, n_batch});
+    expect_shape(session.kv_pos,   {n_batch});
+    expect_shape(session.mask,     {max_ctx, n_batch});
+    expect_shape(session.x_dec,    {d_model, n_batch});
+    expect_shape(session.seen_mask, {hparams.vocab_size, n_batch});
+    expect_shape(session.exp_noise, {hparams.vocab_size, n_batch});
 
     EXPECT_EQ(session.n_batch, n_batch);
     EXPECT_EQ(session.slot_size, slot_size);
@@ -166,22 +168,41 @@ TEST(T2SSession, BuildDecodeGraph) {
 
     gpt_sovits::t2s_session session;
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size));
-    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model));
 
-    // Verify graph outputs
-    struct ggml_tensor * x_dec = gpt_sovits::t2s_session_get_x_dec(session);
-    struct ggml_tensor * y_dec = gpt_sovits::t2s_session_get_y_dec(session);
-    struct ggml_cgraph * gf    = gpt_sovits::t2s_session_get_decode_graph(session);
+    gpt_sovits::t2s_sampler_config sampler_cfg;
+    sampler_cfg.top_k              = 25;
+    sampler_cfg.top_p              = 0.95f;
+    sampler_cfg.temperature        = 1.0f;
+    sampler_cfg.repetition_penalty = 1.35f;
+
+    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model, sampler_cfg));
+
+    // Verify graph structure
+    struct ggml_tensor * x_dec     = gpt_sovits::t2s_session_get_x_dec(session);
+    struct ggml_cgraph * gf        = gpt_sovits::t2s_session_get_decode_graph(session);
+    struct ggml_tensor * sampled   = gpt_sovits::t2s_session_get_sampled(session);
+    struct ggml_tensor * greedy    = gpt_sovits::t2s_session_get_greedy(session);
+    struct ggml_tensor * seen_mask = gpt_sovits::t2s_session_get_seen_mask(session);
+    struct ggml_tensor * exp_noise = gpt_sovits::t2s_session_get_exp_noise(session);
 
     ASSERT_NE(x_dec, nullptr);
-    ASSERT_NE(y_dec, nullptr);
     ASSERT_NE(gf, nullptr);
+    ASSERT_NE(sampled, nullptr);
+    ASSERT_NE(greedy, nullptr);
+    ASSERT_NE(seen_mask, nullptr);
+    ASSERT_NE(exp_noise, nullptr);
 
     const int64_t d_model = model.hparams.hidden_dim;
-    expect_shape(x_dec, {d_model, n_batch});
-    expect_shape(y_dec, {d_model, n_batch});
+    const int64_t vocab   = model.hparams.vocab_size;
+    expect_shape(x_dec,     {d_model, n_batch});
+    expect_shape(seen_mask, {vocab, n_batch});
+    expect_shape(exp_noise, {vocab, n_batch});
+    expect_shape(sampled,   {n_batch});
+    expect_shape(greedy,    {n_batch});
 
-    // alloc_dec should have been created
+    EXPECT_EQ(sampled->type, GGML_TYPE_I32);
+    EXPECT_EQ(greedy->type,  GGML_TYPE_I32);
+
     EXPECT_NE(session.alloc_dec, nullptr);
 
     // Cleanup order: session first (references model weights), then model.
@@ -524,7 +545,7 @@ static gpt_sovits::t2s_model create_minimal_model(gpt_sovits::t2s_hparams hparam
     const int     n_layer = (int) hparams.n_layer;
 
     struct ggml_init_params wparams = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_layer * 12 + 3),
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_layer * 12 + 4),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -547,6 +568,7 @@ static gpt_sovits::t2s_model create_minimal_model(gpt_sovits::t2s_hparams hparam
         w.ln2_w       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
         w.ln2_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
     }
+    model.weights.lm_head_w = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, hparams.vocab_size);
     model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, backend);
 
     return model;

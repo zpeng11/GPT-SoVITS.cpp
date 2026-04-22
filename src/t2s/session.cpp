@@ -45,9 +45,11 @@ bool t2s_session_init(t2s_session      & session,
     const uint32_t n_layer  = hparams.n_layer;
     const int64_t  d_model  = (int64_t) hparams.hidden_dim;
     const int64_t  max_ctx  = (int64_t) n_batch * slot_size;
+    const int64_t  vocab    = (int64_t) hparams.vocab_size;
 
     // Total tensors: n_layer * 2 (K/V) + 1 (kv_pos) + 1 (mask) + 1 (x_dec)
-    const size_t n_tensors = (size_t) n_layer * 2 + 3;
+    //              + 2 (seen_mask, exp_noise)
+    const size_t n_tensors = (size_t) n_layer * 2 + 5;
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 1),
@@ -75,6 +77,10 @@ bool t2s_session_init(t2s_session      & session,
 
     // Decode input tensor: {d_model, n_batch}
     session.x_dec = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, d_model, n_batch);
+
+    // Sampler graph inputs: {vocab, n_batch}
+    session.seen_mask = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, vocab, n_batch);
+    session.exp_noise = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, vocab, n_batch);
 
     // Allocate backend buffer.
     session.backend = backend;
@@ -137,8 +143,11 @@ void t2s_session_free(t2s_session & session) {
         ggml_free(session.ctx_graph);
         session.ctx_graph = nullptr;
     }
-    session.gf_dec = nullptr;
-    session.y_dec  = nullptr;
+    session.gf_dec   = nullptr;
+    session.sampled  = nullptr;
+    session.greedy   = nullptr;
+    session.seen_mask = nullptr;
+    session.exp_noise = nullptr;
 
     if (session.buf_kv) {
         ggml_backend_buffer_free(session.buf_kv);
@@ -156,7 +165,9 @@ void t2s_session_free(t2s_session & session) {
     session.v_caches.clear();
     session.kv_pos = nullptr;
     session.mask   = nullptr;
-    session.x_dec  = nullptr;
+    session.x_dec    = nullptr;
+    session.seen_mask = nullptr;
+    session.exp_noise = nullptr;
     session.mask_host.clear();
 }
 
@@ -236,15 +247,23 @@ int t2s_session_get_n_kv(const t2s_session & session) {
     return (int) session.n_batch * session.slot_size;
 }
 
-bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & model) {
+bool t2s_session_build_decode_graph(
+    t2s_session             & session,
+    const t2s_model         & model,
+    const t2s_sampler_config & sampler_cfg)
+{
     const auto & hparams = model.hparams;
     const int64_t d_model = hparams.hidden_dim;
     const int     n_layer = (int) hparams.n_layer;
     const int     n_head  = (int) hparams.n_head;
     const int     n_kv    = t2s_session_get_n_kv(session);
+    const int     n_batch = (int) session.n_batch;
+
+    session.sampler_cfg = sampler_cfg;
 
     // Graph context: holds intermediate tensors and the cgraph structure.
-    const size_t n_intermediates = (size_t) n_layer * 32;
+    // Attention layers need ~32 intermediates each; sampler needs ~50 per batch element.
+    const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 50 + 8;
     const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
 
     struct ggml_init_params params = {
@@ -273,8 +292,30 @@ bool t2s_session_build_decode_graph(t2s_session & session, const t2s_model & mod
             model.weights.attention[i],
             n_kv, n_head, 1e-5f);
     }
-    ggml_build_forward_expand(session.gf_dec, x);
-    session.y_dec = x;
+
+    // Attach sampler: project hidden states to logits, apply filtering, sample tokens.
+    t2s_sampler_result sampler_result = t2s_sampler_block_forward(
+        session.ctx_graph,
+        x,                          // hidden states from last attention layer
+        model.weights.lm_head_w,    // {d_model, vocab} projection weight
+        session.seen_mask,          // {vocab, n_batch} graph input
+        sampler_cfg.top_k,
+        sampler_cfg.top_p,
+        sampler_cfg.temperature,
+        sampler_cfg.repetition_penalty,
+        session.exp_noise);         // {vocab, n_batch} graph input
+
+    // Mark outputs so the allocator preserves their storage.
+    ggml_set_name(sampler_result.sampled, "sampled");
+    ggml_set_output(sampler_result.sampled);
+    ggml_build_forward_expand(session.gf_dec, sampler_result.sampled);
+
+    ggml_set_name(sampler_result.greedy, "greedy");
+    ggml_set_output(sampler_result.greedy);
+    ggml_build_forward_expand(session.gf_dec, sampler_result.greedy);
+
+    session.sampled = sampler_result.sampled;
+    session.greedy  = sampler_result.greedy;
 
     // Pre-allocate intermediate tensor storage for stable data pointers.
     // This ensures CUDA Graph can reuse the captured graph even when other
@@ -297,12 +338,24 @@ struct ggml_tensor * t2s_session_get_x_dec(const t2s_session & session) {
     return session.x_dec;
 }
 
-struct ggml_tensor * t2s_session_get_y_dec(const t2s_session & session) {
-    return session.y_dec;
-}
-
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session) {
     return session.gf_dec;
+}
+
+struct ggml_tensor * t2s_session_get_sampled(const t2s_session & session) {
+    return session.sampled;
+}
+
+struct ggml_tensor * t2s_session_get_greedy(const t2s_session & session) {
+    return session.greedy;
+}
+
+struct ggml_tensor * t2s_session_get_seen_mask(const t2s_session & session) {
+    return session.seen_mask;
+}
+
+struct ggml_tensor * t2s_session_get_exp_noise(const t2s_session & session) {
+    return session.exp_noise;
 }
 
 // ---------------------------------------------------------------------------
