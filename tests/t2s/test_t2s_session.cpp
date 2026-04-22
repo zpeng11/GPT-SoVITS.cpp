@@ -26,7 +26,7 @@ static gpt_sovits::t2s_sampler_config default_sampler_cfg() {
 }
 
 // ---------------------------------------------------------------------------
-// Helpers
+// Helpers (shared across all test sections)
 // ---------------------------------------------------------------------------
 
 static void expect_shape(ggml_tensor * t, const std::vector<int64_t> & expected) {
@@ -35,6 +35,104 @@ static void expect_shape(ggml_tensor * t, const std::vector<int64_t> & expected)
         int64_t exp = (size_t)i < expected.size() ? expected[i] : 1;
         EXPECT_EQ(t->ne[i], exp) << "dim " << i << " mismatch";
     }
+}
+
+static float fp16_to_fp32(ggml_fp16_t v) { return ggml_fp16_to_fp32(v); }
+static ggml_fp16_t fp32_to_fp16(float v) { return ggml_fp32_to_fp16(v); }
+
+static int32_t read_kv_pos(const gpt_sovits::t2s_session & session, int slot_id) {
+    int32_t val = -1;
+    ggml_backend_tensor_get(session.kv_pos, &val,
+                            slot_id * sizeof(int32_t), sizeof(int32_t));
+    return val;
+}
+
+// Test helper: activate a slot with given n_pos for testing purposes.
+static void test_activate_slot(gpt_sovits::t2s_session & session, int slot_id, int n_pos) {
+    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+    const int slot_start  = slot_id * session.slot_size;
+    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
+
+    session.slots[slot_id].n_pos = n_pos;
+
+    for (int k = 0; k < n_pos; k++) {
+        session.mask_host[slot_id * max_ctx + slot_start + k] = zero;
+    }
+}
+
+// Helper: create a minimal model with zero-initialized weight tensors for graph building.
+static gpt_sovits::t2s_model create_minimal_model(gpt_sovits::t2s_hparams hparams, ggml_backend_t backend) {
+    gpt_sovits::t2s_model model;
+    model.hparams = hparams;
+
+    const int64_t d_model = hparams.hidden_dim;
+    const int64_t d_ff    = hparams.linear_units;
+    const int     n_layer = (int) hparams.n_layer;
+
+    struct ggml_init_params wparams = {
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_layer * 12 + 4),
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+    model.backend = backend;
+    model.ctx_w   = ggml_init(wparams);
+
+    model.weights.attention.resize(n_layer);
+    for (int i = 0; i < n_layer; i++) {
+        auto & w = model.weights.attention[i];
+        w.qkv_w       = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, 3 * d_model);
+        w.qkv_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, 3 * d_model);
+        w.out_proj_w  = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, d_model);
+        w.out_proj_b  = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
+        w.ln1_w       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
+        w.ln1_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
+        w.ffn_up_w    = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, d_ff);
+        w.ffn_up_b    = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_ff);
+        w.ffn_down_w  = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_ff, d_model);
+        w.ffn_down_b  = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
+        w.ln2_w       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
+        w.ln2_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
+    }
+    model.weights.lm_head_w = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, hparams.vocab_size);
+    model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, backend);
+
+    return model;
+}
+
+static std::vector<float> load_f32_bin(const std::string & path) {
+    std::ifstream f(path, std::ios::binary | std::ios::ate);
+    if (!f.is_open()) {
+        ADD_FAILURE() << "Failed to open: " << path;
+        return {};
+    }
+    auto size = static_cast<size_t>(f.tellg());
+    f.seekg(0);
+    std::vector<float> data(size / sizeof(float));
+    f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
+    return data;
+}
+
+struct ErrorStats {
+    double max_abs;
+    double rmse;
+    double mean_abs;
+};
+
+static ErrorStats compute_errors(const std::vector<float> & actual,
+                          const std::vector<float> & expected)
+{
+    ErrorStats s{0.0, 0.0, 0.0};
+    if (actual.size() != expected.size()) return s;
+    double sum_sq = 0.0, sum_abs = 0.0;
+    for (size_t i = 0; i < actual.size(); i++) {
+        double e = std::abs(static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
+        s.max_abs = std::max(s.max_abs, e);
+        sum_sq  += e * e;
+        sum_abs += e;
+    }
+    s.rmse     = std::sqrt(sum_sq / static_cast<double>(actual.size()));
+    s.mean_abs = sum_abs / static_cast<double>(actual.size());
+    return s;
 }
 
 // ---------------------------------------------------------------------------
@@ -107,23 +205,15 @@ TEST(T2SSession, DoubleFreeSafe) {
     ggml_backend_free(backend);
 }
 
+TEST(T2SBuildGraph, GraphFreeSafe) {
+    gpt_sovits::t2s_flex_graph graph;  // default-constructed
+    gpt_sovits::t2s_flex_graph_free(graph);
+    gpt_sovits::t2s_flex_graph_free(graph);  // double free
+}
+
 // ---------------------------------------------------------------------------
 // Slot management
 // ---------------------------------------------------------------------------
-
-// Test helper: activate a slot with given n_pos for testing purposes.
-// In production code, activation happens via t2s_session_flex_advance.
-static void test_activate_slot(gpt_sovits::t2s_session & session, int slot_id, int n_pos) {
-    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
-    const int slot_start  = slot_id * session.slot_size;
-    const ggml_fp16_t zero = ggml_fp32_to_fp16(0.0f);
-
-    session.slots[slot_id].n_pos = n_pos;
-
-    for (int k = 0; k < n_pos; k++) {
-        session.mask_host[slot_id * max_ctx + slot_start + k] = zero;
-    }
-}
 
 TEST(T2SSession, FindFreeSlot) {
     ggml_backend_t backend = create_backend();
@@ -217,37 +307,59 @@ TEST(T2SSession, BuildDecodeGraph) {
 }
 
 // ---------------------------------------------------------------------------
-// Mask management
+// Mask management (fixture)
 // ---------------------------------------------------------------------------
 
-static float fp16_to_fp32(ggml_fp16_t v) {
-    return ggml_fp16_to_fp32(v);
-}
+class T2SMaskTest : public ::testing::Test {
+protected:
+    void SetUp() override {
+        backend = create_backend();
+        ASSERT_NE(backend, nullptr);
+        ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
+        max_ctx = (int64_t)n_batch * slot_size;
+    }
 
-static ggml_fp16_t fp32_to_fp16(float v) {
-    return ggml_fp32_to_fp16(v);
-}
+    void TearDown() override {
+        gpt_sovits::t2s_session_free(session);
+        ggml_backend_free(backend);
+    }
 
-TEST(T2SSession, MaskInitAndActivate) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
+    void expect_mask_val(int slot, int row, float expected) {
+        float val = fp16_to_fp32(session.mask_host[(size_t)slot * max_ctx + row]);
+        if (std::isinf(expected) && expected < 0) {
+            EXPECT_TRUE(std::isinf(val) && val < 0)
+                << "mask_host[" << slot << "][" << row << "]";
+        } else {
+            EXPECT_EQ(val, expected)
+                << "mask_host[" << slot << "][" << row << "]";
+        }
+    }
 
+    void expect_slot_all_inf(int slot) {
+        for (int k = 0; k < max_ctx; k++) {
+            expect_mask_val(slot, k, -INFINITY);
+        }
+    }
+
+    static constexpr uint32_t n_batch   = 2;
+    static constexpr uint32_t slot_size = 8;
+
+    ggml_backend_t backend = nullptr;
     gpt_sovits::t2s_hparams hparams;
     gpt_sovits::t2s_session session;
+    int64_t max_ctx = 0;
+};
 
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    const int64_t max_ctx = (int64_t)n_batch * slot_size;
-
+TEST_F(T2SMaskTest, InitAllInf) {
     // All -inf initially.
     for (size_t i = 0; i < session.mask_host.size(); i++) {
         float val = fp16_to_fp32(session.mask_host[i]);
         EXPECT_TRUE(std::isinf(val) && val < 0)
             << "mask_host[" << i << "] = " << val << ", expected -inf";
     }
+}
 
+TEST_F(T2SMaskTest, ActivateAndCheck) {
     // Activate slot 0 with 3 prefilled tokens.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
@@ -255,94 +367,51 @@ TEST(T2SSession, MaskInitAndActivate) {
 
     // Column 0: rows [0, 3) should be 0, rest -inf.
     for (int k = 0; k < 3; k++) {
-        float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
-        EXPECT_EQ(val, 0.0f) << "mask_host[0][" << k << "] should be 0";
+        expect_mask_val(0, k, 0.0f);
     }
     for (int k = 3; k < max_ctx; k++) {
-        float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
-        EXPECT_TRUE(std::isinf(val) && val < 0)
-            << "mask_host[0][" << k << "] should be -inf";
+        expect_mask_val(0, k, -INFINITY);
     }
 
     // Column 1 should still be all -inf.
-    for (int k = 0; k < max_ctx; k++) {
-        float val = fp16_to_fp32(session.mask_host[1 * max_ctx + k]);
-        EXPECT_TRUE(std::isinf(val) && val < 0)
-            << "mask_host[1][" << k << "] should be -inf";
-    }
+    expect_slot_all_inf(1);
+}
 
+TEST_F(T2SMaskTest, DecodeAdvanceAndKvPos) {
+    // Re-init with slot_size=16 for this test.
     gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
-}
-
-static int32_t read_kv_pos(const gpt_sovits::t2s_session & session, int slot_id) {
-    int32_t val = -1;
-    ggml_backend_tensor_get(session.kv_pos, &val,
-                            slot_id * sizeof(int32_t), sizeof(int32_t));
-    return val;
-}
-
-TEST(T2SSession, DecodeAdvanceMaskAndKvPos) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 16;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    const int64_t max_ctx = (int64_t)n_batch * slot_size;
+    constexpr uint32_t ss = 16;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, ss));
+    max_ctx = (int64_t)n_batch * ss;
 
     // Activate both slots with different n_pos.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
     test_activate_slot(session, s0, 2);
-    int s1 = gpt_sovits::t2s_session_find_free_slot(session);
-    ASSERT_EQ(s1, 1);
-    test_activate_slot(session, s1, 5);
+    test_activate_slot(session, 1, 5);
 
     // First decode step.
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 2);   // slot 0: 0*16 + 2
-    EXPECT_EQ(read_kv_pos(session, s1), 21);  // slot 1: 1*16 + 5
+    EXPECT_EQ(read_kv_pos(session, 1), 21);  // slot 1: 1*16 + 5
 
     // Two more decode steps on slot 0 → total n_pos = 5.
     gpt_sovits::t2s_session_decode_advance(session);
     gpt_sovits::t2s_session_decode_advance(session);
     EXPECT_EQ(read_kv_pos(session, s0), 4);
-    EXPECT_EQ(read_kv_pos(session, s1), 23);
+    EXPECT_EQ(read_kv_pos(session, 1), 23);
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session, s0), 5);
 
     // Column 0: rows [0, 5) should be 0, rest -inf.
     for (int k = 0; k < 5; k++) {
-        float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
-        EXPECT_EQ(val, 0.0f) << "mask_host[0][" << k << "] should be 0";
+        expect_mask_val(0, k, 0.0f);
     }
     for (int k = 5; k < max_ctx; k++) {
-        float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
-        EXPECT_TRUE(std::isinf(val) && val < 0)
-            << "mask_host[0][" << k << "] should be -inf";
+        expect_mask_val(0, k, -INFINITY);
     }
-
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
 }
 
-TEST(T2SSession, SlotReleaseAndReuseMask) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    const int64_t max_ctx = (int64_t)n_batch * slot_size;
-
+TEST_F(T2SMaskTest, ReleaseAndReuse) {
     // Activate both, decode, then release slot 0.
     int s0 = gpt_sovits::t2s_session_find_free_slot(session);
     ASSERT_EQ(s0, 0);
@@ -352,25 +421,14 @@ TEST(T2SSession, SlotReleaseAndReuseMask) {
     gpt_sovits::t2s_session_slot_release(session, s0);
 
     // Column 0 should be all -inf after release.
-    for (int k = 0; k < max_ctx; k++) {
-        float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
-        EXPECT_TRUE(std::isinf(val) && val < 0)
-            << "after release, mask_host[0][" << k << "] should be -inf";
-    }
+    expect_slot_all_inf(0);
 
     // Re-activate slot 0 with 1 token.
     test_activate_slot(session, 0, 1);
-    float val0 = fp16_to_fp32(session.mask_host[0 * max_ctx + 0]);
-    EXPECT_EQ(val0, 0.0f) << "after re-activate, mask_host[0][0] should be 0";
-
+    expect_mask_val(0, 0, 0.0f);
     for (int k = 1; k < max_ctx; k++) {
-        float val = fp16_to_fp32(session.mask_host[0 * max_ctx + k]);
-        EXPECT_TRUE(std::isinf(val) && val < 0)
-            << "after re-activate, mask_host[0][" << k << "] should be -inf";
+        expect_mask_val(0, k, -INFINITY);
     }
-
-    gpt_sovits::t2s_session_free(session);
-    ggml_backend_free(backend);
 }
 
 // ---------------------------------------------------------------------------
@@ -495,7 +553,7 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
 }
 
 // ---------------------------------------------------------------------------
-// Flexible computation graph (t2s_session_build_flex_graph)
+// Flexible computation graph basics
 // ---------------------------------------------------------------------------
 
 TEST(T2SBatchPlan, Total) {
@@ -540,44 +598,9 @@ TEST(T2SBuildGraph, RejectsInvalidPlan) {
     ggml_backend_free(backend);
 }
 
-// Helper: create a minimal model with zero-initialized weight tensors for graph building.
-static gpt_sovits::t2s_model create_minimal_model(gpt_sovits::t2s_hparams hparams, ggml_backend_t backend) {
-    gpt_sovits::t2s_model model;
-    model.hparams = hparams;
-
-    const int64_t d_model = hparams.hidden_dim;
-    const int64_t d_ff    = hparams.linear_units;
-    const int     n_layer = (int) hparams.n_layer;
-
-    struct ggml_init_params wparams = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_layer * 12 + 4),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-    model.backend = backend;
-    model.ctx_w   = ggml_init(wparams);
-
-    model.weights.attention.resize(n_layer);
-    for (int i = 0; i < n_layer; i++) {
-        auto & w = model.weights.attention[i];
-        w.qkv_w       = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, 3 * d_model);
-        w.qkv_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, 3 * d_model);
-        w.out_proj_w  = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, d_model);
-        w.out_proj_b  = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
-        w.ln1_w       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
-        w.ln1_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
-        w.ffn_up_w    = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, d_ff);
-        w.ffn_up_b    = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_ff);
-        w.ffn_down_w  = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_ff, d_model);
-        w.ffn_down_b  = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
-        w.ln2_w       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
-        w.ln2_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
-    }
-    model.weights.lm_head_w = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, hparams.vocab_size);
-    model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, backend);
-
-    return model;
-}
+// ---------------------------------------------------------------------------
+// Flex graph shape & correctness tests
+// ---------------------------------------------------------------------------
 
 TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
@@ -833,14 +856,8 @@ TEST(T2SBuildGraph, MaskCorrectnessThreePart) {
     ggml_backend_free(backend);
 }
 
-TEST(T2SBuildGraph, GraphFreeSafe) {
-    gpt_sovits::t2s_flex_graph graph;  // default-constructed
-    gpt_sovits::t2s_flex_graph_free(graph);
-    gpt_sovits::t2s_flex_graph_free(graph);  // double free
-}
-
 // ---------------------------------------------------------------------------
-// t2s_session_flex_advance
+// Flex advance (positive tests)
 // ---------------------------------------------------------------------------
 
 TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
@@ -963,103 +980,61 @@ TEST(T2SAdvance, ActivatesIdleSlot) {
     ggml_backend_free(backend);
 }
 
-TEST(T2SAdvance, RejectsDecodeOnIdleSlot) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    // Slot 0 idle, try to decode on it (n_query=1) — should assert.
-    gpt_sovits::t2s_batch_plan plan;
-    plan.n_query = {1, 0};
-
-    auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
-    ASSERT_NE(graph.ctx, nullptr);
-
-    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
-
-    gpt_sovits::t2s_flex_graph_free(graph);
-    gpt_sovits::t2s_session_free(session);
-    gpt_sovits::t2s_model_free(model);
-    ggml_backend_free(backend);
-}
-
-TEST(T2SAdvance, RejectsPrefillOnActiveSlot) {
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_hparams hparams;
-    gpt_sovits::t2s_session session;
-    const uint32_t n_batch   = 2;
-    const uint32_t slot_size = 8;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
-
-    // Slot 0 active with n_pos=3, try to prefill (n_query>1) — should assert.
-    test_activate_slot(session, 0, 3);
-
-    gpt_sovits::t2s_batch_plan plan;
-    plan.n_query = {5, 0};
-
-    auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
-    ASSERT_NE(graph.ctx, nullptr);
-
-    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
-
-    gpt_sovits::t2s_flex_graph_free(graph);
-    gpt_sovits::t2s_session_free(session);
-    gpt_sovits::t2s_model_free(model);
-    ggml_backend_free(backend);
-}
-
 // ---------------------------------------------------------------------------
-// Prefill parity test: compare C++ flex graph output against Python reference
+// Flex advance (death tests — parameterized)
 // ---------------------------------------------------------------------------
 
-namespace {
-
-std::vector<float> load_f32_bin(const std::string & path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        ADD_FAILURE() << "Failed to open: " << path;
-        return {};
-    }
-    auto size = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    std::vector<float> data(size / sizeof(float));
-    f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
-    return data;
-}
-
-struct ErrorStats {
-    double max_abs;
-    double rmse;
-    double mean_abs;
+struct FlexAdvanceDeathParams {
+    int initial_n_pos;   // 0 = idle slot
+    int n_query;         // >1 = prefill attempt on active slot
+    const char * description;
 };
 
-ErrorStats compute_errors(const std::vector<float> & actual,
-                          const std::vector<float> & expected)
-{
-    ErrorStats s{0.0, 0.0, 0.0};
-    if (actual.size() != expected.size()) return s;
-    double sum_sq = 0.0, sum_abs = 0.0;
-    for (size_t i = 0; i < actual.size(); i++) {
-        double e = std::abs(static_cast<double>(actual[i]) - static_cast<double>(expected[i]));
-        s.max_abs = std::max(s.max_abs, e);
-        sum_sq  += e * e;
-        sum_abs += e;
+class T2SAdvanceDeathTest : public ::testing::TestWithParam<FlexAdvanceDeathParams> {
+protected:
+    void SetUp() override {
+        backend = create_backend();
+        ASSERT_NE(backend, nullptr);
+        ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, 2, 8));
     }
-    s.rmse     = std::sqrt(sum_sq / static_cast<double>(actual.size()));
-    s.mean_abs = sum_abs / static_cast<double>(actual.size());
-    return s;
+    void TearDown() override {
+        gpt_sovits::t2s_session_free(session);
+        ggml_backend_free(backend);
+    }
+
+    ggml_backend_t backend = nullptr;
+    gpt_sovits::t2s_hparams hparams;
+    gpt_sovits::t2s_session session;
+};
+
+TEST_P(T2SAdvanceDeathTest, RejectsInvalidTransition) {
+    const auto & p = GetParam();
+    if (p.initial_n_pos > 0) {
+        test_activate_slot(session, 0, p.initial_n_pos);
+    }
+
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query = {p.n_query, 0};
+
+    auto model = create_minimal_model(hparams, backend);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    ASSERT_NE(graph.ctx, nullptr);
+
+    EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
+
+    gpt_sovits::t2s_flex_graph_free(graph);
+    gpt_sovits::t2s_model_free(model);
 }
 
-} // anonymous namespace
+INSTANTIATE_TEST_SUITE_P(, T2SAdvanceDeathTest,
+    ::testing::Values(
+        FlexAdvanceDeathParams{0, 1, "decode on idle slot"},
+        FlexAdvanceDeathParams{3, 5, "prefill on active slot"}
+    ));
+
+// ---------------------------------------------------------------------------
+// Prefill parity tests (parameterized)
+// ---------------------------------------------------------------------------
 
 // Shared prefill parity test body. `label` is used in log messages.
 // `kv_cache_type` controls KV cache element type (F32 or quantized).
@@ -1222,96 +1197,82 @@ static void run_prefill_parity_test(
     ggml_backend_free(backend);
 }
 
-// --- Weight-only quantization (F32 KV cache) ---
+struct PrefillParityParams {
+    std::string model_file;
+    const char * label;
+    double y_max, y_rmse, kv_max, kv_rmse;
+    ggml_type kv_type;
+};
 
-TEST(T2SPrefillParity, FullPrefillF16) {
+class T2SPrefillParity : public ::testing::TestWithParam<PrefillParityParams> {};
+
+TEST_P(T2SPrefillParity, FullPrefill) {
+    const auto & p = GetParam();
     run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf",
-        "f16",
-        /*y_max_tol=*/1.0, /*y_rmse_tol=*/0.1,
-        /*kv_max_tol=*/1.0, /*kv_rmse_tol=*/0.1);
+        kTestDir + "models/" + p.model_file,
+        p.label, p.y_max, p.y_rmse, p.kv_max, p.kv_rmse, p.kv_type);
 }
 
-TEST(T2SPrefillParity, FullPrefillQ8) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-q8.gguf",
-        "q8",
-        /*y_max_tol=*/2.0, /*y_rmse_tol=*/0.3,
-        /*kv_max_tol=*/2.0, /*kv_rmse_tol=*/0.3);
-}
+static const PrefillParityParams kPrefillParityCases[] = {
+    // Weight-only quantization (F32 KV cache)
+    {"s1v3-s2Gv2Pro-f16.gguf",          "f16",            1, 0.1,  1, 0.1, GGML_TYPE_F32},
+    {"s1v3-s2Gv2Pro-q8.gguf",           "q8",             2, 0.3,  2, 0.3, GGML_TYPE_F32},
+    {"s1v3-s2Gv2Pro-q4.gguf",           "q4",             5, 1.0,  5, 1.0, GGML_TYPE_F32},
+    // Weight + KV cache quantized (Q8_0)
+    {"s1v3-s2Gv2Pro-f16.gguf",          "f16+q8kv",       2, 0.3,  2, 0.3, GGML_TYPE_Q8_0},
+    {"s1v3-s2Gv2Pro-q8.gguf",           "q8+q8kv",        2, 0.3,  2, 0.3, GGML_TYPE_Q8_0},
+    {"s1v3-s2Gv2Pro-q4.gguf",           "q4+q8kv",        5, 1.0,  5, 1.0, GGML_TYPE_Q8_0},
+    // Weight + KV cache quantized (Q4_0)
+    {"s1v3-s2Gv2Pro-f16.gguf",          "f16+q4kv",       5, 1.0,  5, 1.0, GGML_TYPE_Q4_0},
+    {"s1v3-s2Gv2Pro-q8.gguf",           "q8+q4kv",        5, 1.0,  5, 1.0, GGML_TYPE_Q4_0},
+    {"s1v3-s2Gv2Pro-q4.gguf",           "q4+q4kv",       10, 2.0, 10, 2.0, GGML_TYPE_Q4_0},
+    // ProPlus model — verifies sampler integration doesn't affect attention output
+    {"s1v3-s2Gv2ProPlus-f16.gguf",      "ProPlus_f16",    2, 0.5,  2, 0.5, GGML_TYPE_F32},
+};
 
-TEST(T2SPrefillParity, FullPrefillQ4) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-q4.gguf",
-        "q4",
-        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
-        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0);
-}
-
-// --- Weight + KV cache quantized (Q8_0 KV cache) ---
-
-TEST(T2SPrefillParity, F16WeightQ8KV) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf",
-        "f16+q8kv",
-        /*y_max_tol=*/2.0, /*y_rmse_tol=*/0.3,
-        /*kv_max_tol=*/2.0, /*kv_rmse_tol=*/0.3,
-        GGML_TYPE_Q8_0);
-}
-
-TEST(T2SPrefillParity, Q8WeightQ8KV) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-q8.gguf",
-        "q8+q8kv",
-        /*y_max_tol=*/2.0, /*y_rmse_tol=*/0.3,
-        /*kv_max_tol=*/2.0, /*kv_rmse_tol=*/0.3,
-        GGML_TYPE_Q8_0);
-}
-
-TEST(T2SPrefillParity, Q4WeightQ8KV) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-q4.gguf",
-        "q4+q8kv",
-        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
-        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0,
-        GGML_TYPE_Q8_0);
-}
-
-// --- Weight + KV cache quantized (Q4_0 KV cache) ---
-
-TEST(T2SPrefillParity, F16WeightQ4KV) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-f16.gguf",
-        "f16+q4kv",
-        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
-        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0,
-        GGML_TYPE_Q4_0);
-}
-
-TEST(T2SPrefillParity, Q8WeightQ4KV) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-q8.gguf",
-        "q8+q4kv",
-        /*y_max_tol=*/5.0, /*y_rmse_tol=*/1.0,
-        /*kv_max_tol=*/5.0, /*kv_rmse_tol=*/1.0,
-        GGML_TYPE_Q4_0);
-}
-
-TEST(T2SPrefillParity, Q4WeightQ4KV) {
-    run_prefill_parity_test(
-        kTestDir + "models/s1v3-s2Gv2Pro-q4.gguf",
-        "q4+q4kv",
-        /*y_max_tol=*/10.0, /*y_rmse_tol=*/2.0,
-        /*kv_max_tol=*/10.0, /*kv_rmse_tol=*/2.0,
-        GGML_TYPE_Q4_0);
-}
+INSTANTIATE_TEST_SUITE_P(, T2SPrefillParity,
+    ::testing::ValuesIn(kPrefillParityCases));
 
 // ---------------------------------------------------------------------------
 // Flex graph sampler tests
 // ---------------------------------------------------------------------------
 
+// Helper: fill inputs, compute, and verify sampler outputs are valid token IDs.
+static void fill_compute_and_check_sampler(
+    gpt_sovits::t2s_session & session,
+    gpt_sovits::t2s_model & model,
+    const gpt_sovits::t2s_batch_plan & plan,
+    gpt_sovits::t2s_flex_graph & graph,
+    ggml_backend_t backend,
+    int64_t d_model, int64_t vocab, int N)
+{
+    // Fill x with zeros (zero hidden states + zero weights → uniform logits → valid tokens).
+    std::vector<float> zeros_x((size_t)(d_model * N), 0.0f);
+    ggml_backend_tensor_set(graph.x, zeros_x.data(), 0, zeros_x.size() * sizeof(float));
+
+    // Fill exp_noise with ones so div(noise) is a no-op.
+    std::vector<float> ones_noise((size_t)(vocab * graph.n_active), 1.0f);
+    ggml_backend_tensor_set(graph.exp_noise, ones_noise.data(), 0, ones_noise.size() * sizeof(float));
+
+    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
+    ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
+
+    // Read sampler outputs
+    std::vector<int32_t> sampled(graph.n_active), greedy(graph.n_active);
+    ggml_backend_tensor_get(graph.sampled, sampled.data(), 0, graph.n_active * sizeof(int32_t));
+    ggml_backend_tensor_get(graph.greedy,  greedy.data(),  0, graph.n_active * sizeof(int32_t));
+
+    // Token IDs must be in [0, vocab)
+    for (int b = 0; b < graph.n_active; b++) {
+        EXPECT_GE(sampled[b], 0) << "slot " << b;
+        EXPECT_LT(sampled[b], (int32_t) vocab) << "slot " << b;
+        EXPECT_GE(greedy[b], 0) << "slot " << b;
+        EXPECT_LT(greedy[b], (int32_t) vocab) << "slot " << b;
+    }
+}
+
 // Verify that sampler outputs have correct shapes and are valid token IDs.
-TEST(T2SFlexSampler, ShapeAndTokenRange) {
+TEST(T2SFlexSampler, DecodeOnly) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -1345,29 +1306,7 @@ TEST(T2SFlexSampler, ShapeAndTokenRange) {
     expect_shape(graph.sampled,   {2});
     expect_shape(graph.greedy,    {2});
 
-    // Fill inputs with zeros (zero hidden states + zero weights → uniform logits → valid tokens)
-    std::vector<float> zeros_x((size_t)(d_model * 2), 0.0f);
-    ggml_backend_tensor_set(graph.x, zeros_x.data(), 0, zeros_x.size() * sizeof(float));
-
-    // Fill exp_noise with ones so div(noise) is a no-op.
-    std::vector<float> ones_noise((size_t)(vocab * 2), 1.0f);
-    ggml_backend_tensor_set(graph.exp_noise, ones_noise.data(), 0, ones_noise.size() * sizeof(float));
-
-    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
-    ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
-
-    // Read sampler outputs
-    std::vector<int32_t> sampled(2), greedy(2);
-    ggml_backend_tensor_get(graph.sampled, sampled.data(), 0, 2 * sizeof(int32_t));
-    ggml_backend_tensor_get(graph.greedy,  greedy.data(),  0, 2 * sizeof(int32_t));
-
-    // Token IDs must be in [0, vocab)
-    for (int b = 0; b < 2; b++) {
-        EXPECT_GE(sampled[b], 0) << "slot " << b;
-        EXPECT_LT(sampled[b], (int32_t) vocab) << "slot " << b;
-        EXPECT_GE(greedy[b], 0) << "slot " << b;
-        EXPECT_LT(greedy[b], (int32_t) vocab) << "slot " << b;
-    }
+    fill_compute_and_check_sampler(session, model, plan, graph, backend, d_model, vocab, 2);
 
     gpt_sovits::t2s_flex_graph_free(graph);
     gpt_sovits::t2s_session_free(session);
@@ -1377,7 +1316,7 @@ TEST(T2SFlexSampler, ShapeAndTokenRange) {
 
 // Verify sampler with prefill: only the last token is sampled.
 // With mixed prefill + decode in one plan.
-TEST(T2SFlexSampler, PrefillSamplesLastTokenOnly) {
+TEST(T2SFlexSampler, MixedPrefillAndDecode) {
     ggml_backend_t backend = create_backend();
     ASSERT_NE(backend, nullptr);
 
@@ -1414,32 +1353,11 @@ TEST(T2SFlexSampler, PrefillSamplesLastTokenOnly) {
     expect_shape(graph.sampled,   {2});
     expect_shape(graph.greedy,    {2});
 
-    // Fill inputs
-    std::vector<float> zeros_x((size_t)(d_model * 8), 0.0f);
-    ggml_backend_tensor_set(graph.x, zeros_x.data(), 0, zeros_x.size() * sizeof(float));
-
-    std::vector<float> ones_noise((size_t)(vocab * 2), 1.0f);
-    ggml_backend_tensor_set(graph.exp_noise, ones_noise.data(), 0, ones_noise.size() * sizeof(float));
-
-    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
-    ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
-
-    // Read sampler outputs
-    std::vector<int32_t> sampled(2), greedy(2);
-    ggml_backend_tensor_get(graph.sampled, sampled.data(), 0, 2 * sizeof(int32_t));
-    ggml_backend_tensor_get(graph.greedy,  greedy.data(),  0, 2 * sizeof(int32_t));
-
-    for (int b = 0; b < 2; b++) {
-        EXPECT_GE(sampled[b], 0);
-        EXPECT_LT(sampled[b], (int32_t) vocab);
-        EXPECT_GE(greedy[b], 0);
-        EXPECT_LT(greedy[b], (int32_t) vocab);
-    }
+    fill_compute_and_check_sampler(session, model, plan, graph, backend, d_model, vocab, 8);
 
     // Verify y still has correct shape (full attention output, not truncated)
     std::vector<float> y_data((size_t)(d_model * 8));
     ggml_backend_tensor_get(graph.y, y_data.data(), 0, y_data.size() * sizeof(float));
-    // y should have 8 * d_model elements and be readable
     EXPECT_EQ((int64_t) y_data.size(), d_model * 8);
 
     gpt_sovits::t2s_flex_graph_free(graph);
@@ -1447,89 +1365,3 @@ TEST(T2SFlexSampler, PrefillSamplesLastTokenOnly) {
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
 }
-
-// Verify that adding the sampler does not change the attention output (graph.y).
-// Uses the full prefill parity test data and checks graph.y matches reference.
-TEST(T2SFlexSampler, PrefillParitySamplerDoesNotAffectY) {
-    const std::string model_path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
-    FILE * f = fopen(model_path.c_str(), "rb");
-    if (!f) GTEST_SKIP() << "Model file not found: " << model_path;
-    fclose(f);
-
-    // Load reference data
-    const std::string ref_dir = kTestDir + "ref/";
-    auto ref_xy_pos = load_f32_bin(ref_dir + "xy_pos.bin");
-    auto ref_xy_dec = load_f32_bin(ref_dir + "xy_dec.bin");
-    ASSERT_FALSE(ref_xy_pos.empty());
-    ASSERT_FALSE(ref_xy_dec.empty());
-
-    const int64_t T_ref     = 52;
-    const int64_t T_in      = 28;
-    const int64_t T_prompt  = 113;
-    const int64_t T_total   = T_ref + T_in + T_prompt;  // 193
-
-    ggml_backend_t backend = create_backend();
-    ASSERT_NE(backend, nullptr);
-
-    gpt_sovits::t2s_model model;
-    ASSERT_TRUE(gpt_sovits::t2s_model_load(model_path, model, backend));
-
-    const int64_t d_model = model.hparams.hidden_dim;
-
-    ASSERT_EQ((int64_t) ref_xy_pos.size(), d_model * T_total);
-    ASSERT_EQ((int64_t) ref_xy_dec.size(), d_model * T_total);
-
-    const uint32_t n_batch   = 1;
-    const uint32_t slot_size = 256;
-
-    gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size));
-
-    session.ref_T_ref    = T_ref;
-    session.ref_T_prompt = T_prompt;
-
-    gpt_sovits::t2s_batch_plan plan;
-    plan.n_query = {(int) T_total};
-
-    // Build graph WITH sampler
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
-    ASSERT_NE(graph.ctx, nullptr);
-
-    // Verify sampler fields are populated
-    EXPECT_EQ(graph.n_active, 1);
-    ASSERT_NE(graph.sampled, nullptr);
-    ASSERT_NE(graph.greedy, nullptr);
-    EXPECT_EQ(graph.seen_mask, nullptr);  // repetition_penalty=1.0 → not created
-    ASSERT_NE(graph.exp_noise, nullptr);
-
-    // Fill inputs
-    ggml_backend_tensor_set(graph.x, ref_xy_pos.data(), 0,
-                            (size_t)(d_model * T_total) * sizeof(float));
-
-    // Fill sampler inputs (zeros for deterministic behavior)
-    const int64_t vocab = model.hparams.vocab_size;
-
-    std::vector<float> ones_noise((size_t) vocab, 1.0f);
-    ggml_backend_tensor_set(graph.exp_noise, ones_noise.data(), 0, ones_noise.size() * sizeof(float));
-
-    gpt_sovits::t2s_session_flex_advance(session, plan, graph);
-    ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
-
-    // Check graph.y matches reference — this proves the sampler doesn't affect y.
-    std::vector<float> actual_y((size_t)(d_model * T_total));
-    ggml_backend_tensor_get(graph.y, actual_y.data(), 0, actual_y.size() * sizeof(float));
-
-    auto err_y = compute_errors(actual_y, ref_xy_dec);
-    printf("  [sampler-prefill-parity] Output  max_abs=%.6f  RMSE=%.6f\n",
-           err_y.max_abs, err_y.rmse);
-    EXPECT_LT(err_y.max_abs, 2.0)
-        << "sampler should not affect attention output";
-    EXPECT_LT(err_y.rmse, 0.5)
-        << "sampler should not affect attention output";
-
-    gpt_sovits::t2s_flex_graph_free(graph);
-    gpt_sovits::t2s_session_free(session);
-    gpt_sovits::t2s_model_free(model);
-    ggml_backend_free(backend);
-}
-
