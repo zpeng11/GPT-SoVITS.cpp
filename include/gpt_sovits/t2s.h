@@ -562,12 +562,19 @@ struct t2s_flex_graph {
     struct ggml_tensor * kv_pos = nullptr;   // {N} I32  (filled by t2s_session_flex_advance)
     struct ggml_tensor * mask   = nullptr;   // {n_kv, N} F16  (filled by t2s_session_flex_advance)
 
+    // Sampler inputs/outputs (caller fills seen_mask/exp_noise, reads sampled/greedy)
+    struct ggml_tensor * seen_mask = nullptr;  // {vocab, n_active} F32 input (optional)
+    struct ggml_tensor * exp_noise = nullptr;  // {vocab, n_active} F32 input (optional)
+    struct ggml_tensor * sampled   = nullptr;  // {n_active} I32 output
+    struct ggml_tensor * greedy    = nullptr;  // {n_active} I32 output
+
     // ggml resources (ctx/gf owned, backend borrowed from session)
     struct ggml_context * ctx     = nullptr;
     struct ggml_cgraph  * gf      = nullptr;
     ggml_backend_t        backend = nullptr;  // borrowed from session
 
-    int N = 0;   // total query tokens (sum of active slot n_query)
+    int N        = 0;  // total query tokens (sum of active slot n_query)
+    int n_active = 0;  // number of active slots (sampler batch dim)
 };
 
 // Build a flexible computation graph for the given batch plan.
@@ -576,6 +583,14 @@ struct t2s_flex_graph {
 // Creates input tensors (x, kv_pos, mask) with shapes derived from the plan.
 // kv_pos and mask are left uninitialized — call t2s_session_flex_advance to fill
 // them and advance session state before executing the graph.
+//
+// After the transformer layers, the sampler is attached.  For each active slot,
+// only the last token's hidden state is extracted for sampling:
+//   - decode slots (n_query == 1): the single token
+//   - prefill slots (n_query > 1): the last token in the prefill sequence
+// The extracted columns are concatenated into y_sample {d_model, n_active} and
+// passed to t2s_sampler_block_forward.  The full attention output y is still
+// available as graph.y for verification purposes.
 //
 // A shared allocator (session.alloc_flex) is created on first call and reused
 // across subsequent calls.  The allocator's buffer is retained between builds,
@@ -587,9 +602,10 @@ struct t2s_flex_graph {
 // Returns a t2s_flex_graph with ctx != nullptr on success, or an empty graph
 // on failure.  Call t2s_flex_graph_free when done (frees ctx only, not the allocator).
 t2s_flex_graph t2s_session_build_flex_graph(
-    t2s_session          & session,
-    const t2s_model      & model,
-    const t2s_batch_plan & plan);
+    t2s_session             & session,
+    const t2s_model         & model,
+    const t2s_batch_plan    & plan,
+    const t2s_sampler_config & sampler_cfg);
 
 // Free all resources owned by a t2s_flex_graph.
 void t2s_flex_graph_free(t2s_flex_graph & graph);

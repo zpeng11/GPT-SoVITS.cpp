@@ -386,9 +386,10 @@ void t2s_flex_graph_free(t2s_flex_graph & graph) {
 }
 
 t2s_flex_graph t2s_session_build_flex_graph(
-    t2s_session          & session,
-    const t2s_model      & model,
-    const t2s_batch_plan & plan)
+    t2s_session             & session,
+    const t2s_model         & model,
+    const t2s_batch_plan    & plan,
+    const t2s_sampler_config & sampler_cfg)
 {
     t2s_flex_graph graph;
 
@@ -408,9 +409,17 @@ t2s_flex_graph t2s_session_build_flex_graph(
     const int     n_layer = (int) hparams.n_layer;
     const int     n_head  = (int) hparams.n_head;
     const int     n_kv    = t2s_session_get_n_kv(session);
+    const int64_t vocab   = hparams.vocab_size;
+
+    // Count active slots for sampler batch dimension.
+    int n_active = 0;
+    for (int i = 0; i < (int) plan.n_query.size(); i++) {
+        if (plan.n_query[i] > 0) n_active++;
+    }
 
     // --- 1. Create graph context and tensors ---
-    const size_t n_intermediates = (size_t) n_layer * 32;
+    // Attention layers need ~32 intermediates each; sampler needs ~50 per active slot.
+    const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_active * 50 + 8;
     const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
 
     struct ggml_init_params params = {
@@ -438,7 +447,7 @@ t2s_flex_graph t2s_session_build_flex_graph(
     ggml_set_name(graph.mask, "mask");
     ggml_set_input(graph.mask);
 
-    // --- 2. Build computation graph ---
+    // --- 2. Build transformer layers ---
     graph.gf = ggml_new_graph_custom(graph.ctx, graph_size, false);
 
     struct ggml_tensor * cur = graph.x;
@@ -451,12 +460,84 @@ t2s_flex_graph t2s_session_build_flex_graph(
             model.weights.attention[i],
             n_kv, n_head, 1e-5f);
     }
-    ggml_build_forward_expand(graph.gf, cur);
+
+    // Mark full attention output as graph output (for verification / parity tests).
     graph.y = cur;
     ggml_set_name(graph.y, "y_out");
     ggml_set_output(graph.y);
+    ggml_build_forward_expand(graph.gf, graph.y);
 
-    // --- 3. Allocate intermediate storage (reuse session allocator) ---
+    // --- 3. Attach sampler ---
+    // For each active slot, extract the last token's hidden state:
+    //   - decode (n_query == 1): the single column
+    //   - prefill (n_query > 1): the last column in the slot's range
+    {
+        struct ggml_tensor * y = cur;  // {d_model, N}
+
+        // Collect per-slot column views from y.
+        std::vector<struct ggml_tensor *> sample_cols;
+        int offset = 0;
+        for (int i = 0; i < (int) plan.n_query.size(); i++) {
+            if (plan.n_query[i] > 0) {
+                int col_idx = offset + plan.n_query[i] - 1;
+                struct ggml_tensor * col = ggml_view_2d(
+                    graph.ctx, y, d_model, 1,
+                    y->nb[1], (size_t) col_idx * y->nb[1]);
+                sample_cols.push_back(col);
+            }
+            offset += plan.n_query[i];
+        }
+
+        // Concat into y_sample = {d_model, n_active}.
+        struct ggml_tensor * y_sample;
+        if (sample_cols.size() == 1) {
+            y_sample = sample_cols[0];
+        } else {
+            y_sample = sample_cols[0];
+            for (size_t i = 1; i < sample_cols.size(); i++) {
+                y_sample = ggml_concat(graph.ctx, y_sample, sample_cols[i], 1);
+            }
+        }
+
+        // Sampler graph inputs.
+        // seen_mask is only reachable in the graph when repetition_penalty != 1.0,
+        // so only create it when it will actually be used by the sampler.
+        struct ggml_tensor * seen_mask_arg = nullptr;
+        if (sampler_cfg.repetition_penalty != 1.0f) {
+            graph.seen_mask = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, vocab, n_active);
+            ggml_set_name(graph.seen_mask, "seen_mask");
+            ggml_set_input(graph.seen_mask);
+            seen_mask_arg = graph.seen_mask;
+        }
+
+        graph.exp_noise = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, vocab, n_active);
+        ggml_set_name(graph.exp_noise, "exp_noise");
+        ggml_set_input(graph.exp_noise);
+
+        // Attach sampler: project hidden states to logits, apply filtering, sample tokens.
+        t2s_sampler_result sampler_result = t2s_sampler_block_forward(
+            graph.ctx,
+            y_sample,
+            model.weights.lm_head_w,
+            seen_mask_arg,
+            sampler_cfg.top_k,
+            sampler_cfg.top_p,
+            sampler_cfg.temperature,
+            sampler_cfg.repetition_penalty,
+            graph.exp_noise);
+
+        graph.sampled = sampler_result.sampled;
+        ggml_set_name(graph.sampled, "sampled");
+        ggml_set_output(graph.sampled);
+        ggml_build_forward_expand(graph.gf, graph.sampled);
+
+        graph.greedy = sampler_result.greedy;
+        ggml_set_name(graph.greedy, "greedy");
+        ggml_set_output(graph.greedy);
+        ggml_build_forward_expand(graph.gf, graph.greedy);
+    }
+
+    // --- 4. Allocate intermediate storage (reuse session allocator) ---
     if (!session.alloc_flex) {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
         session.alloc_flex = ggml_gallocr_new(buft);
@@ -473,7 +554,8 @@ t2s_flex_graph t2s_session_build_flex_graph(
     }
 
     graph.backend = session.backend;
-    graph.N = N;
+    graph.N       = N;
+    graph.n_active = n_active;
 
     return graph;
 }
