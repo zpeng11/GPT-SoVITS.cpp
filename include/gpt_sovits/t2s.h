@@ -333,10 +333,10 @@ void t2s_model_free(t2s_model & model);
 // determine which ggml ops are added to the graph topology, so they cannot be
 // changed without rebuilding the graph.
 struct t2s_sampler_config {
-    int   top_k              = -1;     // <= 0 disables top-k filtering
+    int   top_k              = 15;      // <= 0 disables top-k filtering
     float top_p              = 1.0f;   // >= 1.0 disables top-p filtering
     float temperature        = 1.0f;   // logits are divided by max(temperature, 1e-5)
-    float repetition_penalty = 1.0f;   // 1.0 disables repetition penalty
+    float repetition_penalty = 1.35f;  // 1.0 disables repetition penalty
 };
 
 // ---------------------------------------------------------------------------

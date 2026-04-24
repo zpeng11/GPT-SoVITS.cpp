@@ -640,7 +640,7 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     expect_shape(graph.y,      {d_model, 9});
     expect_shape(graph.kv_pos, {9});
     expect_shape(graph.mask,   {max_ctx, 9});
-    EXPECT_EQ(graph.seen_mask, nullptr);  // repetition_penalty=1.0 → not created
+    expect_shape(graph.seen_mask, {(int64_t)model.hparams.vocab_size, 3});
     expect_shape(graph.exp_noise, {(int64_t)model.hparams.vocab_size, 3});
     expect_shape(graph.sampled,   {3});
     expect_shape(graph.greedy,    {3});
@@ -1254,6 +1254,12 @@ static void fill_compute_and_check_sampler(
     std::vector<float> ones_noise((size_t)(vocab * graph.n_active), 1.0f);
     ggml_backend_tensor_set(graph.exp_noise, ones_noise.data(), 0, ones_noise.size() * sizeof(float));
 
+    // Fill seen_mask with zeros (no tokens seen → repetition penalty is a no-op).
+    if (graph.seen_mask) {
+        std::vector<float> zeros_seen((size_t)(vocab * graph.n_active), 0.0f);
+        ggml_backend_tensor_set(graph.seen_mask, zeros_seen.data(), 0, zeros_seen.size() * sizeof(float));
+    }
+
     gpt_sovits::t2s_session_flex_advance(session, plan, graph);
     ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
 
@@ -1301,7 +1307,7 @@ TEST(T2SFlexSampler, DecodeOnly) {
 
     expect_shape(graph.x,         {d_model, 2});
     expect_shape(graph.y,         {d_model, 2});
-    EXPECT_EQ(graph.seen_mask, nullptr);  // repetition_penalty=1.0 → not created
+    expect_shape(graph.seen_mask, {vocab, 2});
     expect_shape(graph.exp_noise, {vocab, 2});
     expect_shape(graph.sampled,   {2});
     expect_shape(graph.greedy,    {2});
@@ -1348,7 +1354,7 @@ TEST(T2SFlexSampler, MixedPrefillAndDecode) {
 
     expect_shape(graph.x,         {d_model, 8});
     expect_shape(graph.y,         {d_model, 8});
-    EXPECT_EQ(graph.seen_mask, nullptr);  // repetition_penalty=1.0 → not created
+    expect_shape(graph.seen_mask, {vocab, 2});
     expect_shape(graph.exp_noise, {vocab, 2});
     expect_shape(graph.sampled,   {2});
     expect_shape(graph.greedy,    {2});

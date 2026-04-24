@@ -53,6 +53,7 @@ endforeach()
 set(T2S_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/test_t2s_loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/test_t2s_session.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/t2s/test_t2s_infer.cpp
 )
 
 foreach(test_src ${T2S_TEST_SOURCES})
