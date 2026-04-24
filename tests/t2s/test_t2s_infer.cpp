@@ -10,10 +10,10 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "npy_loader.h"
 
 #include <cmath>
 #include <cstdio>
-#include <fstream>
 #include <random>
 #include <string>
 #include <vector>
@@ -31,19 +31,6 @@ static gpt_sovits::t2s_sampler_config default_sampler_cfg() {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-static std::vector<float> load_f32_bin(const std::string & path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        ADD_FAILURE() << "Failed to open: " << path;
-        return {};
-    }
-    auto size = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    std::vector<float> data(size / sizeof(float));
-    f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
-    return data;
-}
 
 struct ErrorStats {
     double max_abs;
@@ -164,10 +151,10 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     }
 
     // --- Load reference data ---
-    auto ref_xy_pos  = load_f32_bin(ref_dir + "xy_pos.bin");
-    auto ref_xy_dec  = load_f32_bin(ref_dir + "xy_dec.bin");
-    auto ref_k_cache = load_f32_bin(ref_dir + "k_cache.bin");
-    auto ref_v_cache = load_f32_bin(ref_dir + "v_cache.bin");
+    auto ref_xy_pos  = load_npy_as_f32(ref_dir + "xy_pos.npy");
+    auto ref_xy_dec  = load_npy_as_f32(ref_dir + "xy_dec.npy");
+    auto ref_k_cache = load_npy_as_f32(ref_dir + "k_cache.npy");
+    auto ref_v_cache = load_npy_as_f32(ref_dir + "v_cache.npy");
     ASSERT_FALSE(ref_xy_pos.empty());
     ASSERT_FALSE(ref_xy_dec.empty());
     ASSERT_FALSE(ref_k_cache.empty());
