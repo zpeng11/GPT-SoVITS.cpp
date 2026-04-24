@@ -20,6 +20,36 @@
 
 static const std::string kTestDir = T2S_TEST_DIR;
 
+// Minimal npy writer for 1-D int32 arrays.
+static void save_npy_i32(const std::string & path,
+                         const std::vector<int32_t> & data) {
+    FILE * fp = fopen(path.c_str(), "wb");
+    ASSERT_NE(fp, nullptr);
+    // npy header
+    std::string dict = "{'descr': '<i4', 'fortran_order': False, 'shape': (" +
+                       std::to_string(data.size()) + ",), }";
+    // Pad to 64-byte aligned header (magic(6) + version(2) + header_len(2) + header)
+    // Header must end with '\n'.
+    size_t header_len = 64u - 10u;
+    while (dict.size() + 2 > header_len) header_len += 64;  // +2 for trailing '\n'
+    dict.resize(header_len - 1, ' ');
+    dict += '\n';
+    // npy magic
+    fwrite("\x93NUMPY", 1, 6, fp);
+    // version 1.0
+    uint8_t ver_major = 1, ver_minor = 0;
+    fwrite(&ver_major, 1, 1, fp);
+    fwrite(&ver_minor, 1, 1, fp);
+    // header length (uint16 LE)
+    uint16_t hlen = (uint16_t)header_len;
+    fwrite(&hlen, 2, 1, fp);
+    // header string
+    fwrite(dict.c_str(), 1, header_len, fp);
+    // data
+    fwrite(data.data(), sizeof(int32_t), data.size(), fp);
+    fclose(fp);
+}
+
 static ggml_backend_t create_backend() {
     return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
 }
@@ -391,6 +421,16 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
                max_decode_steps);
     }
     EXPECT_GT((int) generated.size(), 0) << "Should have generated at least the prefill token";
+
+    // =======================================================================
+    // Save generated token sequence
+    // =======================================================================
+
+    {
+        const std::string out_path = ref_dir + "sampled_tokens.npy";
+        save_npy_i32(out_path, generated);
+        printf("  [decode] Saved %zu sampled tokens to %s\n", generated.size(), out_path.c_str());
+    }
 
     // =======================================================================
     // Cleanup
