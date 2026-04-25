@@ -1,6 +1,8 @@
 set(GPTSOVITS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/loader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/block.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/session.cpp

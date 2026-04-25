@@ -63,6 +63,27 @@ foreach(test_src ${ROBERTA_TEST_SOURCES})
     gtest_discover_tests(${test_name})
 endforeach()
 
+# SoVITS ref_enc tests
+set(SOVITS_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_ref_enc.cpp
+)
+
+foreach(test_src ${SOVITS_TEST_SOURCES})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src})
+    target_include_directories(${test_name} PRIVATE
+        ${COMMON_TEST_INCLUDE_DIR}
+    )
+    target_link_libraries(${test_name} PRIVATE
+        gpt_sovits_cpp_static
+        GTest::gtest_main
+    )
+    target_compile_definitions(${test_name} PRIVATE
+        SOVITS_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/t2s/"
+    )
+    gtest_discover_tests(${test_name})
+endforeach()
+
 # T2S tests (use cnpy for .npy loading)
 set(T2S_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/test_t2s_loader.cpp
