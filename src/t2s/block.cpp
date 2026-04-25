@@ -450,7 +450,7 @@ static ::ggml_tensor * embed_text_forward(
     return x;
 }
 
-::ggml_tensor * t2s_audio_embed_block_forward(
+static ::ggml_tensor * t2s_audio_embed_block_forward(
     ::ggml_context * ctx,
     ::ggml_tensor  * token_ids,
     ::ggml_tensor  * audio_embedding,
