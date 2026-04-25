@@ -388,8 +388,16 @@ struct t2s_session {
     // Decode computation graph (built by t2s_session_build_decode_graph)
     struct ggml_context * ctx_graph = nullptr;  // owned
     struct ggml_cgraph  * gf_dec    = nullptr;  // owned
-    struct ggml_tensor  * x_dec     = nullptr;  // input  {d_model, n_batch} F32
     ggml_gallocr_t        alloc_dec = nullptr;  // owned — pre-allocates intermediate storage
+
+    // Decode embedding inputs (filled per decode step)
+    struct ggml_tensor  * token_id  = nullptr;  // {n_batch} I32 — audio token to embed
+    struct ggml_tensor  * position  = nullptr;  // {n_batch} I32 — PE position index
+
+    // Precomputed positional embedding table: {d_model, slot_size} F32
+    // Row p contains the sine PE for position p, matching the layout produced by
+    // build_sine_positional_embedding: [sin0, cos0, sin1, cos1, ...].
+    struct ggml_tensor  * pe_table  = nullptr;
 
     // Sampler configuration (baked into decode graph topology at build time)
     t2s_sampler_config   sampler_cfg;
@@ -527,7 +535,8 @@ bool t2s_session_build_decode_graph(
     const t2s_sampler_config & sampler_cfg = {});
 
 // Accessors for the decode graph.
-struct ggml_tensor * t2s_session_get_x_dec(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_token_id(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_position(const t2s_session & session);
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session);
 struct ggml_tensor * t2s_session_get_sampled(const t2s_session & session);
 struct ggml_tensor * t2s_session_get_greedy(const t2s_session & session);

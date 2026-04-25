@@ -27,6 +27,31 @@ static void mask_upload_range(t2s_session & session, int slot_id,
                             offset, size);
 }
 
+// Precompute sine positional embedding table on CPU.
+// Output layout per position p: [sin0, cos0, sin1, cos1, ...] with d_model elements.
+// This matches the reorder performed in build_sine_positional_embedding (block.cpp).
+static std::vector<float> build_pe_table_cpu(int64_t d_model, int64_t max_pos,
+                                              int max_period = 10000) {
+    const int64_t half = d_model / 2;
+    std::vector<float> table((size_t)(d_model * max_pos), 0.0f);
+
+    // Precompute frequency values: freq[j] = exp(-log(max_period) * j / half)
+    std::vector<float> freq(half);
+    for (int64_t j = 0; j < half; j++) {
+        freq[j] = std::exp(-std::log((float)max_period) * (float)j / (float)half);
+    }
+
+    for (int64_t p = 0; p < max_pos; p++) {
+        float * row = table.data() + p * d_model;
+        for (int64_t j = 0; j < half; j++) {
+            float arg = (float)p * freq[j];
+            row[2 * j]     = std::sin(arg);  // sin_j
+            row[2 * j + 1] = std::cos(arg);  // cos_j
+        }
+    }
+    return table;
+}
+
 bool t2s_session_init(t2s_session      & session,
                       const t2s_hparams & hparams,
                       ggml_backend_t     backend,
@@ -47,9 +72,10 @@ bool t2s_session_init(t2s_session      & session,
     const int64_t  max_ctx  = (int64_t) n_batch * slot_size;
     const int64_t  vocab    = (int64_t) hparams.vocab_size;
 
-    // Total tensors: n_layer * 2 (K/V) + 1 (kv_pos) + 1 (mask) + 1 (x_dec)
+    // Total tensors: n_layer * 2 (K/V) + 1 (kv_pos) + 1 (mask)
+    //              + 1 (token_id) + 1 (position) + 1 (pe_table)
     //              + 2 (seen_mask, exp_noise)
-    const size_t n_tensors = (size_t) n_layer * 2 + 5;
+    const size_t n_tensors = (size_t) n_layer * 2 + 7;
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 1),
@@ -75,8 +101,12 @@ bool t2s_session_init(t2s_session      & session,
     session.kv_pos = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, n_batch);
     session.mask   = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F16, max_ctx, n_batch);
 
-    // Decode input tensor: {d_model, n_batch}
-    session.x_dec = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, d_model, n_batch);
+    // Decode embedding inputs: {n_batch} I32 each
+    session.token_id = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, n_batch);
+    session.position = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, n_batch);
+
+    // Precomputed PE table: {d_model, slot_size} F32
+    session.pe_table = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, d_model, slot_size);
 
     // Sampler graph inputs: {vocab, n_batch}
     session.seen_mask = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, vocab, n_batch);
@@ -105,6 +135,13 @@ bool t2s_session_init(t2s_session      & session,
         std::fill(session.mask_host.begin(), session.mask_host.end(), neg_inf);
         ggml_backend_tensor_set(session.mask, session.mask_host.data(),
                                 0, mask_n * sizeof(ggml_fp16_t));
+    }
+
+    // Compute and upload PE table.
+    {
+        auto pe_data = build_pe_table_cpu(d_model, slot_size);
+        ggml_backend_tensor_set(session.pe_table, pe_data.data(),
+                                0, (size_t)(d_model * slot_size) * sizeof(float));
     }
 
     session.n_batch   = n_batch;
@@ -165,7 +202,9 @@ void t2s_session_free(t2s_session & session) {
     session.v_caches.clear();
     session.kv_pos = nullptr;
     session.mask   = nullptr;
-    session.x_dec    = nullptr;
+    session.token_id  = nullptr;
+    session.position  = nullptr;
+    session.pe_table  = nullptr;
     session.seen_mask = nullptr;
     session.exp_noise = nullptr;
     session.mask_host.clear();
@@ -263,7 +302,8 @@ bool t2s_session_build_decode_graph(
 
     // Graph context: holds intermediate tensors and the cgraph structure.
     // Attention layers need ~32 intermediates each; sampler needs ~50 per batch element.
-    const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 50 + 8;
+    // Embedding path adds ~4 intermediates (get_rows x2, mul, add).
+    const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 50 + 12;
     const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
 
     struct ggml_init_params params = {
@@ -281,8 +321,16 @@ bool t2s_session_build_decode_graph(
 
     session.gf_dec = ggml_new_graph_custom(session.ctx_graph, graph_size, false);
 
+    // In-graph embedding: token_id → audio_embed lookup + PE(position) * alpha.
+    struct ggml_tensor * emb = ggml_get_rows(session.ctx_graph,
+        model.weights.embed.audio_embedding, session.token_id);
+    struct ggml_tensor * pe = ggml_get_rows(session.ctx_graph,
+        session.pe_table, session.position);
+    struct ggml_tensor * scaled_pe = ggml_mul(session.ctx_graph, pe,
+        model.weights.embed.audio_pos_alpha);
+    struct ggml_tensor * x = ggml_add(session.ctx_graph, emb, scaled_pe);
+
     // Build 24-layer decode graph.
-    struct ggml_tensor * x = session.x_dec;
     for (int i = 0; i < n_layer; i++) {
         x = t2s_attention_block_forward(
             session.ctx_graph, session.gf_dec, x,
@@ -334,8 +382,12 @@ bool t2s_session_build_decode_graph(
     return true;
 }
 
-struct ggml_tensor * t2s_session_get_x_dec(const t2s_session & session) {
-    return session.x_dec;
+struct ggml_tensor * t2s_session_get_token_id(const t2s_session & session) {
+    return session.token_id;
+}
+
+struct ggml_tensor * t2s_session_get_position(const t2s_session & session) {
+    return session.position;
 }
 
 struct ggml_cgraph * t2s_session_get_decode_graph(const t2s_session & session) {

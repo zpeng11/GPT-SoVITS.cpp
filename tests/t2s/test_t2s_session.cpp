@@ -152,7 +152,9 @@ TEST(T2SSession, InitAndFree) {
 
     expect_shape(session.kv_pos,   {n_batch});
     expect_shape(session.mask,     {max_ctx, n_batch});
-    expect_shape(session.x_dec,    {d_model, n_batch});
+    expect_shape(session.token_id, {n_batch});
+    expect_shape(session.position, {n_batch});
+    expect_shape(session.pe_table, {d_model, (int64_t)slot_size});
     expect_shape(session.seen_mask, {hparams.vocab_size, n_batch});
     expect_shape(session.exp_noise, {hparams.vocab_size, n_batch});
 
@@ -260,14 +262,16 @@ TEST(T2SSession, BuildDecodeGraph) {
     ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model, sampler_cfg));
 
     // Verify graph structure
-    struct ggml_tensor * x_dec     = gpt_sovits::t2s_session_get_x_dec(session);
+    struct ggml_tensor * token_id  = gpt_sovits::t2s_session_get_token_id(session);
+    struct ggml_tensor * position  = gpt_sovits::t2s_session_get_position(session);
     struct ggml_cgraph * gf        = gpt_sovits::t2s_session_get_decode_graph(session);
     struct ggml_tensor * sampled   = gpt_sovits::t2s_session_get_sampled(session);
     struct ggml_tensor * greedy    = gpt_sovits::t2s_session_get_greedy(session);
     struct ggml_tensor * seen_mask = gpt_sovits::t2s_session_get_seen_mask(session);
     struct ggml_tensor * exp_noise = gpt_sovits::t2s_session_get_exp_noise(session);
 
-    ASSERT_NE(x_dec, nullptr);
+    ASSERT_NE(token_id, nullptr);
+    ASSERT_NE(position, nullptr);
     ASSERT_NE(gf, nullptr);
     ASSERT_NE(sampled, nullptr);
     ASSERT_NE(greedy, nullptr);
@@ -276,7 +280,8 @@ TEST(T2SSession, BuildDecodeGraph) {
 
     const int64_t d_model = model.hparams.hidden_dim;
     const int64_t vocab   = model.hparams.vocab_size;
-    expect_shape(x_dec,     {d_model, n_batch});
+    expect_shape(token_id,  {n_batch});
+    expect_shape(position,  {n_batch});
     expect_shape(seen_mask, {vocab, n_batch});
     expect_shape(exp_noise, {vocab, n_batch});
     expect_shape(sampled,   {n_batch});

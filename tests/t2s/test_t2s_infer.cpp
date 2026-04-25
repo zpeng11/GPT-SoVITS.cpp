@@ -96,69 +96,6 @@ static void fill_exp_noise(std::vector<float> & buf, std::mt19937 & rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Token embedding helper for decode steps
-// ---------------------------------------------------------------------------
-
-// Reusable embed helper that persists its allocator across decode steps.
-struct embed_helper {
-    ggml_backend_t        backend = nullptr;
-    ggml_gallocr_t        alloc   = nullptr;
-    const int64_t         d_model;
-
-    explicit embed_helper(ggml_backend_t backend, int64_t d_model)
-        : backend(backend), d_model(d_model) {
-        auto buft = ggml_backend_get_default_buffer_type(backend);
-        alloc = ggml_gallocr_new(buft);
-    }
-
-    ~embed_helper() {
-        if (alloc) { ggml_gallocr_free(alloc); }
-    }
-
-    std::vector<float> embed(const gpt_sovits::t2s_model & model,
-                             int32_t token_id,
-                             int64_t start_position)
-    {
-        const size_t n_intermediates = 16;
-        const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
-        struct ggml_init_params params = {
-            /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 4) +
-                             ggml_graph_overhead_custom(graph_size, false),
-            /*.mem_buffer =*/ nullptr,
-            /*.no_alloc   =*/ true,
-        };
-
-        struct ggml_context * ctx = ggml_init(params);
-
-        struct ggml_tensor * token_ids = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 1);
-        ggml_set_name(token_ids, "token_id");
-        ggml_set_input(token_ids);
-
-        struct ggml_tensor * emb = gpt_sovits::t2s_audio_embed_block_forward(
-            ctx, token_ids,
-            model.weights.embed.audio_embedding,
-            model.weights.embed.audio_pos_alpha,
-            start_position);
-        ggml_set_name(emb, "emb_out");
-        ggml_set_output(emb);
-
-        struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_size, false);
-        ggml_build_forward_expand(gf, emb);
-
-        ggml_gallocr_alloc_graph(alloc, gf);
-
-        ggml_backend_tensor_set(token_ids, &token_id, 0, sizeof(int32_t));
-        ggml_backend_graph_compute(backend, gf);
-
-        std::vector<float> result(d_model);
-        ggml_backend_tensor_get(emb, result.data(), 0, d_model * sizeof(float));
-
-        ggml_free(ctx);
-        return result;
-    }
-};
-
-// ---------------------------------------------------------------------------
 // Full autoregressive inference test
 // ---------------------------------------------------------------------------
 
@@ -324,10 +261,12 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
 
     struct ggml_tensor * dec_exp_noise  = gpt_sovits::t2s_session_get_exp_noise(session);
     struct ggml_tensor * dec_seen_mask  = gpt_sovits::t2s_session_get_seen_mask(session);
-    struct ggml_tensor * x_dec          = gpt_sovits::t2s_session_get_x_dec(session);
+    struct ggml_tensor * dec_token_id   = gpt_sovits::t2s_session_get_token_id(session);
+    struct ggml_tensor * dec_position   = gpt_sovits::t2s_session_get_position(session);
     ASSERT_NE(dec_exp_noise, nullptr);
     ASSERT_NE(dec_seen_mask, nullptr);
-    ASSERT_NE(x_dec, nullptr);
+    ASSERT_NE(dec_token_id, nullptr);
+    ASSERT_NE(dec_position, nullptr);
 
     // Pre-allocate reusable buffers for decode loop inputs.
     std::vector<float> dec_noise_buf((size_t)(vocab * n_batch));
@@ -346,43 +285,38 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     generated.push_back(current_token);
 
     bool reached_eos = false;
-    embed_helper emb(backend, d_model);
 
     for (int step = 0; step < max_decode_steps; step++) {
-        // 1. Embed the current token with PE at the next audio position.
-        int64_t position = T_prompt + step;
-        auto token_emb = emb.embed(model, current_token, position);
-        ASSERT_EQ((int64_t) token_emb.size(), d_model);
+        // 1. Set token_id and position inputs for in-graph embedding.
+        int32_t position_val = (int32_t)(T_prompt + step);
+        ggml_backend_tensor_set(dec_token_id, &current_token, 0, sizeof(int32_t));
+        ggml_backend_tensor_set(dec_position, &position_val, 0, sizeof(int32_t));
 
-        // 2. Feed the embedding into the decode graph.
-        ggml_backend_tensor_set(x_dec, token_emb.data(), 0,
-                                d_model * sizeof(float));
-
-        // 3. Fill exp_noise with fresh Exp(1) noise.
+        // 2. Fill exp_noise with fresh Exp(1) noise.
         fill_exp_noise(dec_noise_buf, rng);
         ggml_backend_tensor_set(dec_exp_noise, dec_noise_buf.data(), 0,
                                 dec_noise_buf.size() * sizeof(float));
 
-        // 4. Upload seen_mask with all previously generated tokens marked.
+        // 3. Upload seen_mask with all previously generated tokens marked.
         ggml_backend_tensor_set(dec_seen_mask, seen_buf.data(), 0,
                                 seen_buf.size() * sizeof(float));
 
-        // 5. Advance session state (update mask, kv_pos, n_pos).
+        // 4. Advance session state (update mask, kv_pos, n_pos).
         gpt_sovits::t2s_session_decode_advance(session);
 
-        // 6. Execute decode graph.
+        // 5. Execute decode graph.
         ASSERT_EQ(ggml_backend_graph_compute(backend,
                     gpt_sovits::t2s_session_get_decode_graph(session)),
                   GGML_STATUS_SUCCESS);
 
-        // 7. Read sampler output.
+        // 6. Read sampler output.
         int32_t sampled_token = -1, greedy_token = -1;
         ggml_backend_tensor_get(gpt_sovits::t2s_session_get_sampled(session),
                                 &sampled_token, 0, sizeof(int32_t));
         ggml_backend_tensor_get(gpt_sovits::t2s_session_get_greedy(session),
                                 &greedy_token, 0, sizeof(int32_t));
 
-        // 8. Validate token IDs.
+        // 7. Validate token IDs.
         EXPECT_GE(sampled_token, 0) << "decode step " << step;
         EXPECT_LT(sampled_token, (int32_t) vocab) << "decode step " << step;
         EXPECT_GE(greedy_token, 0) << "decode step " << step;
@@ -390,15 +324,15 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
 
         generated.push_back(sampled_token);
 
-        // 9. Update seen_mask: mark the newly generated token.
+        // 8. Update seen_mask: mark the newly generated token.
         if (sampled_token >= 0 && sampled_token < (int32_t) vocab) {
             seen_buf[sampled_token] = 1.0f;
         }
 
         current_token = sampled_token;
 
-        // 10. Check EOS.
-        if (current_token == eos) {
+        // 9. Check EOS (greedy argmax OR sampled token).
+        if (greedy_token == eos || sampled_token == eos) {
             reached_eos = true;
             break;
         }
