@@ -2,6 +2,11 @@
 //
 // End-to-end T2S autoregressive inference test: prefill via flexible graph,
 // decode loop via persistent decode graph.
+//
+// Parameterized over model weight quantization (f16, q8, q4) and KV cache
+// type (F32, Q8_0, Q4_0).  Reference numerical comparison is only performed
+// for the f16 + F32 baseline; other configs validate pipeline correctness
+// (valid token IDs, EOS handling).
 
 #include <gtest/gtest.h>
 
@@ -12,6 +17,7 @@
 #include "ggml-backend.h"
 #include "npy_loader.h"
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <random>
@@ -59,6 +65,38 @@ static gpt_sovits::t2s_sampler_config default_sampler_cfg() {
 }
 
 // ---------------------------------------------------------------------------
+// Test configuration
+// ---------------------------------------------------------------------------
+
+struct TestConfig {
+    std::string model_suffix;   // "f16", "q8", "q4"
+    enum ggml_type kv_type;     // GGML_TYPE_F32, GGML_TYPE_Q8_0, GGML_TYPE_Q4_0
+    std::string test_name;
+
+    // Whether this is the reference baseline (f16 weights + F32 KV cache).
+    bool is_baseline() const {
+        return model_suffix == "f16" && kv_type == GGML_TYPE_F32;
+    }
+
+    std::string model_path() const {
+        return kTestDir + "models/s1v3-s2Gv2Pro-" + model_suffix + ".gguf";
+    }
+};
+
+// Print TestConfig in test output.
+static std::ostream & operator<<(std::ostream & os, const TestConfig & cfg) {
+    const char * kv_name = "unknown";
+    switch (cfg.kv_type) {
+        case GGML_TYPE_F32:  kv_name = "f32";  break;
+        case GGML_TYPE_F16:  kv_name = "f16";  break;
+        case GGML_TYPE_Q8_0: kv_name = "q8_0"; break;
+        case GGML_TYPE_Q4_0: kv_name = "q4_0"; break;
+        default: break;
+    }
+    return os << cfg.model_suffix << "_kv" << kv_name;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -96,12 +134,34 @@ static void fill_exp_noise(std::vector<float> & buf, std::mt19937 & rng) {
 }
 
 // ---------------------------------------------------------------------------
-// Full autoregressive inference test
+// Parameterized test fixture
 // ---------------------------------------------------------------------------
 
-TEST(T2SInfer, PrefillAndDecodeLoop) {
-    // --- Configuration ---
-    const std::string model_path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
+class T2SInferTest : public ::testing::TestWithParam<TestConfig> {
+protected:
+    // Error tolerances depend on quantization level.
+    double max_abs_tol() const {
+        const auto & cfg = GetParam();
+        if (cfg.is_baseline()) return 2.0;
+        if (cfg.kv_type != GGML_TYPE_F32) return 8.0;  // KV quant adds error
+        return 4.0;  // weight-only quantization
+    }
+
+    double rmse_tol() const {
+        const auto & cfg = GetParam();
+        if (cfg.is_baseline()) return 0.5;
+        if (cfg.kv_type != GGML_TYPE_F32) return 2.0;
+        return 1.0;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// Full autoregressive inference test (parameterized)
+// ---------------------------------------------------------------------------
+
+TEST_P(T2SInferTest, PrefillAndDecodeLoop) {
+    const auto & cfg = GetParam();
+    const std::string model_path = cfg.model_path();
     const std::string ref_dir    = kTestDir + "ref/";
 
     // Reference dimensions
@@ -152,7 +212,9 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     auto sampler_cfg = default_sampler_cfg();
 
     gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size, sampler_cfg));
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend,
+                                             n_batch, slot_size, sampler_cfg,
+                                             cfg.kv_type));
 
     // Set reference embedding dimensions for correct mask generation.
     session.ref_T_ref    = T_ref;
@@ -192,19 +254,30 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     gpt_sovits::t2s_session_flex_advance(session, plan, graph);
     ASSERT_EQ(ggml_backend_graph_compute(backend, graph.gf), GGML_STATUS_SUCCESS);
 
-    // --- Verify prefill output ---
-    {
+    // --- Verify prefill output (reference comparison only for baseline) ---
+    if (cfg.is_baseline()) {
         std::vector<float> actual_y((size_t)(d_model * T_total));
         ggml_backend_tensor_get(graph.y, actual_y.data(), 0, actual_y.size() * sizeof(float));
 
         auto err = compute_errors(actual_y, ref_xy_dec);
         printf("  [prefill] Output  max_abs=%.6f  RMSE=%.6f\n", err.max_abs, err.rmse);
-        EXPECT_LT(err.max_abs, 2.0) << "Prefill output max_abs error";
-        EXPECT_LT(err.rmse, 0.5)    << "Prefill output RMSE";
+        EXPECT_LT(err.max_abs, max_abs_tol()) << "Prefill output max_abs error";
+        EXPECT_LT(err.rmse, rmse_tol())       << "Prefill output RMSE";
+    } else {
+        // For non-baseline configs, just check that output contains finite values.
+        std::vector<float> actual_y((size_t)(d_model * T_total));
+        ggml_backend_tensor_get(graph.y, actual_y.data(), 0, actual_y.size() * sizeof(float));
+        int n_inf_or_nan = 0;
+        for (auto v : actual_y) {
+            if (!std::isfinite(v)) n_inf_or_nan++;
+        }
+        printf("  [prefill] non-finite values: %d / %d\n",
+               n_inf_or_nan, (int) actual_y.size());
+        EXPECT_EQ(n_inf_or_nan, 0) << "Prefill output should not contain inf/nan";
     }
 
-    // --- Verify KV caches ---
-    {
+    // --- Verify KV caches (reference comparison only for baseline) ---
+    if (cfg.is_baseline()) {
         const int64_t layer_elems = d_model * T_total;
         double worst_k_max = 0, worst_v_max = 0;
         int worst_k_layer = -1, worst_v_layer = -1;
@@ -217,7 +290,7 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
                                           ref_k_cache.begin() + (layer + 1) * layer_elems);
 
             auto err_k = compute_errors(actual_k, expected_k);
-            EXPECT_LT(err_k.max_abs, 2.0) << "K cache layer " << layer;
+            EXPECT_LT(err_k.max_abs, max_abs_tol()) << "K cache layer " << layer;
             if (err_k.max_abs > worst_k_max) {
                 worst_k_max = err_k.max_abs;
                 worst_k_layer = layer;
@@ -230,7 +303,7 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
                                           ref_v_cache.begin() + (layer + 1) * layer_elems);
 
             auto err_v = compute_errors(actual_v, expected_v);
-            EXPECT_LT(err_v.max_abs, 2.0) << "V cache layer " << layer;
+            EXPECT_LT(err_v.max_abs, max_abs_tol()) << "V cache layer " << layer;
             if (err_v.max_abs > worst_v_max) {
                 worst_v_max = err_v.max_abs;
                 worst_v_layer = layer;
@@ -288,7 +361,13 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
 
     bool reached_eos = false;
 
+    using clock = std::chrono::high_resolution_clock;
+    double total_decode_us = 0.0;
+    double min_step_us = 1e18, max_step_us = 0.0;
+
     for (int step = 0; step < max_decode_steps; step++) {
+        auto t0 = clock::now();
+
         // 1. Set token_id input for in-graph embedding.
         // position is now auto-filled by decode_advance via audio_offset.
         ggml_backend_tensor_set(dec_token_id, &current_token, 0, sizeof(int32_t));
@@ -309,6 +388,12 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
         ASSERT_EQ(ggml_backend_graph_compute(backend,
                     gpt_sovits::t2s_session_get_decode_graph(session)),
                   GGML_STATUS_SUCCESS);
+
+        auto t1 = clock::now();
+        double step_us = std::chrono::duration<double, std::micro>(t1 - t0).count();
+        total_decode_us += step_us;
+        min_step_us = std::min(min_step_us, step_us);
+        max_step_us = std::max(max_step_us, step_us);
 
         // 6. Read sampler output.
         int32_t sampled_token = -1, greedy_token = -1;
@@ -339,6 +424,14 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
         }
     }
 
+    // --- Print timing summary ---
+    int n_steps = (int) generated.size() - 1;  // first token is from prefill
+    if (n_steps > 0) {
+        double avg_us = total_decode_us / n_steps;
+        printf("  [decode] timing: total=%.2f ms, avg=%.1f us/step, min=%.1f us, max=%.1f us (%d steps)\n",
+               total_decode_us / 1000.0, avg_us, min_step_us, max_step_us, n_steps);
+    }
+
     // --- Print summary ---
     printf("  [decode] %zu tokens generated, reached_eos=%d\n",
            generated.size(), reached_eos);
@@ -362,7 +455,13 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     // =======================================================================
 
     {
-        const std::string out_path = ref_dir + "sampled_tokens.npy";
+        const std::string out_path = ref_dir + "sampled_tokens_" +
+                                     cfg.model_suffix + "_kv" +
+                                     (cfg.kv_type == GGML_TYPE_F32  ? "f32" :
+                                      cfg.kv_type == GGML_TYPE_F16  ? "f16" :
+                                      cfg.kv_type == GGML_TYPE_Q8_0 ? "q8_0" :
+                                      cfg.kv_type == GGML_TYPE_Q4_0 ? "q4_0" : "unk") +
+                                     ".npy";
         save_npy_i32(out_path, generated);
         printf("  [decode] Saved %zu sampled tokens to %s\n", generated.size(), out_path.c_str());
     }
@@ -375,3 +474,33 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
 }
+
+// ---------------------------------------------------------------------------
+// Instantiate parameterized tests: all combinations of weight quant × KV type
+// ---------------------------------------------------------------------------
+
+INSTANTIATE_TEST_SUITE_P(
+    T2SInfer,
+    T2SInferTest,
+    ::testing::Values(
+        // Baseline: f16 weights + F32 KV cache (reference numerical comparison)
+        TestConfig{"f16", GGML_TYPE_F32,  "f16_kv_f32"},
+        // f16 weights with quantized KV caches
+        TestConfig{"f16", GGML_TYPE_F16,  "f16_kv_f16"},
+        TestConfig{"f16", GGML_TYPE_Q8_0, "f16_kv_q8_0"},
+        TestConfig{"f16", GGML_TYPE_Q4_0, "f16_kv_q4_0"},
+        // q8 weights with all KV cache types
+        TestConfig{"q8",  GGML_TYPE_F32,  "q8_kv_f32"},
+        TestConfig{"q8",  GGML_TYPE_F16,  "q8_kv_f16"},
+        TestConfig{"q8",  GGML_TYPE_Q8_0, "q8_kv_q8_0"},
+        TestConfig{"q8",  GGML_TYPE_Q4_0, "q8_kv_q4_0"},
+        // q4 weights with all KV cache types
+        TestConfig{"q4",  GGML_TYPE_F32,  "q4_kv_f32"},
+        TestConfig{"q4",  GGML_TYPE_F16,  "q4_kv_f16"},
+        TestConfig{"q4",  GGML_TYPE_Q8_0, "q4_kv_q8_0"},
+        TestConfig{"q4",  GGML_TYPE_Q4_0, "q4_kv_q4_0"}
+    ),
+    [](const ::testing::TestParamInfo<TestConfig> & info) {
+        return info.param.test_name;
+    }
+);

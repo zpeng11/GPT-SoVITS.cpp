@@ -41,4 +41,5 @@ __pycache__/
 tests/hubert/models/
 tests/hubert/ref_*.bin
 tests/hubert/*.json
+tests/t2s/ref/sampled_tokens_*.npy
 tests/t2s/ref/sampled_tokens.npy
