@@ -266,6 +266,17 @@ void t2s_session_decode_advance(t2s_session & session) {
         ggml_backend_tensor_set(session.kv_pos, &write_pos,
                                 i * sizeof(int32_t), sizeof(int32_t));
 
+        // Auto-fill PE position: pe_pos = n_pos - audio_offset.
+        // This mirrors the logic in t2s_session_flex_advance for decode slots.
+        GGML_ASSERT(session.slots[i].audio_offset >= 0 &&
+                    session.slots[i].audio_offset < (int) session.slot_size &&
+                    "decode on slot with invalid audio_offset");
+        const int32_t pe_pos = session.slots[i].n_pos - session.slots[i].audio_offset;
+        GGML_ASSERT(pe_pos >= 0 && pe_pos < (int) session.slot_size &&
+                    "decode PE position out of pe_table bounds");
+        ggml_backend_tensor_set(session.position, &pe_pos,
+                                i * sizeof(int32_t), sizeof(int32_t));
+
         session.slots[i].n_pos++;
     }
 }

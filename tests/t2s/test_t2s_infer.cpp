@@ -288,10 +288,9 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     bool reached_eos = false;
 
     for (int step = 0; step < max_decode_steps; step++) {
-        // 1. Set token_id and position inputs for in-graph embedding.
-        int32_t position_val = (int32_t)(T_prompt + step);
+        // 1. Set token_id input for in-graph embedding.
+        // position is now auto-filled by decode_advance via audio_offset.
         ggml_backend_tensor_set(dec_token_id, &current_token, 0, sizeof(int32_t));
-        ggml_backend_tensor_set(dec_position, &position_val, 0, sizeof(int32_t));
 
         // 2. Fill exp_noise with fresh Exp(1) noise.
         fill_exp_noise(dec_noise_buf, rng);
