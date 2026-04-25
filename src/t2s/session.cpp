@@ -436,6 +436,10 @@ void t2s_flex_graph_free(t2s_flex_graph & graph) {
     graph.y               = nullptr;
     graph.kv_pos          = nullptr;
     graph.mask            = nullptr;
+    graph.seen_mask       = nullptr;
+    graph.exp_noise       = nullptr;
+    graph.sampled         = nullptr;
+    graph.greedy          = nullptr;
     graph.backend         = nullptr;
     graph.N               = 0;
     graph.n_active        = 0;
