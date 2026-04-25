@@ -10,34 +10,6 @@
 
 namespace gpt_sovits {
 
-// Tensor shapes use ggml convention throughout: ne[0] is the innermost dim.
-// PyTorch Linear(in, out).weight has shape [out, in] → ggml {in, out}.
-// All shapes in comments use ggml notation.
-
-// Weights for the SoVITS extract-latent path:
-//   hubert_feature -> ssl_proj Conv1d -> RVQ nearest-code lookup -> codes
-struct sovits_extract_latent_block_weights {
-    struct ggml_tensor * ssl_proj_w;     // Conv1d(768, 768, k=2, s=2)  {2, 768, 768}
-    struct ggml_tensor * ssl_proj_b;     // {768}
-
-    // RVQ codebook (single quantizer layer, n_q = 1).
-    struct ggml_tensor * codebook;       // {768, 1024}
-};
-
-// Build the extract-latent computation graph.
-//
-// Parameters:
-//   ctx            - ggml context
-//   hubert_feature - CN-HuBERT features  {768, T}
-//   weights        - block weights
-//
-// Returns:
-//   codes {T'} (i32), where T' is the post-conv sequence length.
-struct ggml_tensor * sovits_extract_latent_block_forward(
-    struct ggml_context                       * ctx,
-    struct ggml_tensor                        * hubert_feature,
-    const sovits_extract_latent_block_weights & weights);
-
 // Build the computation graph for the T2S sampler path used by
 // AR.models.utils.sample(...).
 //
@@ -76,6 +48,20 @@ struct t2s_sampler_result t2s_sampler_block_forward(
     float                 temperature,
     float                 repetition_penalty,
     struct ggml_tensor  * exp_noise);
+
+// Tensor shapes use ggml convention throughout: ne[0] is the innermost dim.
+// PyTorch Linear(in, out).weight has shape [out, in] → ggml {in, out}.
+// All shapes in comments use ggml notation.
+
+// Weights for the SoVITS extract-latent path:
+//   hubert_feature -> ssl_proj Conv1d -> RVQ nearest-code lookup -> codes
+struct sovits_extract_latent_block_weights {
+    struct ggml_tensor * ssl_proj_w;     // Conv1d(768, 768, k=2, s=2)  {2, 768, 768}
+    struct ggml_tensor * ssl_proj_b;     // {768}
+
+    // RVQ codebook (single quantizer layer, n_q = 1).
+    struct ggml_tensor * codebook;       // {768, 1024}
+};
 
 // Build the computation graph for audio token embedding with positional
 // encoding. Reusable for both prompt prefill (start_position=0) and

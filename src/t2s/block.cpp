@@ -137,7 +137,7 @@ static ::ggml_tensor * apply_repetition_penalty(
     return masked_lerp(ctx, logits, selected, seen);
 }
 
-::ggml_tensor * sovits_extract_latent_block_forward(
+static ::ggml_tensor * sovits_extract_latent_block_forward(
     ::ggml_context                       * ctx,
     ::ggml_tensor                        * hubert_feature,
     const sovits_extract_latent_block_weights & weights)
