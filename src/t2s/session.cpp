@@ -233,7 +233,8 @@ void t2s_session_slot_release(t2s_session & session, int slot_id) {
                           slot_id * session.slot_size, session.slot_size);
     }
 
-    session.slots[slot_id].n_pos = 0;
+    session.slots[slot_id].n_pos        = 0;
+    session.slots[slot_id].audio_offset = 0;
 }
 
 int t2s_session_slot_n_pos(const t2s_session & session, int slot_id) {
@@ -428,13 +429,17 @@ void t2s_flex_graph_free(t2s_flex_graph & graph) {
         ggml_free(graph.ctx);
         graph.ctx = nullptr;
     }
-    graph.gf      = nullptr;
-    graph.x       = nullptr;
-    graph.y       = nullptr;
-    graph.kv_pos  = nullptr;
-    graph.mask    = nullptr;
-    graph.backend = nullptr;
-    graph.N       = 0;
+    graph.gf              = nullptr;
+    graph.x_prefill       = nullptr;
+    graph.decode_token_ids = nullptr;
+    graph.decode_positions = nullptr;
+    graph.y               = nullptr;
+    graph.kv_pos          = nullptr;
+    graph.mask            = nullptr;
+    graph.backend         = nullptr;
+    graph.N               = 0;
+    graph.n_active        = 0;
+    graph.n_decode        = 0;
 }
 
 t2s_flex_graph t2s_session_build_flex_graph(
@@ -463,19 +468,33 @@ t2s_flex_graph t2s_session_build_flex_graph(
     const int     n_kv    = t2s_session_get_n_kv(session);
     const int64_t vocab   = hparams.vocab_size;
 
-    // Count active slots for sampler batch dimension.
-    int n_active = 0;
+    // Classify slots: prefill (n_query > 1), decode (n_query == 1), idle (0).
+    int n_active  = 0;
+    int n_decode  = 0;
+    int N_prefill = 0;
     for (int i = 0; i < (int) plan.n_query.size(); i++) {
-        if (plan.n_query[i] > 0) n_active++;
+        const int nq = plan.n_query[i];
+        if (nq <= 0) continue;
+        n_active++;
+        if (nq == 1) {
+            n_decode++;
+        } else {
+            N_prefill += nq;
+        }
     }
+    const int N_decode = n_decode;  // each decode slot contributes exactly 1 token
 
-    // --- 1. Create graph context and tensors ---
+    // --- 1. Create graph context ---
     // Attention layers need ~32 intermediates each; sampler needs ~50 per active slot.
-    const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_active * 50 + 8;
+    // Decode embedding path adds ~4 intermediates per decode slot (get_rows x2, mul, add).
+    const size_t n_intermediates = (size_t) n_layer * 32
+                                 + (size_t) n_active * 50
+                                 + (size_t) n_decode * 4
+                                 + 8;
     const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
 
     struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 4) +
+        /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 8) +
                          ggml_graph_overhead_custom(graph_size, false),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
@@ -487,9 +506,22 @@ t2s_flex_graph t2s_session_build_flex_graph(
         return graph;
     }
 
-    graph.x = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, d_model, N);
-    ggml_set_name(graph.x, "x_in");
-    ggml_set_input(graph.x);
+    // --- 2. Create input tensors ---
+    if (N_prefill > 0) {
+        graph.x_prefill = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, d_model, N_prefill);
+        ggml_set_name(graph.x_prefill, "x_prefill");
+        ggml_set_input(graph.x_prefill);
+    }
+
+    if (n_decode > 0) {
+        graph.decode_token_ids = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, n_decode);
+        ggml_set_name(graph.decode_token_ids, "decode_token_ids");
+        ggml_set_input(graph.decode_token_ids);
+
+        graph.decode_positions = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, n_decode);
+        ggml_set_name(graph.decode_positions, "decode_positions");
+        ggml_set_input(graph.decode_positions);
+    }
 
     graph.kv_pos = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, N);
     ggml_set_name(graph.kv_pos, "kv_pos");
@@ -499,10 +531,58 @@ t2s_flex_graph t2s_session_build_flex_graph(
     ggml_set_name(graph.mask, "mask");
     ggml_set_input(graph.mask);
 
-    // --- 2. Build transformer layers ---
+    // --- 3. Build full input sequence by interleaving prefill/decode in slot order ---
     graph.gf = ggml_new_graph_custom(graph.ctx, graph_size, false);
 
-    struct ggml_tensor * cur = graph.x;
+    struct ggml_tensor * full_x = nullptr;
+
+    {
+        // Batch all decode token embeddings at once: get_rows yields {d_model, n_decode}
+        struct ggml_tensor * decode_embs = nullptr;
+        if (n_decode > 0) {
+            struct ggml_tensor * emb = ggml_get_rows(graph.ctx,
+                model.weights.embed.audio_embedding, graph.decode_token_ids);
+            struct ggml_tensor * pe  = ggml_get_rows(graph.ctx,
+                session.pe_table, graph.decode_positions);
+            struct ggml_tensor * scaled_pe = ggml_mul(graph.ctx, pe,
+                model.weights.embed.audio_pos_alpha);
+            decode_embs = ggml_add(graph.ctx, emb, scaled_pe);
+        }
+
+        // Walk slots in order, concatenating chunks to build the full input sequence.
+        int prefill_offset = 0;  // column offset into x_prefill
+        int decode_idx     = 0;  // index into decode_embs columns
+
+        for (int i = 0; i < (int) plan.n_query.size(); i++) {
+            const int nq = plan.n_query[i];
+            if (nq <= 0) continue;
+
+            struct ggml_tensor * chunk = nullptr;
+
+            if (nq == 1) {
+                // Decode slot: extract one column from decode_embs.
+                chunk = ggml_view_2d(graph.ctx, decode_embs,
+                    d_model, 1, decode_embs->nb[1],
+                    (size_t) decode_idx * decode_embs->nb[1]);
+                decode_idx++;
+            } else {
+                // Prefill slot: extract nq columns from x_prefill.
+                chunk = ggml_view_2d(graph.ctx, graph.x_prefill,
+                    d_model, nq, graph.x_prefill->nb[1],
+                    (size_t) prefill_offset * graph.x_prefill->nb[1]);
+                prefill_offset += nq;
+            }
+
+            if (!full_x) {
+                full_x = chunk;
+            } else {
+                full_x = ggml_concat(graph.ctx, full_x, chunk, 1);
+            }
+        }
+    }
+
+    // --- 4. Build transformer layers ---
+    struct ggml_tensor * cur = full_x;
     for (int i = 0; i < n_layer; i++) {
         cur = t2s_attention_block_forward(
             graph.ctx, graph.gf, cur,
@@ -519,7 +599,7 @@ t2s_flex_graph t2s_session_build_flex_graph(
     ggml_set_output(graph.y);
     ggml_build_forward_expand(graph.gf, graph.y);
 
-    // --- 3. Attach sampler ---
+    // --- 5. Attach sampler ---
     // For each active slot, extract the last token's hidden state:
     //   - decode (n_query == 1): the single column
     //   - prefill (n_query > 1): the last column in the slot's range
@@ -589,7 +669,7 @@ t2s_flex_graph t2s_session_build_flex_graph(
         ggml_build_forward_expand(graph.gf, graph.greedy);
     }
 
-    // --- 4. Allocate intermediate storage (reuse session allocator) ---
+    // --- 6. Allocate intermediate storage (reuse session allocator) ---
     if (!session.alloc_flex) {
         ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
         session.alloc_flex = ggml_gallocr_new(buft);
@@ -605,9 +685,10 @@ t2s_flex_graph t2s_session_build_flex_graph(
         return graph;
     }
 
-    graph.backend = session.backend;
-    graph.N       = N;
+    graph.backend  = session.backend;
+    graph.N        = N;
     graph.n_active = n_active;
+    graph.n_decode = n_decode;
 
     return graph;
 }
@@ -699,7 +780,49 @@ void t2s_session_flex_advance(t2s_session       & session,
                                 0, (size_t) n_kv * N * sizeof(ggml_fp16_t));
     }
 
-    // --- 3. Update persistent decode mask ---
+    // --- 3. Fill decode_positions and set audio_offset ---
+    if (graph.n_decode > 0 && graph.decode_positions) {
+        std::vector<int32_t> pos_host(graph.n_decode);
+        int decode_idx = 0;
+        for (uint32_t i = 0; i < session.n_batch; i++) {
+            const int nq = plan.n_query[i];
+            if (nq <= 0) continue;
+
+            if (nq == 1) {
+                // Decode: PE position = n_pos - audio_offset
+                GGML_ASSERT(decode_idx < graph.n_decode);
+                GGML_ASSERT(session.slots[i].audio_offset >= 0 &&
+                            session.slots[i].audio_offset < (int) session.slot_size &&
+                            "decode on slot with invalid audio_offset");
+                const int pe_pos = session.slots[i].n_pos - session.slots[i].audio_offset;
+                GGML_ASSERT(pe_pos >= 0 && pe_pos < (int) session.slot_size &&
+                            "decode PE position out of pe_table bounds");
+                pos_host[decode_idx] = pe_pos;
+                decode_idx++;
+            } else {
+                // Prefill: set audio_offset = nq - ref_T_prompt (= T_ref + T_in)
+                const int offset = nq - (int) session.ref_T_prompt;
+                GGML_ASSERT(offset >= 0 &&
+                            "prefill n_query < ref_T_prompt (audio_offset would be negative)");
+                session.slots[i].audio_offset = offset;
+            }
+        }
+        ggml_backend_tensor_set(graph.decode_positions, pos_host.data(),
+                                0, (size_t) graph.n_decode * sizeof(int32_t));
+    } else {
+        // No decode slots — only set audio_offset for prefill slots.
+        for (uint32_t i = 0; i < session.n_batch; i++) {
+            const int nq = plan.n_query[i];
+            if (nq > 1) {
+                const int offset = nq - (int) session.ref_T_prompt;
+                GGML_ASSERT(offset >= 0 &&
+                            "prefill n_query < ref_T_prompt (audio_offset would be negative)");
+                session.slots[i].audio_offset = offset;
+            }
+        }
+    }
+
+    // --- 4. Update persistent decode mask ---
     for (uint32_t i = 0; i < session.n_batch; i++) {
         const int nq = plan.n_query[i];
         if (nq <= 0) continue;
@@ -711,7 +834,7 @@ void t2s_session_flex_advance(t2s_session       & session,
         mask_upload_range(session, (int)i, slot_start + old_n_pos, nq);
     }
 
-    // --- 4. Advance n_pos ---
+    // --- 5. Advance n_pos ---
     for (uint32_t i = 0; i < session.n_batch; i++) {
         if (plan.n_query[i] > 0) {
             session.slots[i].n_pos += plan.n_query[i];

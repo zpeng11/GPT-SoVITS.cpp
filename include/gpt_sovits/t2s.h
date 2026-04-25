@@ -358,7 +358,10 @@ struct t2s_session {
 
     // Per-slot state
     struct slot_state {
-        int n_pos = 0;
+        int n_pos        = 0;  // total tokens written to this slot's KV cache
+        int audio_offset = 0;  // slot-local index of the first audio token (= T_ref + T_in);
+                               // set once during prefill, used to derive decode PE position
+                               // as: n_pos - audio_offset
     };
     std::vector<slot_state> slots;
 
@@ -565,11 +568,32 @@ struct t2s_batch_plan {
 // The allocator is owned by the session and reused across graph builds.
 // The caller must ensure the session and model outlive this object.
 struct t2s_flex_graph {
-    // Input/output tensors (caller fills x, reads y)
-    struct ggml_tensor * x      = nullptr;   // {d_model, N} F32
-    struct ggml_tensor * y      = nullptr;   // {d_model, N} F32
-    struct ggml_tensor * kv_pos = nullptr;   // {N} I32  (filled by t2s_session_flex_advance)
-    struct ggml_tensor * mask   = nullptr;   // {n_kv, N} F16  (filled by t2s_session_flex_advance)
+    // ---- Input tensors ----
+
+    // Prefill embeddings: {d_model, N_prefill} F32
+    // Contains all prefill token embeddings concatenated in slot order (decode/idle slots
+    // omitted).  Null if no prefill slots in the plan.  Caller must fill before compute.
+    struct ggml_tensor * x_prefill = nullptr;
+
+    // Decode token IDs: {n_decode} I32
+    // One element per decode slot, in slot order (prefill/idle slots omitted).
+    // Caller fills with the sampled token from the previous step (or initial token).
+    // Null if no decode slots in the plan.
+    struct ggml_tensor * decode_token_ids = nullptr;
+
+    // ---- Runtime tensors (filled by t2s_session_flex_advance) ----
+
+    // Decode PE positions: {n_decode} I32
+    // Auto-filled from slot state (n_pos - audio_offset).  Caller does not touch.
+    // Null if no decode slots in the plan.
+    struct ggml_tensor * decode_positions = nullptr;
+
+    struct ggml_tensor * kv_pos = nullptr;   // {N} I32
+    struct ggml_tensor * mask   = nullptr;   // {n_kv, N} F16
+
+    // ---- Output tensors ----
+
+    struct ggml_tensor * y      = nullptr;   // {d_model, N} F32 (full attention output)
 
     // Sampler inputs/outputs (caller fills seen_mask/exp_noise, reads sampled/greedy)
     struct ggml_tensor * seen_mask = nullptr;  // {vocab, n_active} F32 input (optional)
@@ -584,14 +608,22 @@ struct t2s_flex_graph {
 
     int N        = 0;  // total query tokens (sum of active slot n_query)
     int n_active = 0;  // number of active slots (sampler batch dim)
+    int n_decode = 0;  // number of decode slots (decode_token_ids batch dim)
 };
 
 // Build a flexible computation graph for the given batch plan.
 //
 // The graph borrows the session's KV caches and the model's weight tensors.
-// Creates input tensors (x, kv_pos, mask) with shapes derived from the plan.
-// kv_pos and mask are left uninitialized — call t2s_session_flex_advance to fill
-// them and advance session state before executing the graph.
+// Input tensors are created with shapes derived from the plan:
+//   - x_prefill:       {d_model, N_prefill} F32 — prefill embeddings (caller fills)
+//   - decode_token_ids: {n_decode} I32          — decode token IDs (caller fills)
+//   - decode_positions: {n_decode} I32           — auto-filled by flex_advance
+//   - kv_pos, mask:                              — filled by flex_advance
+//
+// The graph internally builds the full input sequence by interleaving prefill
+// embedding chunks and in-graph decode embeddings (get_rows(audio_embed, token_id)
+// + get_rows(pe_table, position) * alpha) in slot order.  For pure-prefill or
+// pure-decode plans the degenerate path has zero overhead.
 //
 // After the transformer layers, the sampler is attached.  For each active slot,
 // only the last token's hidden state is extracted for sampling:
@@ -605,7 +637,7 @@ struct t2s_flex_graph {
 // across subsequent calls.  The allocator's buffer is retained between builds,
 // so consecutive plans with similar total token counts avoid buffer realloc.
 //
-// Token ordering in x: slot 0's tokens first, then slot 1's, etc.
+// Token ordering: slot 0's tokens first, then slot 1's, etc.
 // Idle slots (n_query == 0) contribute zero tokens.
 //
 // Returns a t2s_flex_graph with ctx != nullptr on success, or an empty graph
@@ -629,8 +661,10 @@ void t2s_flex_graph_free(t2s_flex_graph & graph);
 //   0. Validates slot state (decode: n_pos > 0; prefill: n_pos == 0)
 //   1. Fills graph.kv_pos with scatter-write positions
 //   2. Fills graph.mask with causal attention mask
-//   3. Reveals newly written KV positions in the session decode mask
-//   4. Increments n_pos by n_query[i]
+//   3. For decode slots: fills graph.decode_positions from (n_pos - audio_offset)
+//   4. Reveals newly written KV positions in the session decode mask
+//   5. Increments n_pos by n_query[i]
+//   6. For prefill slots: sets audio_offset = n_query - session.ref_T_prompt
 //
 // kv_pos rule (per active slot i, per token j within that slot):
 //   kv_pos[offset + j] = i * slot_size + session.slots[i].n_pos + j

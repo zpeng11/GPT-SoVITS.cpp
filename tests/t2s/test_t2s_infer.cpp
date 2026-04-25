@@ -168,8 +168,9 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     ASSERT_NE(graph.ctx, nullptr);
     ASSERT_EQ(graph.N, (int) T_total);
 
-    // Fill input tensor with reference embedding data.
-    ggml_backend_tensor_set(graph.x, ref_xy_pos.data(), 0,
+    // Fill input tensor with reference embedding data (pure prefill plan).
+    ASSERT_NE(graph.x_prefill, nullptr);
+    ggml_backend_tensor_set(graph.x_prefill, ref_xy_pos.data(), 0,
                             (size_t)(d_model * T_total) * sizeof(float));
 
     // Fill exp_noise with Exp(1) random noise for stochastic sampling.

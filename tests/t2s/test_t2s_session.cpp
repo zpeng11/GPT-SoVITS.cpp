@@ -68,9 +68,10 @@ static gpt_sovits::t2s_model create_minimal_model(gpt_sovits::t2s_hparams hparam
     const int64_t d_model = hparams.hidden_dim;
     const int64_t d_ff    = hparams.linear_units;
     const int     n_layer = (int) hparams.n_layer;
+    const int64_t vocab   = hparams.vocab_size;
 
     struct ggml_init_params wparams = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_layer * 12 + 4),
+        /*.mem_size   =*/ ggml_tensor_overhead() * (size_t)(n_layer * 12 + 4 + 2),
         /*.mem_buffer =*/ nullptr,
         /*.no_alloc   =*/ true,
     };
@@ -93,7 +94,12 @@ static gpt_sovits::t2s_model create_minimal_model(gpt_sovits::t2s_hparams hparam
         w.ln2_w       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
         w.ln2_b       = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, d_model);
     }
-    model.weights.lm_head_w = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, hparams.vocab_size);
+    model.weights.lm_head_w = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, vocab);
+
+    // Audio embedding weights needed by flex graph decode path.
+    model.weights.embed.audio_embedding = ggml_new_tensor_2d(model.ctx_w, GGML_TYPE_F32, d_model, vocab);
+    model.weights.embed.audio_pos_alpha = ggml_new_tensor_1d(model.ctx_w, GGML_TYPE_F32, 1);
+
     model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, backend);
 
     return model;
@@ -628,7 +634,12 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     EXPECT_EQ(graph.N, 9);
     EXPECT_EQ(graph.n_active, 3);  // slots 0, 2, 3 are active
 
-    expect_shape(graph.x,      {d_model, 9});
+    // plan = {5(prefill), 0(idle), 3(prefill), 1(decode)}
+    // N_prefill = 8, n_decode = 1
+    expect_shape(graph.x_prefill,        {d_model, 8});
+    expect_shape(graph.decode_token_ids, {1});
+    expect_shape(graph.decode_positions, {1});
+    EXPECT_EQ(graph.n_decode, 1);
     expect_shape(graph.y,      {d_model, 9});
     expect_shape(graph.kv_pos, {9});
     expect_shape(graph.mask,   {max_ctx, 9});
@@ -1090,8 +1101,9 @@ static void run_prefill_parity_test(
     ASSERT_NE(graph.ctx, nullptr);
     ASSERT_EQ(graph.N, (int) T_total);
 
-    // Fill input tensor
-    ggml_backend_tensor_set(graph.x, ref_xy_pos.data(), 0,
+    // Fill input tensor (pure prefill plan — all tokens go into x_prefill)
+    ASSERT_NE(graph.x_prefill, nullptr);
+    ggml_backend_tensor_set(graph.x_prefill, ref_xy_pos.data(), 0,
                             (size_t)(d_model * T_total) * sizeof(float));
 
     // Advance session state (fills kv_pos, mask, updates n_pos)
@@ -1238,9 +1250,18 @@ static void fill_compute_and_check_sampler(
     ggml_backend_t backend,
     int64_t d_model, int64_t vocab, int N)
 {
-    // Fill x with zeros (zero hidden states + zero weights → uniform logits → valid tokens).
-    std::vector<float> zeros_x((size_t)(d_model * N), 0.0f);
-    ggml_backend_tensor_set(graph.x, zeros_x.data(), 0, zeros_x.size() * sizeof(float));
+    // Fill prefill embeddings with zeros (zero hidden states + zero weights → uniform logits).
+    if (graph.x_prefill) {
+        std::vector<float> zeros_x((size_t)(d_model * graph.x_prefill->ne[1]), 0.0f);
+        ggml_backend_tensor_set(graph.x_prefill, zeros_x.data(), 0, zeros_x.size() * sizeof(float));
+    }
+
+    // Fill decode token IDs with 0 (a valid token in the vocabulary).
+    if (graph.decode_token_ids) {
+        std::vector<int32_t> token_ids(graph.n_decode, 0);
+        ggml_backend_tensor_set(graph.decode_token_ids, token_ids.data(), 0,
+                                graph.n_decode * sizeof(int32_t));
+    }
 
     // Fill exp_noise with ones so div(noise) is a no-op.
     std::vector<float> ones_noise((size_t)(vocab * graph.n_active), 1.0f);
@@ -1297,7 +1318,11 @@ TEST(T2SFlexSampler, DecodeOnly) {
     const int64_t d_model = hparams.hidden_dim;
     const int64_t vocab   = hparams.vocab_size;
 
-    expect_shape(graph.x,         {d_model, 2});
+    // Pure decode plan: x_prefill is null, decode_token_ids has 2 elements
+    EXPECT_EQ(graph.x_prefill, nullptr);
+    expect_shape(graph.decode_token_ids, {2});
+    expect_shape(graph.decode_positions, {2});
+    EXPECT_EQ(graph.n_decode, 2);
     expect_shape(graph.y,         {d_model, 2});
     expect_shape(graph.seen_mask, {vocab, 2});
     expect_shape(graph.exp_noise, {vocab, 2});
@@ -1344,7 +1369,11 @@ TEST(T2SFlexSampler, MixedPrefillAndDecode) {
     const int64_t d_model = hparams.hidden_dim;
     const int64_t vocab   = hparams.vocab_size;
 
-    expect_shape(graph.x,         {d_model, 8});
+    // Mixed plan: x_prefill = {d_model, 7} (slot 1), decode_token_ids = {1} (slot 0)
+    expect_shape(graph.x_prefill,        {d_model, 7});
+    expect_shape(graph.decode_token_ids, {1});
+    expect_shape(graph.decode_positions, {1});
+    EXPECT_EQ(graph.n_decode, 1);
     expect_shape(graph.y,         {d_model, 8});
     expect_shape(graph.seen_mask, {vocab, 2});
     expect_shape(graph.exp_noise, {vocab, 2});
