@@ -8,8 +8,7 @@
 
 #include "gpt_sovits/hubert.h"
 
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "test_backend.h"
 
 #include <string>
 #include <vector>
@@ -141,7 +140,7 @@ class HubertLoadAll : public ::testing::TestWithParam<ModelVariant> {};
 
 TEST_P(HubertLoadAll, LoadsSuccessfully) {
     const auto & variant = GetParam();
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
     ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model, backend))
@@ -155,7 +154,7 @@ TEST_P(HubertLoadAll, LoadsSuccessfully) {
 
 TEST_P(HubertLoadAll, WeightPointersComplete) {
     const auto & variant = GetParam();
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
     ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model, backend))
@@ -167,7 +166,7 @@ TEST_P(HubertLoadAll, WeightPointersComplete) {
 
 TEST_P(HubertLoadAll, TensorShapesCorrect) {
     const auto & variant = GetParam();
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
     ASSERT_TRUE(gpt_sovits::hubert_model_load(variant.path, model, backend))
@@ -190,7 +189,7 @@ INSTANTIATE_TEST_SUITE_P(
 // ---------------------------------------------------------------------------
 
 TEST(HubertLoad, NonExistentFileReturnsFalse) {
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::hubert_model model{};
     EXPECT_FALSE(gpt_sovits::hubert_model_load("/nonexistent/path.gguf", model, backend));

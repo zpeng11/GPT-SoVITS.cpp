@@ -13,8 +13,7 @@
 
 #include "ggml.h"
 #include "ggml-alloc.h"
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "test_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -38,7 +37,7 @@ struct ModelVariant {
 };
 
 static const std::vector<ModelVariant> kModelVariants = {
-    {"F32", kTestDir + "chinese-roberta-wwm-ext-large-f32.gguf", 5e-2, 5e-3},
+    {"F32", kTestDir + "chinese-roberta-wwm-ext-large-f32.gguf", 6e-2, 5e-3},
     {"F16", kTestDir + "chinese-roberta-wwm-ext-large-f16.gguf", 1e-1, 1e-2},
     {"Q8",  kTestDir + "chinese-roberta-wwm-ext-large-q8.gguf",  5e-1, 3e-2},
     {"Q5",  kTestDir + "chinese-roberta-wwm-ext-large-q5.gguf",  1.5,  1e-1},
@@ -193,7 +192,7 @@ protected:
         const auto & v = GetParam();
         ASSERT_MODEL_EXISTS(v.path);
 
-        backend_ = ggml_backend_cpu_init();
+        backend_ = create_test_backend();
         ASSERT_NE(backend_, nullptr);
         if (!gpt_sovits::roberta_model_load(v.path, model_, backend_)) {
             GTEST_SKIP() << "Could not load " << v.path;

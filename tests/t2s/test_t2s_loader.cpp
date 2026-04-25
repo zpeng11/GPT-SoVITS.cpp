@@ -8,8 +8,7 @@
 
 #include "gpt_sovits/t2s.h"
 
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "test_backend.h"
 
 #include <string>
 
@@ -27,18 +26,13 @@ static void expect_shape(ggml_tensor * t, const std::vector<int64_t> & expected)
     }
 }
 
-static ggml_backend_t create_backend() {
-    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    return backend;
-}
-
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 TEST(T2SLoader, LoadF16Model) {
     const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
@@ -99,7 +93,7 @@ TEST(T2SLoader, LoadF16Model) {
 
 TEST(T2SLoader, AllAttentionWeightsNonNull) {
     const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
@@ -126,7 +120,7 @@ TEST(T2SLoader, AllAttentionWeightsNonNull) {
 }
 
 TEST(T2SLoader, MissingFileReturnsFalse) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;

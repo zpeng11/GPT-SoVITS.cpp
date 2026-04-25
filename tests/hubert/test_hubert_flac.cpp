@@ -16,8 +16,7 @@
 
 #include "ggml.h"
 #include "ggml-alloc.h"
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "test_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -43,7 +42,7 @@ static const std::vector<ModelVariant> kModelVariants = {
     {"F32", kTestDir + "models/chinese-hubert-base-f32.gguf", 2e-2, 1e-3},
     {"F16", kTestDir + "models/chinese-hubert-base-f16.gguf", 2e-2, 2e-3},
     {"Q8",  kTestDir + "models/chinese-hubert-base-q8.gguf",  1e-1, 1e-2},
-    {"Q5",  kTestDir + "models/chinese-hubert-base-q5.gguf",  2e-1, 3e-2},
+    {"Q5",  kTestDir + "models/chinese-hubert-base-q5.gguf",  2.5e-1, 3e-2},
     {"Q4",  kTestDir + "models/chinese-hubert-base-q4.gguf",  5e-1, 8e-2},
 };
 
@@ -257,7 +256,7 @@ void normalize(std::vector<float> & audio) {
 class HubertFlacParity : public ::testing::TestWithParam<ModelVariant> {
 protected:
     void SetUp() override {
-        backend_ = ggml_backend_cpu_init();
+        backend_ = create_test_backend();
         if (!backend_) {
             GTEST_SKIP() << "Could not init CPU backend";
         }

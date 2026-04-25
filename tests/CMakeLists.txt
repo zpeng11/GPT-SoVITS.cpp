@@ -16,6 +16,9 @@ set(COMMON_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/common/cnpy.cpp
 )
 
+# Common test include path (for cnpy, npy_loader.h, test_backend.h)
+set(COMMON_TEST_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
+
 set(HUBERT_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_load.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_parity.cpp
@@ -25,6 +28,9 @@ set(HUBERT_TEST_SOURCES
 foreach(test_src ${HUBERT_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
+    target_include_directories(${test_name} PRIVATE
+        ${COMMON_TEST_INCLUDE_DIR}
+    )
     target_link_libraries(${test_name} PRIVATE
         gpt_sovits_cpp_static
         GTest::gtest_main
@@ -35,9 +41,6 @@ foreach(test_src ${HUBERT_TEST_SOURCES})
     gtest_discover_tests(${test_name})
 endforeach()
 
-# Common test include path (for cnpy, npy_loader.h)
-set(COMMON_TEST_INCLUDE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/common)
-
 # RoBERTa tests
 set(ROBERTA_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/roberta/test_roberta_load.cpp
@@ -47,6 +50,9 @@ set(ROBERTA_TEST_SOURCES
 foreach(test_src ${ROBERTA_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
     add_executable(${test_name} ${test_src})
+    target_include_directories(${test_name} PRIVATE
+        ${COMMON_TEST_INCLUDE_DIR}
+    )
     target_link_libraries(${test_name} PRIVATE
         gpt_sovits_cpp_static
         GTest::gtest_main

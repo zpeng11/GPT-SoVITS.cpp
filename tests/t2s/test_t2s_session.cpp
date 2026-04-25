@@ -7,18 +7,13 @@
 
 #include "gpt_sovits/t2s.h"
 
-#include "ggml-backend.h"
+#include "test_backend.h"
 #include "npy_loader.h"
 
 #include <cmath>
 #include <string>
 
 static const std::string kTestDir = T2S_TEST_DIR;
-
-static ggml_backend_t create_backend() {
-    ggml_backend_t backend = ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
-    return backend;
-}
 
 // Default sampler config for tests (greedy: no top-k/top-p, temperature=1).
 static gpt_sovits::t2s_sampler_config default_sampler_cfg() {
@@ -133,7 +128,7 @@ static ErrorStats compute_errors(const std::vector<float> & actual,
 // ---------------------------------------------------------------------------
 
 TEST(T2SSession, InitAndFree) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -173,7 +168,7 @@ TEST(T2SSession, InitAndFree) {
 }
 
 TEST(T2SSession, InitRejectsInvalidParams) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -186,7 +181,7 @@ TEST(T2SSession, InitRejectsInvalidParams) {
 }
 
 TEST(T2SSession, DoubleFreeSafe) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -211,7 +206,7 @@ TEST(T2SBuildGraph, GraphFreeSafe) {
 // ---------------------------------------------------------------------------
 
 TEST(T2SSession, FindFreeSlot) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -247,7 +242,7 @@ TEST(T2SSession, FindFreeSlot) {
 
 TEST(T2SSession, BuildDecodeGraph) {
     const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
@@ -311,7 +306,7 @@ TEST(T2SSession, BuildDecodeGraph) {
 class T2SMaskTest : public ::testing::Test {
 protected:
     void SetUp() override {
-        backend = create_backend();
+        backend = create_test_backend();
         ASSERT_NE(backend, nullptr);
         ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, n_batch, slot_size));
         max_ctx = (int64_t)n_batch * slot_size;
@@ -434,7 +429,7 @@ TEST_F(T2SMaskTest, ReleaseAndReuse) {
 // ---------------------------------------------------------------------------
 
 TEST(T2SSession, InitQuantizedKVCache) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -481,7 +476,7 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
     if (!f) GTEST_SKIP() << "Model file not found: " << path;
     fclose(f);
 
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
@@ -564,7 +559,7 @@ TEST(T2SBatchPlan, Total) {
 }
 
 TEST(T2SBuildGraph, RejectsInvalidPlan) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -606,7 +601,7 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     if (!f) GTEST_SKIP() << "Model file not found: " << path;
     fclose(f);
 
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
@@ -656,7 +651,7 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
 }
 
 TEST(T2SBuildGraph, KvPosCorrectness) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -697,7 +692,7 @@ TEST(T2SBuildGraph, KvPosCorrectness) {
 }
 
 TEST(T2SBuildGraph, MaskCorrectness) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -779,7 +774,7 @@ TEST(T2SBuildGraph, MaskCorrectness) {
 // Text tokens see all text bidirectionally, no audio.
 // Audio tokens see all text + causal audio.
 TEST(T2SBuildGraph, MaskCorrectnessThreePart) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -864,7 +859,7 @@ TEST(T2SBuildGraph, MaskCorrectnessThreePart) {
 // ---------------------------------------------------------------------------
 
 TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -931,7 +926,7 @@ TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
 }
 
 TEST(T2SAdvance, ActivatesIdleSlot) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -996,7 +991,7 @@ struct FlexAdvanceDeathParams {
 class T2SAdvanceDeathTest : public ::testing::TestWithParam<FlexAdvanceDeathParams> {
 protected:
     void SetUp() override {
-        backend = create_backend();
+        backend = create_test_backend();
         ASSERT_NE(backend, nullptr);
         ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend, 2, 8));
     }
@@ -1070,7 +1065,7 @@ static void run_prefill_parity_test(
     const int64_t T_prompt  = 113;
     const int64_t T_total   = T_ref + T_in + T_prompt;  // 193
 
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
@@ -1292,7 +1287,7 @@ static void fill_compute_and_check_sampler(
 
 // Verify that sampler outputs have correct shapes and are valid token IDs.
 TEST(T2SFlexSampler, DecodeOnly) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;
@@ -1340,7 +1335,7 @@ TEST(T2SFlexSampler, DecodeOnly) {
 // Verify sampler with prefill: only the last token is sampled.
 // With mixed prefill + decode in one plan.
 TEST(T2SFlexSampler, MixedPrefillAndDecode) {
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_hparams hparams;

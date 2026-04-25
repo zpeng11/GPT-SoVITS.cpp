@@ -15,8 +15,7 @@
 
 #include "ggml.h"
 #include "ggml-alloc.h"
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "test_backend.h"
 
 #include <cmath>
 #include <cstdio>
@@ -176,7 +175,7 @@ static double block_rmse(double full_tol)    { return full_tol * 0.5; }
 class HubertParity : public ::testing::TestWithParam<ModelVariant> {
 protected:
     void SetUp() override {
-        backend_ = ggml_backend_cpu_init();
+        backend_ = create_test_backend();
         if (!backend_) {
             GTEST_SKIP() << "Could not init CPU backend";
         }

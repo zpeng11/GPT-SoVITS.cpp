@@ -7,8 +7,7 @@
 
 #include "gpt_sovits/roberta.h"
 
-#include "ggml-backend.h"
-#include "ggml-cpu.h"
+#include "test_backend.h"
 
 #include <string>
 
@@ -97,7 +96,7 @@ static void check_tensor_shapes(const gpt_sovits::roberta_model_block_weights & 
 
 TEST(RobertaLoad, LoadsSuccessfully) {
     ASSERT_MODEL_EXISTS(kModelF32);
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::roberta_model model{};
     ASSERT_TRUE(gpt_sovits::roberta_model_load(kModelF32, model, backend));
@@ -110,7 +109,7 @@ TEST(RobertaLoad, LoadsSuccessfully) {
 
 TEST(RobertaLoad, WeightPointersComplete) {
     ASSERT_MODEL_EXISTS(kModelF32);
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::roberta_model model{};
     ASSERT_TRUE(gpt_sovits::roberta_model_load(kModelF32, model, backend));
@@ -121,7 +120,7 @@ TEST(RobertaLoad, WeightPointersComplete) {
 
 TEST(RobertaLoad, TensorShapesCorrect) {
     ASSERT_MODEL_EXISTS(kModelF32);
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::roberta_model model{};
     ASSERT_TRUE(gpt_sovits::roberta_model_load(kModelF32, model, backend));
@@ -135,7 +134,7 @@ TEST(RobertaLoad, TensorShapesCorrect) {
 // ---------------------------------------------------------------------------
 
 TEST(RobertaLoad, NonExistentFileReturnsFalse) {
-    ggml_backend_t backend = ggml_backend_cpu_init();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
     gpt_sovits::roberta_model model{};
     EXPECT_FALSE(gpt_sovits::roberta_model_load("/nonexistent/path.gguf", model, backend));

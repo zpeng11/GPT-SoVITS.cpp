@@ -14,7 +14,7 @@
 
 #include "ggml.h"
 #include "ggml-alloc.h"
-#include "ggml-backend.h"
+#include "test_backend.h"
 #include "npy_loader.h"
 
 #include <chrono>
@@ -54,10 +54,6 @@ static void save_npy_i32(const std::string & path,
     // data
     fwrite(data.data(), sizeof(int32_t), data.size(), fp);
     fclose(fp);
-}
-
-static ggml_backend_t create_backend() {
-    return ggml_backend_init_by_type(GGML_BACKEND_DEVICE_TYPE_CPU, nullptr);
 }
 
 static gpt_sovits::t2s_sampler_config default_sampler_cfg() {
@@ -188,7 +184,7 @@ TEST_P(T2SInferTest, PrefillAndDecodeLoop) {
     ASSERT_FALSE(ref_v_cache.empty());
 
     // --- Create backend and load model ---
-    ggml_backend_t backend = create_backend();
+    ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
     gpt_sovits::t2s_model model;
