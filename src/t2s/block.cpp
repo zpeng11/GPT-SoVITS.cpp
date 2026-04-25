@@ -5,6 +5,8 @@
 
 namespace gpt_sovits {
 
+// -1e10 causes softmax to underflow to zero without needing a dedicated
+// masked_fill op (matches Python AR.models.utils behavior).
 static constexpr float kSamplerMaskLogit = -1.0e10f;
 
 struct t2s_sampler_probs_result {
@@ -47,6 +49,7 @@ static ::ggml_tensor * masked_lerp(
     return ggml_add(ctx, base, ggml_mul(ctx, mask, ggml_sub(ctx, selected, base)));
 }
 
+// Top-p filtering in sorted-logit space (matches AR.models.utils).
 static ::ggml_tensor * apply_top_p_sorted(
     ::ggml_context * ctx,
     ::ggml_tensor  * sorted_logits,

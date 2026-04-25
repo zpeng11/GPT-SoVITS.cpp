@@ -10,42 +10,29 @@
 
 namespace gpt_sovits {
 
-// Weights for the SoVITS semantic extractor path used by
-// SynthesizerTrn.extract_latent(...):
+// Tensor shapes use ggml convention throughout: ne[0] is the innermost dim.
+// PyTorch Linear(in, out).weight has shape [out, in] → ggml {in, out}.
+// All shapes in comments use ggml notation.
+
+// Weights for the SoVITS extract-latent path:
 //   hubert_feature -> ssl_proj Conv1d -> RVQ nearest-code lookup -> codes
-//
-// This block matches the inference-only path that produces prompt semantic
-// tokens from HuBERT features. The current GPT-SoVITS models use a single RVQ
-// layer (n_q = 1), so only one codebook is required here.
 struct sovits_extract_latent_block_weights {
-    // Conv1d(768, 768, kernel=2, stride=2) in ggml kernel layout.
-    // PyTorch weight [out_channels, in_channels, kernel_size]
-    // maps to ggml {kernel_size, in_channels, out_channels}.
-    struct ggml_tensor * ssl_proj_w;     // {2, 768, 768}
+    struct ggml_tensor * ssl_proj_w;     // Conv1d(768, 768, k=2, s=2)  {2, 768, 768}
     struct ggml_tensor * ssl_proj_b;     // {768}
 
-    // RVQ codebook for the first and only quantizer layer.
-    // PyTorch embed shape [1024, 768] maps to ggml {768, 1024} so
-    // ggml_mul_mat(codebook, ssl) yields per-token scores {1024, T'}.
+    // RVQ codebook (single quantizer layer, n_q = 1).
     struct ggml_tensor * codebook;       // {768, 1024}
 };
 
-// Build the computation graph for the inference path used by
-// SynthesizerTrn.extract_latent(...).
+// Build the extract-latent computation graph.
 //
 // Parameters:
-//   ctx            - ggml context for tensor/op allocation
-//   hubert_feature - CN-HuBERT features               {768, T}
-//   weights        - block weights (see above)
+//   ctx            - ggml context
+//   hubert_feature - CN-HuBERT features  {768, T}
+//   weights        - block weights
 //
 // Returns:
 //   codes {T'} (i32), where T' is the post-conv sequence length.
-//
-// Notes:
-//   - This implements only the inference path. Training-only EMA updates,
-//     commitment loss, and straight-through quantized outputs are omitted.
-//   - Current GPT-SoVITS checkpoints force semantic_frame_rate = "25hz" in
-//     TTS inference, so ssl_proj is the stride-2 Conv1d path.
 struct ggml_tensor * sovits_extract_latent_block_forward(
     struct ggml_context                       * ctx,
     struct ggml_tensor                        * hubert_feature,
@@ -72,12 +59,8 @@ struct ggml_tensor * sovits_extract_latent_block_forward(
 //   t2s_sampler_result with per-slot token ids, each {n_batch} (i32).
 //
 // Notes:
-//   - Supports batched inference: each column of y is sampled independently.
-//   - Top-p is applied in sorted-logit space exactly as in AR.models.utils.
-//   - Masked logits use a large negative finite sentinel so softmax underflows
-//     them to zero without requiring a dedicated masked_fill op.
-//   - ggml does not provide a graph RNG op, so randomized sampling requires
-//     `exp_noise` to be supplied by the caller.
+//   - Batched: each column of y is sampled independently.
+//   - No in-graph RNG; caller must supply exp_noise for random sampling.
 struct t2s_sampler_result {
     struct ggml_tensor * sampled;   // randomly sampled (or greedy) tokens {n_batch} (i32)
     struct ggml_tensor * greedy;    // argmax tokens (before noise)        {n_batch} (i32)
@@ -123,8 +106,7 @@ struct ggml_tensor * t2s_audio_embed_block_forward(
 //   prompt_tokens -> audio embedding + SinePositionalEmbedding.forward(y)
 //   xy_pos = concat(text, prompt)
 //
-// All tensors use ggml's shape convention (ne[0] = innermost dim).
-// This block currently targets single-sample inference.
+// Embedding weights for the T2S input sequence (single-sample inference).
 struct t2s_embed_block_weights {
     // Text path
     struct ggml_tensor * text_embedding;  // {d_model, phoneme_vocab}
@@ -186,15 +168,9 @@ struct ggml_tensor * t2s_embed_input_forward(
     int64_t               T_ref,
     const t2s_embed_block_weights & embed_weights);
 
-// Per-layer weights for a T2S (Text-to-Semantic) attention block.
-//
-// Implements a post-norm Transformer encoder layer:
-//   x -> QKV proj -> flash attention -> out proj -> residual + LN
+// Per-layer weights for a T2S attention block (post-norm Transformer):
+//   x -> QKV -> attention -> out proj -> residual + LN
 //     -> FFN up (ReLU) -> FFN down -> residual + LN
-//
-// Weight tensor shapes use ggml convention (ne[0] = innermost dim):
-//   Linear(in, out)  ->  weight.ne = {in, out}
-//   LayerNorm(dim)   ->  weight.ne = {dim}, bias.ne = {dim}
 struct t2s_attention_block_weights {
     // Self-attention: fused QKV projection  Linear(d_model, 3*d_model)
     struct ggml_tensor * qkv_w;       // {d_model, 3*d_model}
@@ -228,9 +204,8 @@ struct t2s_attention_block_weights {
 // both with post-norm residuals.
 //
 // Parameters:
-//   ctx       - ggml context for tensor/op allocation (typically no_alloc)
-//   gf        - computation graph; KV cache write ops are added via
-//               ggml_build_forward_expand so they execute before attention
+//   ctx       - ggml context
+//   gf        - computation graph
 //   x         - input activations               {d_model, N}
 //   mask      - attention mask (f16, contiguous) {n_kv, N}
 //               0 = attend, -inf = masked; caller is responsible for
@@ -329,9 +304,7 @@ void t2s_model_free(t2s_model & model);
 // Sampler configuration (baked into decode graph at build time)
 // ---------------------------------------------------------------------------
 
-// Controls sampling behavior for the persistent decode graph.  These values
-// determine which ggml ops are added to the graph topology, so they cannot be
-// changed without rebuilding the graph.
+// Sampling parameters — bound to the session at init time (see t2s_session_init).
 struct t2s_sampler_config {
     int   top_k              = 15;      // <= 0 disables top-k filtering
     float top_p              = 1.0f;   // >= 1.0 disables top-p filtering
@@ -359,9 +332,7 @@ struct t2s_session {
     // Per-slot state
     struct slot_state {
         int n_pos        = 0;  // total tokens written to this slot's KV cache
-        int audio_offset = 0;  // slot-local index of the first audio token (= T_ref + T_in);
-                               // set once during prefill, used to derive decode PE position
-                               // as: n_pos - audio_offset
+        int audio_offset = 0;  // first audio token index (T_ref + T_in); decode PE = n_pos - audio_offset
     };
     std::vector<slot_state> slots;
 
@@ -397,9 +368,8 @@ struct t2s_session {
     struct ggml_tensor  * token_id  = nullptr;  // {n_batch} I32 — audio token to embed
     struct ggml_tensor  * position  = nullptr;  // {n_batch} I32 — PE position index
 
-    // Precomputed positional embedding table: {d_model, slot_size} F32
-    // Row p contains the sine PE for position p, matching the layout produced by
-    // build_sine_positional_embedding: [sin0, cos0, sin1, cos1, ...].
+    // Precomputed sine PE table: {d_model, slot_size} F32
+    // Row p = [sin0, cos0, sin1, cos1, ...] for position p.
     struct ggml_tensor  * pe_table  = nullptr;
 
     // Sampler configuration (baked into decode graph topology at build time)
@@ -429,19 +399,18 @@ struct t2s_session {
 
 // Initialize a T2S inference session with pre-allocated KV caches.
 //
-// The sampler configuration is bound to the session at init time and cannot be
-// changed. All subsequent graph builds (decode graph, flex graph) will use this
-// config. This enforces the 1:1 relationship: one session = one sampler config.
+// The sampler configuration is bound at init time: all subsequent graph builds
+// (decode graph, flex graph) use this config. One session = one sampler config.
 //
 // Parameters:
 //   session     - output session struct (will be populated)
-//   hparams     - model hyperparameters (d_model, n_layer, etc.)
-//   backend     - ggml backend for tensor allocation (borrowed, not freed)
+//   hparams     - model hyperparameters
+//   backend     - ggml backend (borrowed, not freed)
 //   n_batch     - number of concurrent request slots
 //   slot_size   - maximum tokens per request slot
-//   sampler_cfg - sampler configuration (baked into all graphs built for this session)
+//   sampler_cfg - sampler config (baked into all graphs)
 //
-// Returns true on success, false on failure (with errors printed to stderr).
+// Returns true on success, false on failure.
 bool t2s_session_init(t2s_session             & session,
                       const t2s_hparams       & hparams,
                       ggml_backend_t            backend,
@@ -526,19 +495,14 @@ int64_t t2s_session_get_ref_T_ref(const t2s_session & session);
 // Get the cached T_prompt (number of reference prompt audio tokens), or 0 if not computed.
 int64_t t2s_session_get_ref_T_prompt(const t2s_session & session);
 
-// Build a *persistent* decode graph for this session.  Call exactly once
-// after t2s_session_init; the graph is stored in the session and reused for
-// every subsequent decode step.
+// Build a persistent decode graph for this session. Call exactly once after
+// t2s_session_init; the graph is reused for every decode step.
 //
-// The graph includes the sampler: hidden states from the last attention layer
-// are projected to logits via lm_head_w, then filtered and sampled according
-// to the session's sampler_cfg (set at init time).
-// The outputs are `sampled` and `greedy` token id tensors.
+// Includes the sampler (using session's sampler_cfg). Outputs are `sampled`
+// and `greedy` token id tensors.
 //
-// IMPORTANT — this graph assumes **all** `n_batch` slots are occupied and
-// every slot is in the single-token decode phase (one new token per slot
-// per invocation).  It is NOT suitable for prefill where a slot may consume
-// many tokens at once.
+// IMPORTANT — assumes ALL n_batch slots are in single-token decode phase.
+// NOT suitable for prefill; use flex graph for mixed batches.
 bool t2s_session_build_decode_graph(
     t2s_session             & session,
     const t2s_model         & model);
@@ -576,22 +540,15 @@ struct t2s_batch_plan {
 struct t2s_flex_graph {
     // ---- Input tensors ----
 
-    // Prefill embeddings: {d_model, N_prefill} F32
-    // Contains all prefill token embeddings concatenated in slot order (decode/idle slots
-    // omitted).  Null if no prefill slots in the plan.  Caller must fill before compute.
+    // Prefill embeddings in slot order (null if no prefill slots).  {d_model, N_prefill} F32
     struct ggml_tensor * x_prefill = nullptr;
 
-    // Decode token IDs: {n_decode} I32
-    // One element per decode slot, in slot order (prefill/idle slots omitted).
-    // Caller fills with the sampled token from the previous step (or initial token).
-    // Null if no decode slots in the plan.
+    // Decode token IDs in slot order (null if no decode slots).  {n_decode} I32
     struct ggml_tensor * decode_token_ids = nullptr;
 
     // ---- Runtime tensors (filled by t2s_session_flex_advance) ----
 
-    // Decode PE positions: {n_decode} I32
-    // Auto-filled from slot state (n_pos - audio_offset).  Caller does not touch.
-    // Null if no decode slots in the plan.
+    // Decode PE positions — auto-filled by flex_advance (null if no decode slots).  {n_decode} I32
     struct ggml_tensor * decode_positions = nullptr;
 
     struct ggml_tensor * kv_pos = nullptr;   // {N} I32
@@ -619,35 +576,20 @@ struct t2s_flex_graph {
 
 // Build a flexible computation graph for the given batch plan.
 //
-// The graph borrows the session's KV caches and the model's weight tensors.
-// Input tensors are created with shapes derived from the plan:
-//   - x_prefill:       {d_model, N_prefill} F32 — prefill embeddings (caller fills)
-//   - decode_token_ids: {n_decode} I32          — decode token IDs (caller fills)
-//   - decode_positions: {n_decode} I32           — auto-filled by flex_advance
-//   - kv_pos, mask:                              — filled by flex_advance
-//
-// The graph internally builds the full input sequence by interleaving prefill
-// embedding chunks and in-graph decode embeddings (get_rows(audio_embed, token_id)
-// + get_rows(pe_table, position) * alpha) in slot order.  For pure-prefill or
-// pure-decode plans the degenerate path has zero overhead.
-//
-// After the transformer layers, the sampler is attached.  For each active slot,
-// only the last token's hidden state is extracted for sampling:
-//   - decode slots (n_query == 1): the single token
-//   - prefill slots (n_query > 1): the last token in the prefill sequence
-// The extracted columns are concatenated into y_sample {d_model, n_active} and
-// passed to t2s_sampler_block_forward.  The full attention output y is still
-// available as graph.y for verification purposes.
-//
-// A shared allocator (session.alloc_flex) is created on first call and reused
-// across subsequent calls.  The allocator's buffer is retained between builds,
-// so consecutive plans with similar total token counts avoid buffer realloc.
+// Input tensors (caller fills unless noted):
+//   - x_prefill:        {d_model, N_prefill} F32 — prefill embeddings
+//   - decode_token_ids: {n_decode} I32           — decode token IDs
+//   - decode_positions: {n_decode} I32            — auto-filled by flex_advance
+//   - kv_pos, mask:                               — filled by flex_advance
 //
 // Token ordering: slot 0's tokens first, then slot 1's, etc.
 // Idle slots (n_query == 0) contribute zero tokens.
 //
+// The sampler extracts the last token per active slot and applies the session's
+// sampler_cfg. Full attention output is available as graph.y.
+//
 // Returns a t2s_flex_graph with ctx != nullptr on success, or an empty graph
-// on failure.  Call t2s_flex_graph_free when done (frees ctx only, not the allocator).
+// on failure. Call t2s_flex_graph_free when done (frees ctx only, not the allocator).
 t2s_flex_graph t2s_session_build_flex_graph(
     t2s_session             & session,
     const t2s_model         & model,
@@ -657,41 +599,15 @@ t2s_flex_graph t2s_session_build_flex_graph(
 void t2s_flex_graph_free(t2s_flex_graph & graph);
 
 // Advance session state and fill graph runtime inputs for the given plan.
-//
-// This is the flexible-graph counterpart to t2s_session_decode_advance:
-// it prepares runtime inputs AND updates session state before execution.
 // Call after t2s_session_build_flex_graph and before ggml_backend_graph_compute.
 //
-// For each slot with n_query[i] > 0:
-//   0. Validates slot state (decode: n_pos > 0; prefill: n_pos == 0)
-//   1. Fills graph.kv_pos with scatter-write positions
-//   2. Fills graph.mask with causal attention mask
-//   3. For decode slots: fills graph.decode_positions from (n_pos - audio_offset)
-//   4. Reveals newly written KV positions in the session decode mask
-//   5. Increments n_pos by n_query[i]
-//   6. For prefill slots: sets audio_offset = n_query - session.ref_T_prompt
-//
-// kv_pos rule (per active slot i, per token j within that slot):
-//   kv_pos[offset + j] = i * slot_size + session.slots[i].n_pos + j
-//
-// mask rules (per active slot i):
-//
-//   Decode (n_query == 1, n_pos > 0):
-//     The single query token attends to all valid KV positions [0, n_pos).
-//     mask(r, col) = 0    if local_r < n_pos
-//     mask(r, col) = -inf otherwise
-//
-//   Prefill (n_query > 1, n_pos == 0):
-//     Sequence layout: [T_ref (ref text) | T_in (input text) | T_prompt (ref audio)]
-//     where T_text = T_ref + T_in = n_query - session.ref_T_prompt.
-//
-//     Text tokens (j < T_text): bidirectional within text, masked to audio.
-//       mask(r, col) = 0    if local_r < T_text
-//       mask(r, col) = -inf otherwise
-//
-//     Audio tokens (j >= T_text): see all text + causal audio.
-//       mask(r, col) = 0    if local_r < j + 1
-//       mask(r, col) = -inf otherwise
+// For each active slot (n_query[i] > 0):
+//   - Validates slot state (decode: n_pos > 0; prefill: n_pos == 0)
+//   - Fills kv_pos scatter-write positions: slot_col[i] * slot_size + n_pos + j
+//   - Builds attention mask (decode: attend all valid; prefill: text bidirectional + audio causal)
+//   - Decode slots: auto-fills decode_positions from (n_pos - audio_offset)
+//   - Prefill slots: sets audio_offset = n_query - ref_T_prompt
+//   - Reveals new KV positions in session decode mask; increments n_pos
 void t2s_session_flex_advance(t2s_session & session, const t2s_batch_plan & plan, t2s_flex_graph & graph);
 
 } // namespace gpt_sovits
