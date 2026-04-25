@@ -149,8 +149,10 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     const uint32_t n_batch   = 1;
     const uint32_t slot_size = 512;  // >= 193 + max_decode_steps
 
+    auto sampler_cfg = default_sampler_cfg();
+
     gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size));
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size, sampler_cfg));
 
     // Set reference embedding dimensions for correct mask generation.
     session.ref_T_ref    = T_ref;
@@ -163,8 +165,7 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {(int) T_total};
 
-    auto sampler_cfg = default_sampler_cfg();
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, sampler_cfg);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
     ASSERT_EQ(graph.N, (int) T_total);
 
@@ -258,7 +259,7 @@ TEST(T2SInfer, PrefillAndDecodeLoop) {
     // Phase 2: Build persistent decode graph
     // =======================================================================
 
-    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model, sampler_cfg));
+    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model));
 
     struct ggml_tensor * dec_exp_noise  = gpt_sovits::t2s_session_get_exp_noise(session);
     struct ggml_tensor * dec_seen_mask  = gpt_sovits::t2s_session_get_seen_mask(session);

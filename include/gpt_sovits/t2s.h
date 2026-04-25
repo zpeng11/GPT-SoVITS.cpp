@@ -429,20 +429,26 @@ struct t2s_session {
 
 // Initialize a T2S inference session with pre-allocated KV caches.
 //
+// The sampler configuration is bound to the session at init time and cannot be
+// changed. All subsequent graph builds (decode graph, flex graph) will use this
+// config. This enforces the 1:1 relationship: one session = one sampler config.
+//
 // Parameters:
-//   session   - output session struct (will be populated)
-//   hparams   - model hyperparameters (d_model, n_layer, etc.)
-//   backend   - ggml backend for tensor allocation (borrowed, not freed)
-//   n_batch   - number of concurrent request slots
-//   slot_size - maximum tokens per request slot
+//   session     - output session struct (will be populated)
+//   hparams     - model hyperparameters (d_model, n_layer, etc.)
+//   backend     - ggml backend for tensor allocation (borrowed, not freed)
+//   n_batch     - number of concurrent request slots
+//   slot_size   - maximum tokens per request slot
+//   sampler_cfg - sampler configuration (baked into all graphs built for this session)
 //
 // Returns true on success, false on failure (with errors printed to stderr).
-bool t2s_session_init(t2s_session      & session,
-                      const t2s_hparams & hparams,
-                      ggml_backend_t     backend,
-                      uint32_t           n_batch,
-                      uint32_t           slot_size,
-                      enum ggml_type     kv_cache_type = GGML_TYPE_F32);
+bool t2s_session_init(t2s_session             & session,
+                      const t2s_hparams       & hparams,
+                      ggml_backend_t            backend,
+                      uint32_t                  n_batch,
+                      uint32_t                  slot_size,
+                      const t2s_sampler_config & sampler_cfg   = {},
+                      enum ggml_type            kv_cache_type  = GGML_TYPE_F32);
 
 // Free all resources owned by a T2S session.
 void t2s_session_free(t2s_session & session);
@@ -526,7 +532,8 @@ int64_t t2s_session_get_ref_T_prompt(const t2s_session & session);
 //
 // The graph includes the sampler: hidden states from the last attention layer
 // are projected to logits via lm_head_w, then filtered and sampled according
-// to `sampler_cfg`.  The outputs are `sampled` and `greedy` token id tensors.
+// to the session's sampler_cfg (set at init time).
+// The outputs are `sampled` and `greedy` token id tensors.
 //
 // IMPORTANT — this graph assumes **all** `n_batch` slots are occupied and
 // every slot is in the single-token decode phase (one new token per slot
@@ -534,8 +541,7 @@ int64_t t2s_session_get_ref_T_prompt(const t2s_session & session);
 // many tokens at once.
 bool t2s_session_build_decode_graph(
     t2s_session             & session,
-    const t2s_model         & model,
-    const t2s_sampler_config & sampler_cfg = {});
+    const t2s_model         & model);
 
 // Accessors for the decode graph.
 struct ggml_tensor * t2s_session_get_token_id(const t2s_session & session);
@@ -645,8 +651,7 @@ struct t2s_flex_graph {
 t2s_flex_graph t2s_session_build_flex_graph(
     t2s_session             & session,
     const t2s_model         & model,
-    const t2s_batch_plan    & plan,
-    const t2s_sampler_config & sampler_cfg);
+    const t2s_batch_plan    & plan);
 
 // Free all resources owned by a t2s_flex_graph.
 void t2s_flex_graph_free(t2s_flex_graph & graph);

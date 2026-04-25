@@ -52,12 +52,13 @@ static std::vector<float> build_pe_table_cpu(int64_t d_model, int64_t max_pos,
     return table;
 }
 
-bool t2s_session_init(t2s_session      & session,
-                      const t2s_hparams & hparams,
-                      ggml_backend_t     backend,
-                      uint32_t           n_batch,
-                      uint32_t           slot_size,
-                      enum ggml_type     kv_cache_type)
+bool t2s_session_init(t2s_session             & session,
+                      const t2s_hparams       & hparams,
+                      ggml_backend_t            backend,
+                      uint32_t                  n_batch,
+                      uint32_t                  slot_size,
+                      const t2s_sampler_config & sampler_cfg,
+                      enum ggml_type            kv_cache_type)
 {
     GGML_ASSERT(backend != nullptr);
     if (n_batch == 0 || slot_size == 0) {
@@ -144,8 +145,9 @@ bool t2s_session_init(t2s_session      & session,
                                 0, (size_t)(d_model * slot_size) * sizeof(float));
     }
 
-    session.n_batch   = n_batch;
-    session.slot_size = slot_size;
+    session.n_batch      = n_batch;
+    session.slot_size    = slot_size;
+    session.sampler_cfg  = sampler_cfg;
     session.slots.resize(n_batch);
 
     fprintf(stderr, "%s: n_batch=%u, slot_size=%u, max_ctx=%lld, n_layer=%u\n",
@@ -300,8 +302,7 @@ int t2s_session_get_n_kv(const t2s_session & session) {
 
 bool t2s_session_build_decode_graph(
     t2s_session             & session,
-    const t2s_model         & model,
-    const t2s_sampler_config & sampler_cfg)
+    const t2s_model         & model)
 {
     const auto & hparams = model.hparams;
     const int64_t d_model = hparams.hidden_dim;
@@ -310,7 +311,7 @@ bool t2s_session_build_decode_graph(
     const int     n_kv    = t2s_session_get_n_kv(session);
     const int     n_batch = (int) session.n_batch;
 
-    session.sampler_cfg = sampler_cfg;
+    const t2s_sampler_config & sampler_cfg = session.sampler_cfg;
 
     // Graph context: holds intermediate tensors and the cgraph structure.
     // Attention layers need ~32 intermediates each; sampler needs ~50 per batch element.
@@ -460,8 +461,7 @@ void t2s_flex_graph_free(t2s_flex_graph & graph) {
 t2s_flex_graph t2s_session_build_flex_graph(
     t2s_session             & session,
     const t2s_model         & model,
-    const t2s_batch_plan    & plan,
-    const t2s_sampler_config & sampler_cfg)
+    const t2s_batch_plan    & plan)
 {
     t2s_flex_graph graph;
 
@@ -477,6 +477,7 @@ t2s_flex_graph t2s_session_build_flex_graph(
     }
 
     const auto & hparams  = model.hparams;
+    const t2s_sampler_config & sampler_cfg = session.sampler_cfg;
     const int64_t d_model = hparams.hidden_dim;
     const int     n_layer = (int) hparams.n_layer;
     const int     n_head  = (int) hparams.n_head;

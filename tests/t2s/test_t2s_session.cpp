@@ -256,16 +256,16 @@ TEST(T2SSession, BuildDecodeGraph) {
     const uint32_t n_batch   = 2;
     const uint32_t slot_size = 32;
 
-    gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size));
-
     gpt_sovits::t2s_sampler_config sampler_cfg;
     sampler_cfg.top_k              = 25;
     sampler_cfg.top_p              = 0.95f;
     sampler_cfg.temperature        = 1.0f;
     sampler_cfg.repetition_penalty = 1.35f;
 
-    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model, sampler_cfg));
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size, sampler_cfg));
+
+    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model));
 
     // Verify graph structure
     struct ggml_tensor * token_id  = gpt_sovits::t2s_session_get_token_id(session);
@@ -444,7 +444,7 @@ TEST(T2SSession, InitQuantizedKVCache) {
     const uint32_t slot_size = 16;
 
     ASSERT_TRUE(gpt_sovits::t2s_session_init(session, hparams, backend,
-                                              n_batch, slot_size, GGML_TYPE_Q8_0));
+                                              n_batch, slot_size, {}, GGML_TYPE_Q8_0));
 
     const int64_t d_model = hparams.hidden_dim;
     const int64_t max_ctx = (int64_t) n_batch * slot_size;
@@ -578,7 +578,7 @@ TEST(T2SBuildGraph, RejectsInvalidPlan) {
     {
         gpt_sovits::t2s_batch_plan plan;
         plan.n_query = {0, 0, 0, 0};
-        auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+        auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
         EXPECT_EQ(graph.ctx, nullptr) << "should fail for empty plan";
         gpt_sovits::t2s_flex_graph_free(graph);
     }
@@ -587,7 +587,7 @@ TEST(T2SBuildGraph, RejectsInvalidPlan) {
     {
         gpt_sovits::t2s_batch_plan plan;
         plan.n_query = {1, 0};
-        auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+        auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
         EXPECT_EQ(graph.ctx, nullptr) << "should fail for wrong plan size";
         gpt_sovits::t2s_flex_graph_free(graph);
     }
@@ -629,7 +629,7 @@ TEST(T2SBuildGraph, BuildsGraphWithCorrectShapes) {
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {5, 0, 3, 1};
 
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
     EXPECT_EQ(graph.N, 9);
     EXPECT_EQ(graph.n_active, 3);  // slots 0, 2, 3 are active
@@ -673,7 +673,7 @@ TEST(T2SBuildGraph, KvPosCorrectness) {
     plan.n_query = {1, 0, 4};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     gpt_sovits::t2s_session_flex_advance(session, plan, graph);
@@ -715,7 +715,7 @@ TEST(T2SBuildGraph, MaskCorrectness) {
     plan.n_query = {2, 3};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     gpt_sovits::t2s_session_flex_advance(session, plan, graph);
@@ -802,7 +802,7 @@ TEST(T2SBuildGraph, MaskCorrectnessThreePart) {
     plan.n_query = {9, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     gpt_sovits::t2s_session_flex_advance(session, plan, graph);
@@ -890,7 +890,7 @@ TEST(T2SAdvance, InterleavesWithDecodeAdvance) {
     plan.n_query = {1, 1};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     gpt_sovits::t2s_session_flex_advance(session, plan, graph);
@@ -950,7 +950,7 @@ TEST(T2SAdvance, ActivatesIdleSlot) {
     plan.n_query = {1, 4, 0};  // slot 0: decode, slot 1: prefill (activates), slot 2: idle
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     // Slot 1 should be idle before advance
@@ -1020,7 +1020,7 @@ TEST_P(T2SAdvanceDeathTest, RejectsInvalidTransition) {
     plan.n_query = {p.n_query, 0};
 
     auto model = create_minimal_model(hparams, backend);
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
 
     EXPECT_DEATH(gpt_sovits::t2s_session_flex_advance(session, plan, graph), "");
@@ -1087,7 +1087,7 @@ static void run_prefill_parity_test(
     const uint32_t slot_size = 256;  // >= 193
 
     gpt_sovits::t2s_session session;
-    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size, kv_cache_type));
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, n_batch, slot_size, {}, kv_cache_type));
 
     // Set reference embedding dimensions for correct mask generation
     session.ref_T_ref    = T_ref;
@@ -1097,7 +1097,7 @@ static void run_prefill_parity_test(
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {(int) T_total};
 
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
     ASSERT_EQ(graph.N, (int) T_total);
 
@@ -1311,7 +1311,7 @@ TEST(T2SFlexSampler, DecodeOnly) {
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {1, 0, 1};
 
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
     EXPECT_EQ(graph.n_active, 2);
 
@@ -1361,7 +1361,7 @@ TEST(T2SFlexSampler, MixedPrefillAndDecode) {
     gpt_sovits::t2s_batch_plan plan;
     plan.n_query = {1, 7};
 
-    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan, default_sampler_cfg());
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model, plan);
     ASSERT_NE(graph.ctx, nullptr);
     EXPECT_EQ(graph.N, 8);
     EXPECT_EQ(graph.n_active, 2);
