@@ -61,6 +61,18 @@ struct sovits_mel_style_encoder_block_weights {
     struct ggml_tensor * fc_b;           // {512}
 };
 
+// Weights for the SoVITS RVQ decode path used by SynthesizerTrn.forward:
+//   codes {T} -> codebook lookup -> quantized SSL features {768, T}
+//
+// Scope:
+//   - single-sample inference only
+//   - single RVQ layer only (matches v1/v2 export path: n_q = 1)
+//   - input codes must be a 1D ggml vector of token ids
+struct sovits_rvq_decode_block_weights {
+    // EuclideanCodebook.embed stored in ggml layout.
+    struct ggml_tensor * codebook;       // {768, 1024}
+};
+
 // Build the SoVITS v2 MelStyleEncoder graph.
 //
 // Parameters:
@@ -75,6 +87,20 @@ struct ggml_tensor * sovits_mel_style_encoder_block_forward(
     struct ggml_tensor                               * refer,
     const sovits_mel_style_encoder_block_weights     & weights);
 
+// Build the SoVITS single-layer RVQ decode graph.
+//
+// Parameters:
+//   ctx      - ggml context for tensor/op allocation
+//   codes    - semantic token ids {T} (i32)
+//   weights  - RVQ decode weights
+//
+// Returns:
+//   quantized SSL features {768, T}
+struct ggml_tensor * sovits_rvq_decode_block_forward(
+    struct ggml_context                       * ctx,
+    struct ggml_tensor                        * codes,
+    const sovits_rvq_decode_block_weights     & weights);
+
 // ---------------------------------------------------------------------------
 // SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
 // (except backend, which is borrowed from the caller).
@@ -82,6 +108,16 @@ struct ggml_tensor * sovits_mel_style_encoder_block_forward(
 
 struct sovits_ref_enc_model {
     sovits_mel_style_encoder_block_weights weights = {};
+
+    ggml_backend_t            backend = nullptr;
+    ggml_backend_buffer_t     buf_w   = nullptr;
+    struct ggml_context     * ctx_w   = nullptr;
+};
+
+// SoVITS quantizer model: owns the loaded GGUF weights and ggml resources
+// (except backend, which is borrowed from the caller).
+struct sovits_quantizer_model {
+    sovits_rvq_decode_block_weights weights = {};
 
     ggml_backend_t            backend = nullptr;
     ggml_backend_buffer_t     buf_w   = nullptr;
@@ -104,7 +140,17 @@ bool sovits_ref_enc_model_load(
     sovits_ref_enc_model & model,
     ggml_backend_t backend);
 
+// Load a SoVITS quantizer model from a GGUF file produced by
+// `convert_sovits_quantizer_to_gguf.py`.
+bool sovits_quantizer_model_load(
+    const std::string & fname,
+    sovits_quantizer_model & model,
+    ggml_backend_t backend);
+
 // Free all resources owned by a SoVITS ref_enc model.
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model);
+
+// Free all resources owned by a SoVITS quantizer model.
+void sovits_quantizer_model_free(sovits_quantizer_model & model);
 
 } // namespace gpt_sovits

@@ -66,6 +66,7 @@ endforeach()
 # SoVITS ref_enc tests
 set(SOVITS_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_ref_enc.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_quantizer.cpp
 )
 
 foreach(test_src ${SOVITS_TEST_SOURCES})

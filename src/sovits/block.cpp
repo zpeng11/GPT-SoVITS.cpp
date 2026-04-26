@@ -9,11 +9,31 @@ namespace gpt_sovits {
 namespace {
 
 static constexpr int64_t kMelChannels = 704;
+static constexpr int64_t kRVQDim = 768;
+static constexpr int64_t kRVQBins = 1024;
 static constexpr int64_t kStyleHidden = 128;
 static constexpr int64_t kStyleOut = 512;
 static constexpr int64_t kStyleKernel = 5;
 static constexpr int64_t kStyleHeads = 2;
 static constexpr int64_t kStyleHeadDim = kStyleHidden / kStyleHeads;
+
+static ::ggml_tensor * flatten_vector_1d(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(x->ne[2] == 1);
+    GGML_ASSERT(x->ne[3] == 1);
+    GGML_ASSERT(x->ne[1] == 1 || x->ne[0] == 1);
+
+    if (x->ne[1] == 1) {
+        return ggml_reshape_1d(ctx, x, x->ne[0]);
+    }
+
+    ::ggml_tensor * flat = ggml_reshape_1d(ctx, x, x->ne[1]);
+    return ggml_cont(ctx, flat);
+}
 
 static ::ggml_tensor * reshape_bias_2d(
     ::ggml_context * ctx,
@@ -231,6 +251,24 @@ static ::ggml_tensor * attention_block_forward(
     x = attention_block_forward(ctx, x, weights.attention);
     x = linear_2d(ctx, x, weights.fc_w, weights.fc_b);
     return masked_temporal_avg_pool(ctx, x);
+}
+
+::ggml_tensor * sovits_rvq_decode_block_forward(
+    ::ggml_context                       * ctx,
+    ::ggml_tensor                        * codes,
+    const sovits_rvq_decode_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(codes != nullptr);
+    GGML_ASSERT(weights.codebook != nullptr);
+    GGML_ASSERT(codes->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights.codebook->ne[0] == kRVQDim);
+    GGML_ASSERT(weights.codebook->ne[1] == kRVQBins);
+
+    ::ggml_tensor * codes_vec = flatten_vector_1d(ctx, codes);
+    GGML_ASSERT(codes_vec->ne[0] >= 0);
+
+    return ggml_get_rows(ctx, weights.codebook, codes_vec);
 }
 
 } // namespace gpt_sovits

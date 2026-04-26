@@ -66,12 +66,25 @@ static bool populate_weights(
     return true;
 }
 
-} // namespace
+static bool populate_quantizer_weights(
+    struct ggml_context * ctx,
+    sovits_rvq_decode_block_weights & w)
+{
+    w.codebook = checked_get_tensor(ctx, "quantizer.codebook");
+    if (!w.codebook) {
+        return false;
+    }
 
-bool sovits_ref_enc_model_load(
+    return true;
+}
+
+template <typename ModelT, typename PopulateFn>
+static bool load_model_from_gguf(
     const std::string & fname,
-    sovits_ref_enc_model & model,
-    ggml_backend_t backend)
+    ModelT & model,
+    ggml_backend_t backend,
+    PopulateFn populate,
+    void (*free_model)(ModelT &))
 {
     GGML_ASSERT(backend != nullptr);
     model.backend = backend;
@@ -91,14 +104,14 @@ bool sovits_ref_enc_model_load(
     if (!model.buf_w) {
         fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() failed\n", __func__);
         gguf_free(ctx_gguf);
-        sovits_ref_enc_model_free(model);
+        free_model(model);
         return false;
     }
 
-    if (!populate_weights(model.ctx_w, model.weights)) {
+    if (!populate(model.ctx_w, model.weights)) {
         fprintf(stderr, "%s: populate_weights() failed -- missing tensors\n", __func__);
         gguf_free(ctx_gguf);
-        sovits_ref_enc_model_free(model);
+        free_model(model);
         return false;
     }
 
@@ -106,7 +119,7 @@ bool sovits_ref_enc_model_load(
     if (!f) {
         fprintf(stderr, "%s: fopen('%s') failed\n", __func__, fname.c_str());
         gguf_free(ctx_gguf);
-        sovits_ref_enc_model_free(model);
+        free_model(model);
         return false;
     }
 
@@ -126,14 +139,14 @@ bool sovits_ref_enc_model_load(
             fprintf(stderr, "%s: fseek() failed for tensor '%s'\n", __func__, name);
             fclose(f);
             gguf_free(ctx_gguf);
-            sovits_ref_enc_model_free(model);
+            free_model(model);
             return false;
         }
         if (fread(buf.data(), 1, nbytes, f) != nbytes) {
             fprintf(stderr, "%s: fread() failed for tensor '%s' (%zu bytes)\n", __func__, name, nbytes);
             fclose(f);
             gguf_free(ctx_gguf);
-            sovits_ref_enc_model_free(model);
+            free_model(model);
             return false;
         }
 
@@ -147,7 +160,37 @@ bool sovits_ref_enc_model_load(
     return true;
 }
 
+} // namespace
+
+bool sovits_ref_enc_model_load(
+    const std::string & fname,
+    sovits_ref_enc_model & model,
+    ggml_backend_t backend)
+{
+    return load_model_from_gguf(fname, model, backend, populate_weights, sovits_ref_enc_model_free);
+}
+
+bool sovits_quantizer_model_load(
+    const std::string & fname,
+    sovits_quantizer_model & model,
+    ggml_backend_t backend)
+{
+    return load_model_from_gguf(fname, model, backend, populate_quantizer_weights, sovits_quantizer_model_free);
+}
+
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model) {
+    if (model.buf_w) {
+        ggml_backend_buffer_free(model.buf_w);
+        model.buf_w = nullptr;
+    }
+    if (model.ctx_w) {
+        ggml_free(model.ctx_w);
+        model.ctx_w = nullptr;
+    }
+    model.backend = nullptr;
+}
+
+void sovits_quantizer_model_free(sovits_quantizer_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
         model.buf_w = nullptr;
