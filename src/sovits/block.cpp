@@ -628,4 +628,16 @@ static ::ggml_tensor * attention_block_forward(
     return relpos_encoder_stack_forward(ctx, x, weights.layers);
 }
 
+::ggml_tensor * sovits_text_encoder_post_block_forward(
+    ::ggml_context                          * ctx,
+    ::ggml_tensor                           * x,
+    const sovits_text_encoder_post_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(x->ne[0] == kTextEncoderSslHidden);
+
+    return relpos_encoder_stack_forward(ctx, x, weights.layers);
+}
+
 } // namespace gpt_sovits

@@ -10,6 +10,7 @@ namespace gpt_sovits {
 
 static constexpr int kSovitsTextEncoderSslLayers = 3;
 static constexpr int kSovitsTextEncoderTextLayers = 6;
+static constexpr int kSovitsTextEncoderPostLayers = 3;
 
 // SoVITS v2 reference encoder (`ref_enc`) inference block.
 //
@@ -140,6 +141,20 @@ struct sovits_text_encoder_text_block_weights {
     std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderTextLayers> layers;
 };
 
+// Weights for the SoVITS v2 `enc_p.encoder2` path:
+//   features {192, T} -> 3 x [rel-pos self-attn + FFN] -> {192, T}
+//
+// Scope:
+//   - single-sample inference only
+//   - fixed v2 hyperparameters from the shipped checkpoint:
+//       hidden=192, ffn=768, n_heads=2, n_layers=3, kernel=3, window=4
+//   - dropout is skipped (eval-mode behavior)
+//   - mask handling is fixed to the exported v2 inference path in
+//     `module/models_onnx.py`: all frames are treated as valid
+struct sovits_text_encoder_post_block_weights {
+    std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderPostLayers> layers;
+};
+
 // Build the SoVITS v2 MelStyleEncoder graph.
 //
 // Parameters:
@@ -196,6 +211,20 @@ struct ggml_tensor * sovits_text_encoder_text_block_forward(
     struct ggml_tensor                                 * text,
     const sovits_text_encoder_text_block_weights       & weights);
 
+// Build the SoVITS v2 `enc_p.encoder2` graph.
+//
+// Parameters:
+//   ctx      - ggml context for tensor/op allocation
+//   x        - post-MRTE features {192, T}
+//   weights  - encoder2 weights
+//
+// Returns:
+//   encoded post-MRTE features {192, T}
+struct ggml_tensor * sovits_text_encoder_post_block_forward(
+    struct ggml_context                                * ctx,
+    struct ggml_tensor                                 * x,
+    const sovits_text_encoder_post_block_weights       & weights);
+
 // ---------------------------------------------------------------------------
 // SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
 // (except backend, which is borrowed from the caller).
@@ -239,6 +268,16 @@ struct sovits_text_encoder_text_model {
     struct ggml_context     * ctx_w   = nullptr;
 };
 
+// SoVITS text-encoder post model: owns the loaded GGUF weights and ggml
+// resources (except backend, which is borrowed from the caller).
+struct sovits_text_encoder_post_model {
+    sovits_text_encoder_post_block_weights weights = {};
+
+    ggml_backend_t            backend = nullptr;
+    ggml_backend_buffer_t     buf_w   = nullptr;
+    struct ggml_context     * ctx_w   = nullptr;
+};
+
 // Load a SoVITS ref_enc model from a GGUF file produced by
 // `convert_sovits_ref_enc_to_gguf.py`.
 //
@@ -276,6 +315,13 @@ bool sovits_text_encoder_text_model_load(
     sovits_text_encoder_text_model & model,
     ggml_backend_t backend);
 
+// Load a SoVITS text_encoder_post model from a GGUF file produced by
+// `convert_sovits_text_encoder_post_to_gguf.py`.
+bool sovits_text_encoder_post_model_load(
+    const std::string & fname,
+    sovits_text_encoder_post_model & model,
+    ggml_backend_t backend);
+
 // Free all resources owned by a SoVITS ref_enc model.
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model);
 
@@ -287,5 +333,8 @@ void sovits_text_encoder_ssl_model_free(sovits_text_encoder_ssl_model & model);
 
 // Free all resources owned by a SoVITS text_encoder_text model.
 void sovits_text_encoder_text_model_free(sovits_text_encoder_text_model & model);
+
+// Free all resources owned by a SoVITS text_encoder_post model.
+void sovits_text_encoder_post_model_free(sovits_text_encoder_post_model & model);
 
 } // namespace gpt_sovits

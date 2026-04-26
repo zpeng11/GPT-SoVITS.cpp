@@ -199,6 +199,61 @@ static bool populate_text_encoder_text_weights(
     return true;
 }
 
+static bool populate_text_encoder_post_weights(
+    struct ggml_context * ctx,
+    sovits_text_encoder_post_block_weights & w)
+{
+    for (int i = 0; i < kSovitsTextEncoderPostLayers; ++i) {
+        auto & layer = w.layers[i];
+        char name[96];
+
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.qkv_w", i);
+        layer.qkv_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.qkv_b", i);
+        layer.qkv_b = checked_get_tensor(ctx, name);
+
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.out_w", i);
+        layer.out_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.out_b", i);
+        layer.out_b = checked_get_tensor(ctx, name);
+
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.rel_k", i);
+        layer.rel_k = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.rel_v_t", i);
+        layer.rel_v_t = checked_get_tensor(ctx, name);
+
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ln1_w", i);
+        layer.ln1_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ln1_b", i);
+        layer.ln1_b = checked_get_tensor(ctx, name);
+
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ffn_up_w", i);
+        layer.ffn_up_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ffn_up_b", i);
+        layer.ffn_up_b = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ffn_down_w", i);
+        layer.ffn_down_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ffn_down_b", i);
+        layer.ffn_down_b = checked_get_tensor(ctx, name);
+
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ln2_w", i);
+        layer.ln2_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_post.layers.%d.ln2_b", i);
+        layer.ln2_b = checked_get_tensor(ctx, name);
+
+        if (!layer.qkv_w || !layer.qkv_b || !layer.out_w || !layer.out_b ||
+            !layer.rel_k || !layer.rel_v_t ||
+            !layer.ln1_w || !layer.ln1_b ||
+            !layer.ffn_up_w || !layer.ffn_up_b ||
+            !layer.ffn_down_w || !layer.ffn_down_b ||
+            !layer.ln2_w || !layer.ln2_b) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 template <typename ModelT, typename PopulateFn>
 static bool load_model_from_gguf(
     const std::string & fname,
@@ -325,6 +380,19 @@ bool sovits_text_encoder_text_model_load(
         sovits_text_encoder_text_model_free);
 }
 
+bool sovits_text_encoder_post_model_load(
+    const std::string & fname,
+    sovits_text_encoder_post_model & model,
+    ggml_backend_t backend)
+{
+    return load_model_from_gguf(
+        fname,
+        model,
+        backend,
+        populate_text_encoder_post_weights,
+        sovits_text_encoder_post_model_free);
+}
+
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
@@ -362,6 +430,18 @@ void sovits_text_encoder_ssl_model_free(sovits_text_encoder_ssl_model & model) {
 }
 
 void sovits_text_encoder_text_model_free(sovits_text_encoder_text_model & model) {
+    if (model.buf_w) {
+        ggml_backend_buffer_free(model.buf_w);
+        model.buf_w = nullptr;
+    }
+    if (model.ctx_w) {
+        ggml_free(model.ctx_w);
+        model.ctx_w = nullptr;
+    }
+    model.backend = nullptr;
+}
+
+void sovits_text_encoder_post_model_free(sovits_text_encoder_post_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
         model.buf_w = nullptr;
