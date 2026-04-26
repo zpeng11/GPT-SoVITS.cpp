@@ -199,6 +199,37 @@ static bool populate_text_encoder_text_weights(
     return true;
 }
 
+static bool populate_text_encoder_mrte_weights(
+    struct ggml_context * ctx,
+    sovits_text_encoder_mrte_block_weights & w)
+{
+    w.c_pre_w = checked_get_tensor(ctx, "text_encoder_mrte.c_pre_w");
+    w.c_pre_b = checked_get_tensor(ctx, "text_encoder_mrte.c_pre_b");
+    w.text_pre_w = checked_get_tensor(ctx, "text_encoder_mrte.text_pre_w");
+    w.text_pre_b = checked_get_tensor(ctx, "text_encoder_mrte.text_pre_b");
+    w.c_post_w = checked_get_tensor(ctx, "text_encoder_mrte.c_post_w");
+    w.c_post_b = checked_get_tensor(ctx, "text_encoder_mrte.c_post_b");
+    if (!w.c_pre_w || !w.c_pre_b || !w.text_pre_w || !w.text_pre_b ||
+        !w.c_post_w || !w.c_post_b) {
+        return false;
+    }
+
+    w.attention.q_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.q_w");
+    w.attention.q_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.q_b");
+    w.attention.k_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.k_w");
+    w.attention.k_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.k_b");
+    w.attention.v_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.v_w");
+    w.attention.v_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.v_b");
+    w.attention.out_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.out_w");
+    w.attention.out_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.out_b");
+    if (!w.attention.q_w || !w.attention.q_b || !w.attention.k_w || !w.attention.k_b ||
+        !w.attention.v_w || !w.attention.v_b || !w.attention.out_w || !w.attention.out_b) {
+        return false;
+    }
+
+    return true;
+}
+
 static bool populate_text_encoder_post_weights(
     struct ggml_context * ctx,
     sovits_text_encoder_post_block_weights & w)
@@ -380,6 +411,19 @@ bool sovits_text_encoder_text_model_load(
         sovits_text_encoder_text_model_free);
 }
 
+bool sovits_text_encoder_mrte_model_load(
+    const std::string & fname,
+    sovits_text_encoder_mrte_model & model,
+    ggml_backend_t backend)
+{
+    return load_model_from_gguf(
+        fname,
+        model,
+        backend,
+        populate_text_encoder_mrte_weights,
+        sovits_text_encoder_mrte_model_free);
+}
+
 bool sovits_text_encoder_post_model_load(
     const std::string & fname,
     sovits_text_encoder_post_model & model,
@@ -430,6 +474,18 @@ void sovits_text_encoder_ssl_model_free(sovits_text_encoder_ssl_model & model) {
 }
 
 void sovits_text_encoder_text_model_free(sovits_text_encoder_text_model & model) {
+    if (model.buf_w) {
+        ggml_backend_buffer_free(model.buf_w);
+        model.buf_w = nullptr;
+    }
+    if (model.ctx_w) {
+        ggml_free(model.ctx_w);
+        model.ctx_w = nullptr;
+    }
+    model.backend = nullptr;
+}
+
+void sovits_text_encoder_mrte_model_free(sovits_text_encoder_mrte_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
         model.buf_w = nullptr;

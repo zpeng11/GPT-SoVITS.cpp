@@ -141,6 +141,40 @@ struct sovits_text_encoder_text_block_weights {
     std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderTextLayers> layers;
 };
 
+// Weights for the SoVITS v2 `enc_p.mrte` path:
+//   ssl {192, T_ssl} -> Conv1d(192, 512, k=1)
+//   text {192, T_text} -> Conv1d(192, 512, k=1)
+//   -> cross-attention(ssl, text) + ssl + ge -> Conv1d(512, 192, k=1)
+//   -> {192, T_ssl}
+//
+// Scope:
+//   - single-sample inference only
+//   - fixed v2 hyperparameters from the shipped checkpoint:
+//       hidden=512, out=192, n_heads=4
+//   - dropout is skipped (eval-mode behavior)
+//   - mask handling is fixed to the exported v1/v2 inference path in
+//     `module/models_onnx.py`: all frames and text tokens are treated as valid
+struct sovits_text_encoder_mrte_attention_block_weights {
+    struct ggml_tensor * q_w;      // {512, 512}
+    struct ggml_tensor * q_b;      // {512}
+    struct ggml_tensor * k_w;      // {512, 512}
+    struct ggml_tensor * k_b;      // {512}
+    struct ggml_tensor * v_w;      // {512, 512}
+    struct ggml_tensor * v_b;      // {512}
+    struct ggml_tensor * out_w;    // {512, 512}
+    struct ggml_tensor * out_b;    // {512}
+};
+
+struct sovits_text_encoder_mrte_block_weights {
+    struct ggml_tensor * c_pre_w;      // {1, 192, 512}
+    struct ggml_tensor * c_pre_b;      // {512}
+    struct ggml_tensor * text_pre_w;   // {1, 192, 512}
+    struct ggml_tensor * text_pre_b;   // {512}
+    sovits_text_encoder_mrte_attention_block_weights attention;
+    struct ggml_tensor * c_post_w;     // {1, 512, 192}
+    struct ggml_tensor * c_post_b;     // {192}
+};
+
 // Weights for the SoVITS v2 `enc_p.encoder2` path:
 //   features {192, T} -> 3 x [rel-pos self-attn + FFN] -> {192, T}
 //
@@ -211,6 +245,24 @@ struct ggml_tensor * sovits_text_encoder_text_block_forward(
     struct ggml_tensor                                 * text,
     const sovits_text_encoder_text_block_weights       & weights);
 
+// Build the SoVITS v2 `enc_p.mrte` graph.
+//
+// Parameters:
+//   ctx      - ggml context for tensor/op allocation
+//   ssl      - encoded SSL features {192, T_ssl}
+//   text     - encoded text features {192, T_text}
+//   ge       - reference style embedding {512, 1}
+//   weights  - MRTE weights
+//
+// Returns:
+//   post-MRTE features {192, T_ssl}
+struct ggml_tensor * sovits_text_encoder_mrte_block_forward(
+    struct ggml_context                                * ctx,
+    struct ggml_tensor                                 * ssl,
+    struct ggml_tensor                                 * text,
+    struct ggml_tensor                                 * ge,
+    const sovits_text_encoder_mrte_block_weights       & weights);
+
 // Build the SoVITS v2 `enc_p.encoder2` graph.
 //
 // Parameters:
@@ -268,6 +320,16 @@ struct sovits_text_encoder_text_model {
     struct ggml_context     * ctx_w   = nullptr;
 };
 
+// SoVITS text-encoder MRTE model: owns the loaded GGUF weights and ggml
+// resources (except backend, which is borrowed from the caller).
+struct sovits_text_encoder_mrte_model {
+    sovits_text_encoder_mrte_block_weights weights = {};
+
+    ggml_backend_t            backend = nullptr;
+    ggml_backend_buffer_t     buf_w   = nullptr;
+    struct ggml_context     * ctx_w   = nullptr;
+};
+
 // SoVITS text-encoder post model: owns the loaded GGUF weights and ggml
 // resources (except backend, which is borrowed from the caller).
 struct sovits_text_encoder_post_model {
@@ -315,6 +377,13 @@ bool sovits_text_encoder_text_model_load(
     sovits_text_encoder_text_model & model,
     ggml_backend_t backend);
 
+// Load a SoVITS text_encoder_mrte model from a GGUF file produced by
+// `convert_sovits_text_encoder_mrte_to_gguf.py`.
+bool sovits_text_encoder_mrte_model_load(
+    const std::string & fname,
+    sovits_text_encoder_mrte_model & model,
+    ggml_backend_t backend);
+
 // Load a SoVITS text_encoder_post model from a GGUF file produced by
 // `convert_sovits_text_encoder_post_to_gguf.py`.
 bool sovits_text_encoder_post_model_load(
@@ -333,6 +402,9 @@ void sovits_text_encoder_ssl_model_free(sovits_text_encoder_ssl_model & model);
 
 // Free all resources owned by a SoVITS text_encoder_text model.
 void sovits_text_encoder_text_model_free(sovits_text_encoder_text_model & model);
+
+// Free all resources owned by a SoVITS text_encoder_mrte model.
+void sovits_text_encoder_mrte_model_free(sovits_text_encoder_mrte_model & model);
 
 // Free all resources owned by a SoVITS text_encoder_post model.
 void sovits_text_encoder_post_model_free(sovits_text_encoder_post_model & model);
