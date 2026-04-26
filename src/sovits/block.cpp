@@ -186,6 +186,13 @@ static ::ggml_tensor * conv1d_with_bias_channels_first(
     GGML_ASSERT(weight != nullptr);
     GGML_ASSERT(bias != nullptr);
 
+    // Conv1d with kernel=1/stride=1/pad=0 is exactly a per-time-step linear
+    // projection on the channel axis, so avoid the im2col path.
+    if (weight->ne[0] == 1 && stride == 1 && padding == 0) {
+        ::ggml_tensor * linear_w = ggml_reshape_2d(ctx, weight, weight->ne[1], weight->ne[2]);
+        return linear_2d(ctx, x, linear_w, bias);
+    }
+
     ::ggml_tensor * y = conv1d_forward_channels_first(ctx, x, weight, stride, padding);
     y = ensure_f32(ctx, y);
     return ggml_add(ctx, y, reshape_bias_2d(ctx, bias));
@@ -309,15 +316,10 @@ static ::ggml_tensor * build_relative_value_for_head(
             1,
             rel_v->nb[1],
             (size_t) rel_idx * rel_v->nb[1]);
-        rel_vec = ggml_cont(ctx, rel_vec);
+        rel_vec = ensure_f32(ctx, ggml_cont(ctx, rel_vec));
 
-        ::ggml_tensor * target = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, kTextEncoderSslHeadDim, length);
-        ::ggml_tensor * rel_slice = ggml_repeat(ctx, rel_vec, target);
-        rel_slice = ensure_f32(ctx, rel_slice);
-        ::ggml_tensor * diag_repeat = ggml_repeat(ctx, diag, rel_slice);
-        diag_repeat = ensure_f32(ctx, diag_repeat);
-        ::ggml_tensor * contrib = ggml_mul(ctx, rel_slice, diag_repeat);
-        contrib = ensure_f32(ctx, contrib);
+        ::ggml_tensor * diag_col = ggml_reshape_2d(ctx, flatten_vector_1d(ctx, diag), length, 1);
+        ::ggml_tensor * contrib = ggml_out_prod(ctx, rel_vec, diag_col);
         contrib = ggml_pad_ext(
             ctx,
             contrib,
