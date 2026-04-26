@@ -348,7 +348,7 @@ static ::ggml_tensor * self_attention_with_relative_position(
     ::ggml_tensor * v = split_qkv_projection(ctx, qkv, 2);
 
     const int64_t time = x->ne[1];
-    ::ggml_tensor * heads[2] = { nullptr, nullptr };
+    ::ggml_tensor * merged = zeros_2d(ctx, kTextEncoderSslHidden, time);
     ::ggml_tensor * rel_k = weights.rel_k;
     ::ggml_tensor * rel_v_t = weights.rel_v_t;
 
@@ -372,13 +372,18 @@ static ::ggml_tensor * self_attention_with_relative_position(
         content_out = ggml_cont(ctx, content_out);
 
         ::ggml_tensor * rel_out = build_relative_value_for_head(ctx, attn, rel_v_t);
-        heads[h] = ggml_add(ctx, content_out, rel_out);
-        GGML_ASSERT(heads[h]->ne[0] == kTextEncoderSslHeadDim);
-        GGML_ASSERT(heads[h]->ne[1] == time);
+        ::ggml_tensor * head_out = ggml_add(ctx, content_out, rel_out);
+        GGML_ASSERT(head_out->ne[0] == kTextEncoderSslHeadDim);
+        GGML_ASSERT(head_out->ne[1] == time);
+
+        merged = ggml_set_2d_inplace(
+            ctx,
+            merged,
+            head_out,
+            merged->nb[1],
+            (size_t) ch0 * ggml_element_size(merged));
     }
 
-    ::ggml_tensor * merged = ggml_concat(ctx, heads[0], heads[1], 0);
-    merged = ggml_cont(ctx, merged);
     return conv1d_with_bias_channels_first(ctx, merged, weights.out_w, weights.out_b, 1, 0);
 }
 

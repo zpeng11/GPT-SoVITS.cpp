@@ -152,12 +152,15 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
         tensor_np = weights[ckpt_name]
         if gguf_name.endswith("ffn_up_w") or gguf_name.endswith("ffn_down_w"):
             tensor_np = tensor_np.astype(np.float32)
+            tensor_type = gguf.GGMLQuantizationType.F32
         elif target_type == gguf.GGMLQuantizationType.F16 and tensor_np.ndim >= 2:
             tensor_np = tensor_np.astype(np.float16)
+            tensor_type = target_type
         else:
             tensor_np = tensor_np.astype(np.float32)
+            tensor_type = gguf.GGMLQuantizationType.F32
 
-        writer.add_tensor(gguf_name, tensor_np, raw_dtype=target_type if tensor_np.dtype == np.float16 else gguf.GGMLQuantizationType.F32)
+        writer.add_tensor(gguf_name, tensor_np, raw_dtype=tensor_type)
         n_converted += 1
         print(
             f"  [{n_converted:2d}] {gguf_name:36s} <- {ckpt_name:48s} "
