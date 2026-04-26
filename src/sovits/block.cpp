@@ -25,6 +25,7 @@ static constexpr int64_t kTextEncoderSslHeadDim =
 static constexpr int64_t kTextEncoderSslKernel = 3;
 static constexpr int64_t kTextEncoderSslWindow = 4;
 static constexpr int64_t kTextEncoderSslRelSize = 2 * kTextEncoderSslWindow + 1;
+static constexpr int64_t kTextEncoderTextVocabV2 = 732;
 static constexpr float kLayerNormEps = 1.0e-5f;
 
 static ::ggml_tensor * flatten_vector_1d(
@@ -330,7 +331,7 @@ static ::ggml_tensor * build_relative_value_for_head(
 static ::ggml_tensor * self_attention_with_relative_position(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
-    const sovits_text_encoder_ssl_layer_weights & weights)
+    const sovits_relpos_encoder_layer_weights & weights)
 {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
@@ -390,7 +391,7 @@ static ::ggml_tensor * self_attention_with_relative_position(
 static ::ggml_tensor * text_encoder_ssl_layer_forward(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
-    const sovits_text_encoder_ssl_layer_weights & weights)
+    const sovits_relpos_encoder_layer_weights & weights)
 {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
@@ -416,6 +417,23 @@ static ::ggml_tensor * text_encoder_ssl_layer_forward(
         /*padding=*/1);
 
     return layer_norm_2d(ctx, ggml_add(ctx, x1, ffn), weights.ln2_w, weights.ln2_b);
+}
+
+template <size_t N>
+static ::ggml_tensor * relpos_encoder_stack_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    const std::array<sovits_relpos_encoder_layer_weights, N> & layers)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(x->ne[0] == kTextEncoderSslHidden);
+
+    for (const sovits_relpos_encoder_layer_weights & layer : layers) {
+        x = text_encoder_ssl_layer_forward(ctx, x, layer);
+    }
+
+    return x;
 }
 
 static ::ggml_tensor * masked_temporal_avg_pool(
@@ -590,11 +608,24 @@ static ::ggml_tensor * attention_block_forward(
         /*stride=*/1,
         /*padding=*/0);
 
-    for (const sovits_text_encoder_ssl_layer_weights & layer : weights.layers) {
-        x = text_encoder_ssl_layer_forward(ctx, x, layer);
-    }
+    return relpos_encoder_stack_forward(ctx, x, weights.layers);
+}
 
-    return x;
+::ggml_tensor * sovits_text_encoder_text_block_forward(
+    ::ggml_context                          * ctx,
+    ::ggml_tensor                           * text,
+    const sovits_text_encoder_text_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(text != nullptr);
+    GGML_ASSERT(text->type == GGML_TYPE_I32);
+    GGML_ASSERT(weights.text_embedding != nullptr);
+    GGML_ASSERT(weights.text_embedding->ne[0] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.text_embedding->ne[1] == kTextEncoderTextVocabV2);
+    GGML_ASSERT(text->ne[0] > 0);
+
+    ::ggml_tensor * x = ggml_get_rows(ctx, weights.text_embedding, text);
+    return relpos_encoder_stack_forward(ctx, x, weights.layers);
 }
 
 } // namespace gpt_sovits
