@@ -70,7 +70,7 @@ set(SOVITS_TEST_SOURCES
 
 foreach(test_src ${SOVITS_TEST_SOURCES})
     get_filename_component(test_name ${test_src} NAME_WE)
-    add_executable(${test_name} ${test_src})
+    add_executable(${test_name} ${test_src} ${COMMON_TEST_SOURCES})
     target_include_directories(${test_name} PRIVATE
         ${COMMON_TEST_INCLUDE_DIR}
     )
@@ -79,7 +79,7 @@ foreach(test_src ${SOVITS_TEST_SOURCES})
         GTest::gtest_main
     )
     target_compile_definitions(${test_name} PRIVATE
-        SOVITS_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/t2s/"
+        SOVITS_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sovits/"
     )
     gtest_discover_tests(${test_name})
 endforeach()
