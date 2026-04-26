@@ -141,38 +141,28 @@ struct sovits_text_encoder_text_block_weights {
     std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderTextLayers> layers;
 };
 
-// Weights for the SoVITS v2 `enc_p.mrte` path:
-//   ssl {192, T_ssl} -> Conv1d(192, 512, k=1)
-//   text {192, T_text} -> Conv1d(192, 512, k=1)
-//   -> cross-attention(ssl, text) + ssl + ge -> Conv1d(512, 192, k=1)
-//   -> {192, T_ssl}
+// Weights for an inference-only fused SoVITS v2 `enc_p.mrte` path:
+//   ssl {192, T_ssl} -> fused [q, skip] projection {704, T_ssl}
+//   text {192, T_text} -> fused [k, v] projection {1024, T_text}
+//   ge {512, 1} -> fused ge projection {192, 1}
+//   -> cross-attention(q, k, v) -> fused output projection {192, T_ssl}
+//   -> attn_out + skip + ge_out -> {192, T_ssl}
 //
 // Scope:
 //   - single-sample inference only
-//   - fixed v2 hyperparameters from the shipped checkpoint:
-//       hidden=512, out=192, n_heads=4
+//   - exact offline fusion of the shipped v2 MRTE weights
 //   - dropout is skipped (eval-mode behavior)
 //   - mask handling is fixed to the exported v1/v2 inference path in
 //     `module/models_onnx.py`: all frames and text tokens are treated as valid
-struct sovits_text_encoder_mrte_attention_block_weights {
-    struct ggml_tensor * q_w;      // {512, 512}
-    struct ggml_tensor * q_b;      // {512}
-    struct ggml_tensor * k_w;      // {512, 512}
-    struct ggml_tensor * k_b;      // {512}
-    struct ggml_tensor * v_w;      // {512, 512}
-    struct ggml_tensor * v_b;      // {512}
-    struct ggml_tensor * out_w;    // {512, 512}
-    struct ggml_tensor * out_b;    // {512}
-};
-
 struct sovits_text_encoder_mrte_block_weights {
-    struct ggml_tensor * c_pre_w;      // {1, 192, 512}
-    struct ggml_tensor * c_pre_b;      // {512}
-    struct ggml_tensor * text_pre_w;   // {1, 192, 512}
-    struct ggml_tensor * text_pre_b;   // {512}
-    sovits_text_encoder_mrte_attention_block_weights attention;
-    struct ggml_tensor * c_post_w;     // {1, 512, 192}
-    struct ggml_tensor * c_post_b;     // {192}
+    struct ggml_tensor * ssl_fused_w;   // {1, 192, 704}
+    struct ggml_tensor * ssl_fused_b;   // {704}
+    struct ggml_tensor * text_kv_w;     // {1, 192, 1024}
+    struct ggml_tensor * text_kv_b;     // {1024}
+    struct ggml_tensor * attn_out_w;    // {1, 512, 192}
+    struct ggml_tensor * attn_out_b;    // {192}
+    struct ggml_tensor * ge_out_w;      // {1, 512, 192}
+    struct ggml_tensor * ge_out_b;      // {192}
 };
 
 // Weights for the SoVITS v2 `enc_p.encoder2` path:
@@ -245,7 +235,7 @@ struct ggml_tensor * sovits_text_encoder_text_block_forward(
     struct ggml_tensor                                 * text,
     const sovits_text_encoder_text_block_weights       & weights);
 
-// Build the SoVITS v2 `enc_p.mrte` graph.
+// Build the fused SoVITS v2 `enc_p.mrte` graph.
 //
 // Parameters:
 //   ctx      - ggml context for tensor/op allocation

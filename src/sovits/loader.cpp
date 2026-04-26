@@ -203,27 +203,16 @@ static bool populate_text_encoder_mrte_weights(
     struct ggml_context * ctx,
     sovits_text_encoder_mrte_block_weights & w)
 {
-    w.c_pre_w = checked_get_tensor(ctx, "text_encoder_mrte.c_pre_w");
-    w.c_pre_b = checked_get_tensor(ctx, "text_encoder_mrte.c_pre_b");
-    w.text_pre_w = checked_get_tensor(ctx, "text_encoder_mrte.text_pre_w");
-    w.text_pre_b = checked_get_tensor(ctx, "text_encoder_mrte.text_pre_b");
-    w.c_post_w = checked_get_tensor(ctx, "text_encoder_mrte.c_post_w");
-    w.c_post_b = checked_get_tensor(ctx, "text_encoder_mrte.c_post_b");
-    if (!w.c_pre_w || !w.c_pre_b || !w.text_pre_w || !w.text_pre_b ||
-        !w.c_post_w || !w.c_post_b) {
-        return false;
-    }
-
-    w.attention.q_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.q_w");
-    w.attention.q_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.q_b");
-    w.attention.k_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.k_w");
-    w.attention.k_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.k_b");
-    w.attention.v_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.v_w");
-    w.attention.v_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.v_b");
-    w.attention.out_w = checked_get_tensor(ctx, "text_encoder_mrte.attn.out_w");
-    w.attention.out_b = checked_get_tensor(ctx, "text_encoder_mrte.attn.out_b");
-    if (!w.attention.q_w || !w.attention.q_b || !w.attention.k_w || !w.attention.k_b ||
-        !w.attention.v_w || !w.attention.v_b || !w.attention.out_w || !w.attention.out_b) {
+    w.ssl_fused_w = checked_get_tensor(ctx, "text_encoder_mrte.ssl_fused_w");
+    w.ssl_fused_b = checked_get_tensor(ctx, "text_encoder_mrte.ssl_fused_b");
+    w.text_kv_w = checked_get_tensor(ctx, "text_encoder_mrte.text_kv_w");
+    w.text_kv_b = checked_get_tensor(ctx, "text_encoder_mrte.text_kv_b");
+    w.attn_out_w = checked_get_tensor(ctx, "text_encoder_mrte.attn_out_w");
+    w.attn_out_b = checked_get_tensor(ctx, "text_encoder_mrte.attn_out_b");
+    w.ge_out_w = checked_get_tensor(ctx, "text_encoder_mrte.ge_out_w");
+    w.ge_out_b = checked_get_tensor(ctx, "text_encoder_mrte.ge_out_b");
+    if (!w.ssl_fused_w || !w.ssl_fused_b || !w.text_kv_w || !w.text_kv_b ||
+        !w.attn_out_w || !w.attn_out_b || !w.ge_out_w || !w.ge_out_b) {
         return false;
     }
 

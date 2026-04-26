@@ -31,8 +31,8 @@ static const std::string kRefOutputNpy = kRefDir + "v2_text_encoder_mrte_output.
 
 static constexpr int64_t kInChannels = 192;
 static constexpr int64_t kHidden = 512;
-static constexpr int64_t kHeads = 4;
-static constexpr int64_t kHeadDim = kHidden / kHeads;
+static constexpr int64_t kSslFusedDim = 704;
+static constexpr int64_t kKvDim = 1024;
 static constexpr int64_t kSslTime = 24;
 static constexpr int64_t kTextTime = 17;
 static constexpr size_t kMaxNodes = 32768;
@@ -177,51 +177,31 @@ TEST(SoVITSTextEncoderMrte, WeightPointersAndShapesLookCorrect) {
     ASSERT_TRUE(gpt_sovits::sovits_text_encoder_mrte_model_load(kModelF16, model, backend));
 
     const auto & w = model.weights;
-    ASSERT_NE(w.c_pre_w, nullptr);
-    ASSERT_NE(w.c_pre_b, nullptr);
-    ASSERT_NE(w.text_pre_w, nullptr);
-    ASSERT_NE(w.text_pre_b, nullptr);
-    ASSERT_NE(w.c_post_w, nullptr);
-    ASSERT_NE(w.c_post_b, nullptr);
-    ASSERT_NE(w.attention.q_w, nullptr);
-    ASSERT_NE(w.attention.q_b, nullptr);
-    ASSERT_NE(w.attention.k_w, nullptr);
-    ASSERT_NE(w.attention.k_b, nullptr);
-    ASSERT_NE(w.attention.v_w, nullptr);
-    ASSERT_NE(w.attention.v_b, nullptr);
-    ASSERT_NE(w.attention.out_w, nullptr);
-    ASSERT_NE(w.attention.out_b, nullptr);
+    ASSERT_NE(w.ssl_fused_w, nullptr);
+    ASSERT_NE(w.ssl_fused_b, nullptr);
+    ASSERT_NE(w.text_kv_w, nullptr);
+    ASSERT_NE(w.text_kv_b, nullptr);
+    ASSERT_NE(w.attn_out_w, nullptr);
+    ASSERT_NE(w.attn_out_b, nullptr);
+    ASSERT_NE(w.ge_out_w, nullptr);
+    ASSERT_NE(w.ge_out_b, nullptr);
 
-    EXPECT_EQ(w.c_pre_w->ne[0], 1);
-    EXPECT_EQ(w.c_pre_w->ne[1], kInChannels);
-    EXPECT_EQ(w.c_pre_w->ne[2], kHidden);
-    EXPECT_EQ(w.c_pre_b->ne[0], kHidden);
-    EXPECT_EQ(w.text_pre_w->ne[0], 1);
-    EXPECT_EQ(w.text_pre_w->ne[1], kInChannels);
-    EXPECT_EQ(w.text_pre_w->ne[2], kHidden);
-    EXPECT_EQ(w.text_pre_b->ne[0], kHidden);
-
-    EXPECT_EQ(w.attention.q_w->ne[0], 1);
-    EXPECT_EQ(w.attention.q_w->ne[1], kHidden);
-    EXPECT_EQ(w.attention.q_w->ne[2], kHidden);
-    EXPECT_EQ(w.attention.q_b->ne[0], kHidden);
-    EXPECT_EQ(w.attention.k_w->ne[0], 1);
-    EXPECT_EQ(w.attention.k_w->ne[1], kHidden);
-    EXPECT_EQ(w.attention.k_w->ne[2], kHidden);
-    EXPECT_EQ(w.attention.k_b->ne[0], kHidden);
-    EXPECT_EQ(w.attention.v_w->ne[0], 1);
-    EXPECT_EQ(w.attention.v_w->ne[1], kHidden);
-    EXPECT_EQ(w.attention.v_w->ne[2], kHidden);
-    EXPECT_EQ(w.attention.v_b->ne[0], kHidden);
-    EXPECT_EQ(w.attention.out_w->ne[0], 1);
-    EXPECT_EQ(w.attention.out_w->ne[1], kHidden);
-    EXPECT_EQ(w.attention.out_w->ne[2], kHidden);
-    EXPECT_EQ(w.attention.out_b->ne[0], kHidden);
-
-    EXPECT_EQ(w.c_post_w->ne[0], 1);
-    EXPECT_EQ(w.c_post_w->ne[1], kHidden);
-    EXPECT_EQ(w.c_post_w->ne[2], kInChannels);
-    EXPECT_EQ(w.c_post_b->ne[0], kInChannels);
+    EXPECT_EQ(w.ssl_fused_w->ne[0], 1);
+    EXPECT_EQ(w.ssl_fused_w->ne[1], kInChannels);
+    EXPECT_EQ(w.ssl_fused_w->ne[2], kSslFusedDim);
+    EXPECT_EQ(w.ssl_fused_b->ne[0], kSslFusedDim);
+    EXPECT_EQ(w.text_kv_w->ne[0], 1);
+    EXPECT_EQ(w.text_kv_w->ne[1], kInChannels);
+    EXPECT_EQ(w.text_kv_w->ne[2], kKvDim);
+    EXPECT_EQ(w.text_kv_b->ne[0], kKvDim);
+    EXPECT_EQ(w.attn_out_w->ne[0], 1);
+    EXPECT_EQ(w.attn_out_w->ne[1], kHidden);
+    EXPECT_EQ(w.attn_out_w->ne[2], kInChannels);
+    EXPECT_EQ(w.attn_out_b->ne[0], kInChannels);
+    EXPECT_EQ(w.ge_out_w->ne[0], 1);
+    EXPECT_EQ(w.ge_out_w->ne[1], kHidden);
+    EXPECT_EQ(w.ge_out_w->ne[2], kInChannels);
+    EXPECT_EQ(w.ge_out_b->ne[0], kInChannels);
 
     gpt_sovits::sovits_text_encoder_mrte_model_free(model);
     ggml_backend_free(backend);
