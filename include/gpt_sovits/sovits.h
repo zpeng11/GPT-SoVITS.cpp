@@ -177,6 +177,30 @@ struct sovits_text_encoder_mrte_block_weights {
 //     `module/models_onnx.py`: all frames are treated as valid
 struct sovits_text_encoder_post_block_weights {
     std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderPostLayers> layers;
+
+    // Conv1d(192, 384, k=1), used by full `enc_p` to produce [m, logs].
+    struct ggml_tensor * proj_w;    // {1, 192, 384}
+    struct ggml_tensor * proj_b;    // {384}
+};
+
+// Weights for the full SoVITS v2 `enc_p` path at fixed speed=1:
+//   ssl {768, T_ssl} -> ssl encoder
+//   text ids {T_text} -> text encoder
+//   ssl/text/ge -> MRTE -> post encoder -> proj -> split(m, logs)
+//
+// Returns the same activations as `TextEncoder.forward(..., speed=1)` in
+// `module/models_onnx.py`, except the all-ones `y_mask` is omitted.
+struct sovits_text_encoder_block_weights {
+    sovits_text_encoder_ssl_block_weights  ssl;
+    sovits_text_encoder_text_block_weights text;
+    sovits_text_encoder_mrte_block_weights mrte;
+    sovits_text_encoder_post_block_weights post;
+};
+
+struct sovits_text_encoder_result {
+    struct ggml_tensor * x;     // {192, T_ssl}
+    struct ggml_tensor * m;     // {192, T_ssl}
+    struct ggml_tensor * logs;  // {192, T_ssl}
 };
 
 // Build the SoVITS v2 MelStyleEncoder graph.
@@ -267,6 +291,25 @@ struct ggml_tensor * sovits_text_encoder_post_block_forward(
     struct ggml_tensor                                 * x,
     const sovits_text_encoder_post_block_weights       & weights);
 
+// Build the full SoVITS v2 `enc_p` graph at fixed speed=1.
+//
+// Parameters:
+//   ctx      - ggml context for tensor/op allocation
+//   ssl      - quantized SSL features {768, T_ssl}
+//   text     - phoneme token ids {T_text} (i32)
+//   ge       - reference style embedding {512, 1}
+//   weights  - full text-encoder weights
+//
+// Returns:
+//   x, m, logs where each tensor uses ggml layout and `x`/`m`/`logs`
+//   match `TextEncoder.forward(..., speed=1)`.
+sovits_text_encoder_result sovits_text_encoder_block_forward(
+    struct ggml_context                           * ctx,
+    struct ggml_tensor                            * ssl,
+    struct ggml_tensor                            * text,
+    struct ggml_tensor                            * ge,
+    const sovits_text_encoder_block_weights       & weights);
+
 // ---------------------------------------------------------------------------
 // SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
 // (except backend, which is borrowed from the caller).
@@ -330,6 +373,16 @@ struct sovits_text_encoder_post_model {
     struct ggml_context     * ctx_w   = nullptr;
 };
 
+// SoVITS full text-encoder model: owns the loaded GGUF weights and ggml
+// resources (except backend, which is borrowed from the caller).
+struct sovits_text_encoder_model {
+    sovits_text_encoder_block_weights weights = {};
+
+    ggml_backend_t            backend = nullptr;
+    ggml_backend_buffer_t     buf_w   = nullptr;
+    struct ggml_context     * ctx_w   = nullptr;
+};
+
 // Load a SoVITS ref_enc model from a GGUF file produced by
 // `convert_sovits_ref_enc_to_gguf.py`.
 //
@@ -381,6 +434,13 @@ bool sovits_text_encoder_post_model_load(
     sovits_text_encoder_post_model & model,
     ggml_backend_t backend);
 
+// Load a SoVITS full text_encoder model from a GGUF file produced by
+// `convert_sovits_text_encoder_to_gguf.py`.
+bool sovits_text_encoder_model_load(
+    const std::string & fname,
+    sovits_text_encoder_model & model,
+    ggml_backend_t backend);
+
 // Free all resources owned by a SoVITS ref_enc model.
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model);
 
@@ -398,5 +458,8 @@ void sovits_text_encoder_mrte_model_free(sovits_text_encoder_mrte_model & model)
 
 // Free all resources owned by a SoVITS text_encoder_post model.
 void sovits_text_encoder_post_model_free(sovits_text_encoder_post_model & model);
+
+// Free all resources owned by a SoVITS text_encoder model.
+void sovits_text_encoder_model_free(sovits_text_encoder_model & model);
 
 } // namespace gpt_sovits

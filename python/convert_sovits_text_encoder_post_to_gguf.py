@@ -25,7 +25,10 @@ GGML_TYPES = {
 }
 
 
-TEXT_ENCODER_POST_MAP = []
+TEXT_ENCODER_POST_MAP = [
+    ("text_encoder_post.proj_w", "enc_p.proj.weight"),
+    ("text_encoder_post.proj_b", "enc_p.proj.bias"),
+]
 
 for i in range(3):
     TEXT_ENCODER_POST_MAP.extend([
@@ -83,6 +86,7 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     writer.add_uint32("sovits.text_encoder_post.n_layer", 3)
     writer.add_uint32("sovits.text_encoder_post.kernel_size", 3)
     writer.add_uint32("sovits.text_encoder_post.window_size", 4)
+    writer.add_uint32("sovits.text_encoder_post.out_dim", 192)
 
     n_converted = 0
     for i in range(3):
@@ -146,6 +150,8 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
             )
 
         tensor_np = weights[ckpt_name]
+        if gguf_name == "text_encoder_post.proj_w" and tensor_np.shape[2] != 1:
+            raise ValueError(f"Expected enc_p.proj.weight to have kernel size 1, got shape {tensor_np.shape}")
         if gguf_name.endswith("ffn_up_w") or gguf_name.endswith("ffn_down_w"):
             tensor_np = tensor_np.astype(np.float32)
             tensor_type = gguf.GGMLQuantizationType.F32

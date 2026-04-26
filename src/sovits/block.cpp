@@ -781,4 +781,42 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     return relpos_encoder_stack_forward(ctx, x, weights.layers);
 }
 
+sovits_text_encoder_result sovits_text_encoder_block_forward(
+    ::ggml_context                    * ctx,
+    ::ggml_tensor                     * ssl,
+    ::ggml_tensor                     * text,
+    ::ggml_tensor                     * ge,
+    const sovits_text_encoder_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(ssl != nullptr);
+    GGML_ASSERT(text != nullptr);
+    GGML_ASSERT(ge != nullptr);
+    GGML_ASSERT(weights.post.proj_w != nullptr);
+    GGML_ASSERT(weights.post.proj_b != nullptr);
+    GGML_ASSERT(weights.post.proj_w->ne[0] == 1);
+    GGML_ASSERT(weights.post.proj_w->ne[1] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.post.proj_w->ne[2] == 2 * kTextEncoderSslHidden);
+    GGML_ASSERT(weights.post.proj_b->ne[0] == 2 * kTextEncoderSslHidden);
+
+    ::ggml_tensor * ssl_x = sovits_text_encoder_ssl_block_forward(ctx, ssl, weights.ssl);
+    ::ggml_tensor * text_x = sovits_text_encoder_text_block_forward(ctx, text, weights.text);
+    ::ggml_tensor * fused = sovits_text_encoder_mrte_block_forward(ctx, ssl_x, text_x, ge, weights.mrte);
+    ::ggml_tensor * x = sovits_text_encoder_post_block_forward(ctx, fused, weights.post);
+
+    ::ggml_tensor * stats = conv1d_with_bias_channels_first(
+        ctx,
+        x,
+        weights.post.proj_w,
+        weights.post.proj_b,
+        /*stride=*/1,
+        /*padding=*/0);
+
+    sovits_text_encoder_result result;
+    result.x = x;
+    result.m = split_channels(ctx, stats, 0, kTextEncoderSslHidden);
+    result.logs = split_channels(ctx, stats, kTextEncoderSslHidden, kTextEncoderSslHidden);
+    return result;
+}
+
 } // namespace gpt_sovits
