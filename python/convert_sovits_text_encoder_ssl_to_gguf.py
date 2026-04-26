@@ -32,12 +32,6 @@ TEXT_ENCODER_SSL_MAP = [
 
 for i in range(3):
     TEXT_ENCODER_SSL_MAP.extend([
-        (f"text_encoder_ssl.layers.{i}.q_w", f"enc_p.encoder_ssl.attn_layers.{i}.conv_q.weight"),
-        (f"text_encoder_ssl.layers.{i}.q_b", f"enc_p.encoder_ssl.attn_layers.{i}.conv_q.bias"),
-        (f"text_encoder_ssl.layers.{i}.k_w", f"enc_p.encoder_ssl.attn_layers.{i}.conv_k.weight"),
-        (f"text_encoder_ssl.layers.{i}.k_b", f"enc_p.encoder_ssl.attn_layers.{i}.conv_k.bias"),
-        (f"text_encoder_ssl.layers.{i}.v_w", f"enc_p.encoder_ssl.attn_layers.{i}.conv_v.weight"),
-        (f"text_encoder_ssl.layers.{i}.v_b", f"enc_p.encoder_ssl.attn_layers.{i}.conv_v.bias"),
         (f"text_encoder_ssl.layers.{i}.out_w", f"enc_p.encoder_ssl.attn_layers.{i}.conv_o.weight"),
         (f"text_encoder_ssl.layers.{i}.out_b", f"enc_p.encoder_ssl.attn_layers.{i}.conv_o.bias"),
         (f"text_encoder_ssl.layers.{i}.rel_k", f"enc_p.encoder_ssl.attn_layers.{i}.emb_rel_k"),
@@ -51,6 +45,27 @@ for i in range(3):
         (f"text_encoder_ssl.layers.{i}.ln2_w", f"enc_p.encoder_ssl.norm_layers_2.{i}.gamma"),
         (f"text_encoder_ssl.layers.{i}.ln2_b", f"enc_p.encoder_ssl.norm_layers_2.{i}.beta"),
     ])
+
+
+def _fused_qkv(weights: dict[str, np.ndarray], layer_idx: int) -> tuple[np.ndarray, np.ndarray]:
+    prefix = f"enc_p.encoder_ssl.attn_layers.{layer_idx}"
+    q_w = weights[f"{prefix}.conv_q.weight"]
+    k_w = weights[f"{prefix}.conv_k.weight"]
+    v_w = weights[f"{prefix}.conv_v.weight"]
+    q_b = weights[f"{prefix}.conv_q.bias"]
+    k_b = weights[f"{prefix}.conv_k.bias"]
+    v_b = weights[f"{prefix}.conv_v.bias"]
+    return np.concatenate([q_w, k_w, v_w], axis=0), np.concatenate([q_b, k_b, v_b], axis=0)
+
+
+def _packed_rel_k(weights: dict[str, np.ndarray], layer_idx: int) -> np.ndarray:
+    rel_k = weights[f"enc_p.encoder_ssl.attn_layers.{layer_idx}.emb_rel_k"]
+    return rel_k[0].copy()
+
+
+def _packed_rel_v_t(weights: dict[str, np.ndarray], layer_idx: int) -> np.ndarray:
+    rel_v = weights[f"enc_p.encoder_ssl.attn_layers.{layer_idx}.emb_rel_v"]
+    return rel_v[0].transpose(1, 0).copy()
 
 
 def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
@@ -74,7 +89,60 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     writer.add_uint32("sovits.text_encoder_ssl.window_size", 4)
 
     n_converted = 0
+    for i in range(3):
+        qkv_w, qkv_b = _fused_qkv(weights, i)
+        qkv_w = qkv_w.astype(np.float16 if target_type == gguf.GGMLQuantizationType.F16 else np.float32)
+        qkv_b = qkv_b.astype(np.float32)
+        rel_k = _packed_rel_k(weights, i).astype(np.float32)
+        rel_v_t = _packed_rel_v_t(weights, i).astype(np.float32)
+
+        writer.add_tensor(
+            f"text_encoder_ssl.layers.{i}.qkv_w",
+            qkv_w,
+            raw_dtype=target_type if qkv_w.dtype == np.float16 else gguf.GGMLQuantizationType.F32,
+        )
+        n_converted += 1
+        print(
+            f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.qkv_w':36s} <- fused q/k/v weights{'':18s} "
+            f"{list(qkv_w.shape)!s:16s} {qkv_w.dtype}"
+        )
+
+        writer.add_tensor(
+            f"text_encoder_ssl.layers.{i}.qkv_b",
+            qkv_b,
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        n_converted += 1
+        print(
+            f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.qkv_b':36s} <- fused q/k/v bias{'':21s} "
+            f"{list(qkv_b.shape)!s:16s} {qkv_b.dtype}"
+        )
+
+        writer.add_tensor(
+            f"text_encoder_ssl.layers.{i}.rel_k",
+            rel_k,
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        n_converted += 1
+        print(
+            f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.rel_k':36s} <- packed rel_k{'':27s} "
+            f"{list(rel_k.shape)!s:16s} {rel_k.dtype}"
+        )
+
+        writer.add_tensor(
+            f"text_encoder_ssl.layers.{i}.rel_v_t",
+            rel_v_t,
+            raw_dtype=gguf.GGMLQuantizationType.F32,
+        )
+        n_converted += 1
+        print(
+            f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.rel_v_t':36s} <- packed rel_v_t{'':25s} "
+            f"{list(rel_v_t.shape)!s:16s} {rel_v_t.dtype}"
+        )
+
     for gguf_name, ckpt_name in TEXT_ENCODER_SSL_MAP:
+        if gguf_name.endswith(".rel_k") or gguf_name.endswith(".rel_v"):
+            continue
         if ckpt_name not in weights:
             raise KeyError(
                 f"Tensor '{ckpt_name}' not found in checkpoint "
@@ -82,7 +150,9 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
             )
 
         tensor_np = weights[ckpt_name]
-        if target_type == gguf.GGMLQuantizationType.F16 and tensor_np.ndim >= 2:
+        if gguf_name.endswith("ffn_up_w") or gguf_name.endswith("ffn_down_w"):
+            tensor_np = tensor_np.astype(np.float32)
+        elif target_type == gguf.GGMLQuantizationType.F16 and tensor_np.ndim >= 2:
             tensor_np = tensor_np.astype(np.float16)
         else:
             tensor_np = tensor_np.astype(np.float32)

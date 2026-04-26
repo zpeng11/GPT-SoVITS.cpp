@@ -87,19 +87,16 @@ struct sovits_rvq_decode_block_weights {
 //   - mask handling is fixed to the exported v2 inference path in
 //     `module/models_onnx.py`: all frames are valid
 struct sovits_text_encoder_ssl_layer_weights {
-    // 1x1 Conv1d projections for self-attention.
-    struct ggml_tensor * q_w;      // {1, 192, 192}
-    struct ggml_tensor * q_b;      // {192}
-    struct ggml_tensor * k_w;      // {1, 192, 192}
-    struct ggml_tensor * k_b;      // {192}
-    struct ggml_tensor * v_w;      // {1, 192, 192}
-    struct ggml_tensor * v_b;      // {192}
+    // Fused 1x1 Conv1d projections for self-attention.
+    // Output channels are laid out as [Q, K, V].
+    struct ggml_tensor * qkv_w;    // {1, 192, 576}
+    struct ggml_tensor * qkv_b;    // {576}
     struct ggml_tensor * out_w;    // {1, 192, 192}
     struct ggml_tensor * out_b;    // {192}
 
-    // Relative-position parameters. Stored in ggml layout after GGUF import.
-    struct ggml_tensor * rel_k;    // {96, 9, 1}
-    struct ggml_tensor * rel_v;    // {96, 9, 1}
+    // Relative-position parameters, prepacked for inference.
+    struct ggml_tensor * rel_k;      // {96, 9}
+    struct ggml_tensor * rel_v_t;    // {9, 96}
 
     // LayerNorm(hidden)
     struct ggml_tensor * ln1_w;    // {192}

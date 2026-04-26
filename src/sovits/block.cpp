@@ -108,8 +108,20 @@ static ::ggml_tensor * split_channels(
     GGML_ASSERT(start_channel + n_channels <= x->ne[0]);
 
     const size_t offset = (size_t) start_channel * ggml_element_size(x);
-    ::ggml_tensor * view = ggml_view_2d(ctx, x, n_channels, x->ne[1], x->nb[1], offset);
-    return ggml_cont(ctx, view);
+    return ggml_view_2d(ctx, x, n_channels, x->ne[1], x->nb[1], offset);
+}
+
+static ::ggml_tensor * split_qkv_projection(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * qkv,
+    int64_t          index)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(qkv != nullptr);
+    GGML_ASSERT(index >= 0 && index < 3);
+    GGML_ASSERT(qkv->ne[0] == 3 * kTextEncoderSslHidden);
+
+    return split_channels(ctx, qkv, index * kTextEncoderSslHidden, kTextEncoderSslHidden);
 }
 
 static ::ggml_tensor * ensure_f32(
@@ -250,31 +262,21 @@ static ::ggml_tensor * build_relative_logits_for_head(
 
         const int64_t q_start = shift >= 0 ? 0 : -shift;
         const int64_t key_start = shift >= 0 ? shift : 0;
-        ::ggml_tensor * dot_row = ggml_view_2d(
+        ::ggml_tensor * dot = ggml_view_2d(
             ctx,
             rel_dot,
             1,
-            time,
+            length,
             rel_dot->nb[1],
-            (size_t) rel_idx * rel_dot->nb[0]);
-        dot_row = ensure_f32(ctx, ggml_cont(ctx, dot_row));
-        ::ggml_tensor * dot = slice_time_range(ctx, dot_row, q_start, length);
+            (size_t) rel_idx * rel_dot->nb[0] + (size_t) q_start * rel_dot->nb[1]);
+        dot = ensure_f32(ctx, ggml_cont(ctx, dot));
 
-        ::ggml_tensor * dot_vec = flatten_vector_1d(ctx, dot);
-        ::ggml_tensor * diag = ggml_diag(ctx, dot_vec);
-        diag = ensure_f32(ctx, diag);
-        diag = ggml_pad_ext(
+        scores = ggml_set_2d(
             ctx,
-            diag,
-            key_start,
-            time - length - key_start,
-            q_start,
-            time - length - q_start,
-            0,
-            0,
-            0,
-            0);
-        scores = ggml_add(ctx, scores, diag);
+            scores,
+            dot,
+            scores->nb[0] + scores->nb[1],
+            (size_t) key_start * scores->nb[0] + (size_t) q_start * scores->nb[1]);
     }
 
     return scores;
@@ -292,13 +294,12 @@ static ::ggml_tensor * build_relative_value_for_head(
     GGML_ASSERT(rel_v_t->ne[1] == kTextEncoderSslHeadDim);
 
     const int64_t time = attn_head->ne[0];
-    ::ggml_tensor * rel_weight_rows[kTextEncoderSslRelSize] = { nullptr };
+    ::ggml_tensor * rel_weights = zeros_2d(ctx, kTextEncoderSslRelSize, time);
 
     for (int64_t rel_idx = 0; rel_idx < kTextEncoderSslRelSize; ++rel_idx) {
         const int64_t shift = rel_idx - kTextEncoderSslWindow;
         int64_t length = time - (shift >= 0 ? shift : -shift);
         if (length <= 0) {
-            rel_weight_rows[rel_idx] = zeros_2d(ctx, 1, time);
             continue;
         }
 
@@ -308,24 +309,13 @@ static ::ggml_tensor * build_relative_value_for_head(
         ::ggml_tensor * diag = ggml_view_2d(ctx, attn_head, 1, length, attn_head->nb[0] + attn_head->nb[1], offset);
         diag = ensure_f32(ctx, ggml_cont(ctx, diag));
 
-        rel_weight_rows[rel_idx] = ggml_pad_ext(
+        rel_weights = ggml_set_2d(
             ctx,
+            rel_weights,
             diag,
-            0,
-            0,
-            query_start,
-            time - length - query_start,
-            0,
-            0,
-            0,
-            0);
+            rel_weights->nb[1],
+            (size_t) rel_idx * rel_weights->nb[0] + (size_t) query_start * rel_weights->nb[1]);
     }
-
-    ::ggml_tensor * rel_weights = rel_weight_rows[0];
-    for (int64_t rel_idx = 1; rel_idx < kTextEncoderSslRelSize; ++rel_idx) {
-        rel_weights = ggml_concat(ctx, rel_weights, rel_weight_rows[rel_idx], 0);
-    }
-    rel_weights = ggml_cont(ctx, rel_weights);
 
     ::ggml_tensor * output = ggml_mul_mat(ctx, rel_v_t, rel_weights);
     return ensure_f32(ctx, output);
@@ -339,44 +329,25 @@ static ::ggml_tensor * self_attention_with_relative_position(
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(x->ne[0] == kTextEncoderSslHidden);
-    GGML_ASSERT(weights.q_w != nullptr);
-    GGML_ASSERT(weights.q_b != nullptr);
-    GGML_ASSERT(weights.k_w != nullptr);
-    GGML_ASSERT(weights.k_b != nullptr);
-    GGML_ASSERT(weights.v_w != nullptr);
-    GGML_ASSERT(weights.v_b != nullptr);
+    GGML_ASSERT(weights.qkv_w != nullptr);
+    GGML_ASSERT(weights.qkv_b != nullptr);
     GGML_ASSERT(weights.out_w != nullptr);
     GGML_ASSERT(weights.out_b != nullptr);
     GGML_ASSERT(weights.rel_k != nullptr);
-    GGML_ASSERT(weights.rel_v != nullptr);
+    GGML_ASSERT(weights.rel_v_t != nullptr);
 
-    ::ggml_tensor * q = conv1d_with_bias_channels_first(ctx, x, weights.q_w, weights.q_b, 1, 0);
-    ::ggml_tensor * k = conv1d_with_bias_channels_first(ctx, x, weights.k_w, weights.k_b, 1, 0);
-    ::ggml_tensor * v = conv1d_with_bias_channels_first(ctx, x, weights.v_w, weights.v_b, 1, 0);
+    ::ggml_tensor * qkv = conv1d_with_bias_channels_first(ctx, x, weights.qkv_w, weights.qkv_b, 1, 0);
+    ::ggml_tensor * q = split_qkv_projection(ctx, qkv, 0);
+    ::ggml_tensor * k = split_qkv_projection(ctx, qkv, 1);
+    ::ggml_tensor * v = split_qkv_projection(ctx, qkv, 2);
 
     const int64_t time = x->ne[1];
     ::ggml_tensor * heads[2] = { nullptr, nullptr };
-    ::ggml_tensor * rel_k = ggml_view_2d(
-        ctx,
-        weights.rel_k,
-        kTextEncoderSslHeadDim,
-        kTextEncoderSslRelSize,
-        weights.rel_k->nb[1],
-        0);
-    rel_k = ggml_cont(ctx, rel_k);
-
-    ::ggml_tensor * rel_v = ggml_view_2d(
-        ctx,
-        weights.rel_v,
-        kTextEncoderSslHeadDim,
-        kTextEncoderSslRelSize,
-        weights.rel_v->nb[1],
-        0);
-    rel_v = ggml_cont(ctx, rel_v);
-    ::ggml_tensor * rel_v_t = ggml_transpose(ctx, rel_v);
-    rel_v_t = ensure_f32(ctx, ggml_cont(ctx, rel_v_t));
+    ::ggml_tensor * rel_k = weights.rel_k;
+    ::ggml_tensor * rel_v_t = weights.rel_v_t;
 
     for (int64_t h = 0; h < kTextEncoderSslHeads; ++h) {
+        const float attn_scale = 1.0f / sqrtf((float) kTextEncoderSslHeadDim);
         const int64_t ch0 = h * kTextEncoderSslHeadDim;
         ::ggml_tensor * q_head = split_channels(ctx, q, ch0, kTextEncoderSslHeadDim);
         ::ggml_tensor * k_head = split_channels(ctx, k, ch0, kTextEncoderSslHeadDim);
@@ -384,12 +355,10 @@ static ::ggml_tensor * self_attention_with_relative_position(
 
         ::ggml_tensor * content_scores = ggml_mul_mat(ctx, k_head, q_head);
         content_scores = ensure_f32(ctx, content_scores);
-        content_scores = ggml_scale(ctx, content_scores, 1.0f / sqrtf((float) kTextEncoderSslHeadDim));
 
         ::ggml_tensor * rel_scores = build_relative_logits_for_head(ctx, q_head, rel_k);
-        rel_scores = ggml_scale(ctx, rel_scores, 1.0f / sqrtf((float) kTextEncoderSslHeadDim));
         ::ggml_tensor * scores = ggml_add(ctx, content_scores, rel_scores);
-        ::ggml_tensor * attn = ggml_soft_max(ctx, scores);
+        ::ggml_tensor * attn = ggml_soft_max_ext(ctx, scores, nullptr, attn_scale, 0.0f);
 
         ::ggml_tensor * v_head_t = ggml_transpose(ctx, v_head);
         v_head_t = ggml_cont(ctx, v_head_t);

@@ -92,20 +92,10 @@ static bool populate_text_encoder_ssl_weights(
         auto & layer = w.layers[i];
         char name[96];
 
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.q_w", i);
-        layer.q_w = checked_get_tensor(ctx, name);
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.q_b", i);
-        layer.q_b = checked_get_tensor(ctx, name);
-
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.k_w", i);
-        layer.k_w = checked_get_tensor(ctx, name);
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.k_b", i);
-        layer.k_b = checked_get_tensor(ctx, name);
-
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.v_w", i);
-        layer.v_w = checked_get_tensor(ctx, name);
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.v_b", i);
-        layer.v_b = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.qkv_w", i);
+        layer.qkv_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.qkv_b", i);
+        layer.qkv_b = checked_get_tensor(ctx, name);
 
         snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.out_w", i);
         layer.out_w = checked_get_tensor(ctx, name);
@@ -114,8 +104,8 @@ static bool populate_text_encoder_ssl_weights(
 
         snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.rel_k", i);
         layer.rel_k = checked_get_tensor(ctx, name);
-        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.rel_v", i);
-        layer.rel_v = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.rel_v_t", i);
+        layer.rel_v_t = checked_get_tensor(ctx, name);
 
         snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.ln1_w", i);
         layer.ln1_w = checked_get_tensor(ctx, name);
@@ -136,9 +126,8 @@ static bool populate_text_encoder_ssl_weights(
         snprintf(name, sizeof(name), "text_encoder_ssl.layers.%d.ln2_b", i);
         layer.ln2_b = checked_get_tensor(ctx, name);
 
-        if (!layer.q_w || !layer.q_b || !layer.k_w || !layer.k_b ||
-            !layer.v_w || !layer.v_b || !layer.out_w || !layer.out_b ||
-            !layer.rel_k || !layer.rel_v ||
+        if (!layer.qkv_w || !layer.qkv_b || !layer.out_w || !layer.out_b ||
+            !layer.rel_k || !layer.rel_v_t ||
             !layer.ln1_w || !layer.ln1_b ||
             !layer.ffn_up_w || !layer.ffn_up_b ||
             !layer.ffn_down_w || !layer.ffn_down_b ||

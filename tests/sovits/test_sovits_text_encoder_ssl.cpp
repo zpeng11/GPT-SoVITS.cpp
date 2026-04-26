@@ -186,25 +186,22 @@ TEST(SoVITSTextEncoderSsl, WeightPointersAndShapesLookCorrect) {
 
     for (int i = 0; i < gpt_sovits::kSovitsTextEncoderSslLayers; ++i) {
         const auto & layer = w.layers[i];
-        ASSERT_NE(layer.q_w, nullptr);
-        ASSERT_NE(layer.q_b, nullptr);
-        ASSERT_NE(layer.k_w, nullptr);
-        ASSERT_NE(layer.v_w, nullptr);
+        ASSERT_NE(layer.qkv_w, nullptr);
+        ASSERT_NE(layer.qkv_b, nullptr);
         ASSERT_NE(layer.out_w, nullptr);
         ASSERT_NE(layer.rel_k, nullptr);
-        ASSERT_NE(layer.rel_v, nullptr);
+        ASSERT_NE(layer.rel_v_t, nullptr);
         ASSERT_NE(layer.ffn_up_w, nullptr);
         ASSERT_NE(layer.ffn_down_w, nullptr);
 
-        EXPECT_EQ(layer.q_w->ne[0], 1);
-        EXPECT_EQ(layer.q_w->ne[1], kHidden);
-        EXPECT_EQ(layer.q_w->ne[2], kHidden);
+        EXPECT_EQ(layer.qkv_w->ne[0], 1);
+        EXPECT_EQ(layer.qkv_w->ne[1], kHidden);
+        EXPECT_EQ(layer.qkv_w->ne[2], 3 * kHidden);
+        EXPECT_EQ(layer.qkv_b->ne[0], 3 * kHidden);
         EXPECT_EQ(layer.rel_k->ne[0], kHeadDim);
         EXPECT_EQ(layer.rel_k->ne[1], 2 * kWindow + 1);
-        EXPECT_EQ(layer.rel_k->ne[2], 1);
-        EXPECT_EQ(layer.rel_v->ne[0], kHeadDim);
-        EXPECT_EQ(layer.rel_v->ne[1], 2 * kWindow + 1);
-        EXPECT_EQ(layer.rel_v->ne[2], 1);
+        EXPECT_EQ(layer.rel_v_t->ne[0], 2 * kWindow + 1);
+        EXPECT_EQ(layer.rel_v_t->ne[1], kHeadDim);
         EXPECT_EQ(layer.ffn_up_w->ne[0], 3);
         EXPECT_EQ(layer.ffn_up_w->ne[1], kHidden);
         EXPECT_EQ(layer.ffn_up_w->ne[2], kFFN);
