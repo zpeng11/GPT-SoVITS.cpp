@@ -77,17 +77,13 @@ struct sovits_rvq_decode_block_weights {
     struct ggml_tensor * codebook;       // {768, 1024}
 };
 
-// Weights for the SoVITS v2 `enc_p.ssl_proj + enc_p.encoder_ssl` path:
-//   ssl {768, T} -> Conv1d(768, 192, k=1) -> 3 x [rel-pos self-attn + FFN]
-//   -> {192, T}
+// Weights for one SoVITS v2 relative-position encoder layer:
+//   hidden {192, T} -> relative-position self-attention -> residual + LayerNorm
+//   -> Conv1d(192, 768, k=3) -> ReLU -> Conv1d(768, 192, k=3)
+//   -> residual + LayerNorm -> {192, T}
 //
-// Scope:
-//   - single-sample inference only
-//   - fixed v2 hyperparameters from the shipped checkpoint:
-//       hidden=192, ffn=768, n_heads=2, n_layers=3, kernel=3, window=4
-//   - dropout is skipped (eval-mode behavior)
-//   - mask handling is fixed to the exported v2 inference path in
-//     `module/models_onnx.py`: all frames are valid
+// Shared by `enc_p.encoder_ssl`, `enc_p.encoder_text`, and `enc_p.encoder2`
+// in `module/models_onnx.py`.
 struct sovits_relpos_encoder_layer_weights {
     // Fused 1x1 Conv1d projections for self-attention.
     // Output channels are laid out as [Q, K, V].
@@ -115,6 +111,17 @@ struct sovits_relpos_encoder_layer_weights {
     struct ggml_tensor * ln2_b;    // {192}
 };
 
+// Weights for the SoVITS v2 `enc_p.ssl_proj + enc_p.encoder_ssl` branch:
+//   ssl {768, T} -> Conv1d(768, 192, k=1)
+//   -> 3 x [relative-position encoder layer] -> {192, T}
+//
+// Scope:
+//   - single-sample inference only
+//   - fixed v2 hyperparameters from the shipped checkpoint:
+//       hidden=192, ffn=768, n_heads=2, n_layers=3, kernel=3, window=4
+//   - dropout is skipped (eval-mode behavior)
+//   - mask handling is fixed to the exported v2 inference path in
+//     `module/models_onnx.py`: all frames are valid
 struct sovits_text_encoder_ssl_block_weights {
     // Conv1d(768, 192, k=1)
     struct ggml_tensor * ssl_proj_w;    // {1, 768, 192}
@@ -123,9 +130,9 @@ struct sovits_text_encoder_ssl_block_weights {
     std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderSslLayers> layers;
 };
 
-// Weights for the SoVITS v2 `enc_p.text_embedding + enc_p.encoder_text` path:
-//   text ids {T} -> Embedding(732, 192) -> 6 x [rel-pos self-attn + FFN]
-//   -> {192, T}
+// Weights for the SoVITS v2 `enc_p.text_embedding + enc_p.encoder_text` branch:
+//   text ids {T} -> Embedding(732, 192)
+//   -> 6 x [relative-position encoder layer] -> {192, T}
 //
 // Scope:
 //   - single-sample inference only
@@ -141,7 +148,7 @@ struct sovits_text_encoder_text_block_weights {
     std::array<sovits_relpos_encoder_layer_weights, kSovitsTextEncoderTextLayers> layers;
 };
 
-// Weights for an inference-only fused SoVITS v2 `enc_p.mrte` path:
+// Weights for the inference-only fused SoVITS v2 `enc_p.mrte` branch:
 //   ssl {192, T_ssl} -> fused [q, skip] projection {704, T_ssl}
 //   text {192, T_text} -> fused [k, v] projection {1024, T_text}
 //   ge {512, 1} -> fused ge projection {192, 1}
@@ -165,8 +172,8 @@ struct sovits_text_encoder_mrte_block_weights {
     struct ggml_tensor * ge_out_b;      // {192}
 };
 
-// Weights for the SoVITS v2 `enc_p.encoder2` path:
-//   features {192, T} -> 3 x [rel-pos self-attn + FFN] -> {192, T}
+// Weights for the SoVITS v2 `enc_p.encoder2` branch:
+//   features {192, T} -> 3 x [relative-position encoder layer] -> {192, T}
 //
 // Scope:
 //   - single-sample inference only
@@ -183,10 +190,10 @@ struct sovits_text_encoder_post_block_weights {
     struct ggml_tensor * proj_b;    // {384}
 };
 
-// Weights for the full SoVITS v2 `enc_p` path at fixed speed=1:
-//   ssl {768, T_ssl} -> ssl encoder
-//   text ids {T_text} -> text encoder
-//   ssl/text/ge -> MRTE -> post encoder -> proj -> split(m, logs)
+// Weights for the full SoVITS v2 `enc_p` graph at fixed speed=1:
+//   ssl {768, T_ssl} -> SSL branch
+//   text ids {T_text} -> text branch
+//   ssl/text/ge -> MRTE branch -> post branch -> proj -> split(m, logs)
 //
 // Returns the same activations as `TextEncoder.forward(..., speed=1)` in
 // `module/models_onnx.py`, except the all-ones `y_mask` is omitted.
@@ -231,12 +238,12 @@ struct ggml_tensor * sovits_rvq_decode_block_forward(
     struct ggml_tensor                        * codes,
     const sovits_rvq_decode_block_weights     & weights);
 
-// Build the SoVITS v2 `enc_p.ssl_proj + enc_p.encoder_ssl` graph.
+// Build the SoVITS v2 `enc_p.ssl_proj + enc_p.encoder_ssl` branch.
 //
 // Parameters:
 //   ctx      - ggml context for tensor/op allocation
 //   ssl      - quantized SSL features {768, T}
-//   weights  - text-encoder SSL weights
+//   weights  - SSL-branch weights
 //
 // Returns:
 //   encoded SSL features {192, T}
@@ -245,12 +252,12 @@ struct ggml_tensor * sovits_text_encoder_ssl_block_forward(
     struct ggml_tensor                                * ssl,
     const sovits_text_encoder_ssl_block_weights       & weights);
 
-// Build the SoVITS v2 `enc_p.text_embedding + enc_p.encoder_text` graph.
+// Build the SoVITS v2 `enc_p.text_embedding + enc_p.encoder_text` branch.
 //
 // Parameters:
 //   ctx      - ggml context for tensor/op allocation
 //   text     - phoneme token ids {T} (i32)
-//   weights  - text-encoder text weights
+//   weights  - text-branch weights
 //
 // Returns:
 //   encoded text features {192, T}
@@ -259,7 +266,7 @@ struct ggml_tensor * sovits_text_encoder_text_block_forward(
     struct ggml_tensor                                 * text,
     const sovits_text_encoder_text_block_weights       & weights);
 
-// Build the fused SoVITS v2 `enc_p.mrte` graph.
+// Build the fused SoVITS v2 `enc_p.mrte` branch.
 //
 // Parameters:
 //   ctx      - ggml context for tensor/op allocation
@@ -277,12 +284,12 @@ struct ggml_tensor * sovits_text_encoder_mrte_block_forward(
     struct ggml_tensor                                 * ge,
     const sovits_text_encoder_mrte_block_weights       & weights);
 
-// Build the SoVITS v2 `enc_p.encoder2` graph.
+// Build the SoVITS v2 `enc_p.encoder2` branch.
 //
 // Parameters:
 //   ctx      - ggml context for tensor/op allocation
 //   x        - post-MRTE features {192, T}
-//   weights  - encoder2 weights
+//   weights  - post-branch weights
 //
 // Returns:
 //   encoded post-MRTE features {192, T}

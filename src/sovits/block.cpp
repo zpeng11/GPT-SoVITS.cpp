@@ -528,7 +528,7 @@ static ::ggml_tensor * self_attention_with_relative_position(
     return conv1d_with_bias_channels_first(ctx, merged, weights.out_w, weights.out_b, 1, 0);
 }
 
-static ::ggml_tensor * text_encoder_ssl_layer_forward(
+static ::ggml_tensor * relpos_encoder_layer_forward(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
     const sovits_relpos_encoder_layer_weights & weights)
@@ -569,8 +569,9 @@ static ::ggml_tensor * relpos_encoder_stack_forward(
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(x->ne[0] == kTextEncoderSslHidden);
 
+    // Shared by the ssl, text, and post encoder branches.
     for (const sovits_relpos_encoder_layer_weights & layer : layers) {
-        x = text_encoder_ssl_layer_forward(ctx, x, layer);
+        x = relpos_encoder_layer_forward(ctx, x, layer);
     }
 
     return x;
