@@ -67,10 +67,6 @@ endforeach()
 set(SOVITS_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_ref_enc.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_quantizer.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_text_encoder_ssl.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_text_encoder_text.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_text_encoder_mrte.cpp
-    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_text_encoder_post.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_text_encoder.cpp
 )
 

@@ -778,7 +778,7 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     return ggml_get_rows(ctx, weights.codebook, codes_vec);
 }
 
-::ggml_tensor * sovits_text_encoder_ssl_block_forward(
+static ::ggml_tensor * sovits_text_encoder_ssl_block_forward(
     ::ggml_context                         * ctx,
     ::ggml_tensor                          * ssl,
     const sovits_text_encoder_ssl_block_weights & weights)
@@ -804,7 +804,7 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     return relpos_encoder_stack_forward(ctx, x, weights.layers);
 }
 
-::ggml_tensor * sovits_text_encoder_text_block_forward(
+static ::ggml_tensor * sovits_text_encoder_text_block_forward(
     ::ggml_context                          * ctx,
     ::ggml_tensor                           * text,
     const sovits_text_encoder_text_block_weights & weights)
@@ -821,7 +821,7 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     return relpos_encoder_stack_forward(ctx, x, weights.layers);
 }
 
-::ggml_tensor * sovits_text_encoder_mrte_block_forward(
+static ::ggml_tensor * sovits_text_encoder_mrte_block_forward(
     ::ggml_context                                * ctx,
     ::ggml_tensor                                 * ssl,
     ::ggml_tensor                                 * text,
@@ -901,7 +901,7 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     return ggml_add(ctx, ggml_add(ctx, attn_out, skip), ge_out);
 }
 
-::ggml_tensor * sovits_text_encoder_post_block_forward(
+static ::ggml_tensor * sovits_text_encoder_post_block_forward(
     ::ggml_context                          * ctx,
     ::ggml_tensor                           * x,
     const sovits_text_encoder_post_block_weights & weights)

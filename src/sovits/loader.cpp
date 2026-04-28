@@ -396,58 +396,6 @@ bool sovits_quantizer_model_load(
     return load_model_from_gguf(fname, model, backend, populate_quantizer_weights, sovits_quantizer_model_free);
 }
 
-bool sovits_text_encoder_ssl_model_load(
-    const std::string & fname,
-    sovits_text_encoder_ssl_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate_text_encoder_ssl_weights,
-        sovits_text_encoder_ssl_model_free);
-}
-
-bool sovits_text_encoder_text_model_load(
-    const std::string & fname,
-    sovits_text_encoder_text_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate_text_encoder_text_weights,
-        sovits_text_encoder_text_model_free);
-}
-
-bool sovits_text_encoder_mrte_model_load(
-    const std::string & fname,
-    sovits_text_encoder_mrte_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate_text_encoder_mrte_weights,
-        sovits_text_encoder_mrte_model_free);
-}
-
-bool sovits_text_encoder_post_model_load(
-    const std::string & fname,
-    sovits_text_encoder_post_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate_text_encoder_post_weights,
-        sovits_text_encoder_post_model_free);
-}
-
 bool sovits_text_encoder_model_load(
     const std::string & fname,
     sovits_text_encoder_model & model,
@@ -474,54 +422,6 @@ void sovits_ref_enc_model_free(sovits_ref_enc_model & model) {
 }
 
 void sovits_quantizer_model_free(sovits_quantizer_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-void sovits_text_encoder_ssl_model_free(sovits_text_encoder_ssl_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-void sovits_text_encoder_text_model_free(sovits_text_encoder_text_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-void sovits_text_encoder_mrte_model_free(sovits_text_encoder_mrte_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-void sovits_text_encoder_post_model_free(sovits_text_encoder_post_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
         model.buf_w = nullptr;
