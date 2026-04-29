@@ -25,6 +25,12 @@ namespace {
 static const std::string kTestDir = SOVITS_TEST_DIR;
 static const std::string kModelF16 =
     kTestDir + "models/v2-generator-f16.gguf";
+static const std::string kModelQ8 =
+    kTestDir + "models/v2-generator-q8.gguf";
+static const std::string kModelQ5 =
+    kTestDir + "models/v2-generator-q5.gguf";
+static const std::string kModelQ4 =
+    kTestDir + "models/v2-generator-q4.gguf";
 
 static constexpr int64_t kGeneratorIn = 192;
 static constexpr int64_t kGeneratorGin = 512;
@@ -109,12 +115,12 @@ TEST(SoVITSGenerator, WeightPointersAndShapesLookCorrect) {
     ASSERT_NE(w.cond.b, nullptr);
     ASSERT_NE(w.conv_post_w, nullptr);
 
-    EXPECT_EQ(w.conv_pre.w->ne[0], 7);
-    EXPECT_EQ(w.conv_pre.w->ne[1], 192);
-    EXPECT_EQ(w.conv_pre.w->ne[2], 512);
-    EXPECT_EQ(w.cond.w->ne[0], 1);
+    EXPECT_EQ(w.conv_pre.w->ne[0], 192 * 7);
+    EXPECT_EQ(w.conv_pre.w->ne[1], 512);
+    EXPECT_EQ(w.conv_pre.w->ne[2], 1);
+    EXPECT_EQ(w.cond.w->ne[0], 512);
     EXPECT_EQ(w.cond.w->ne[1], 512);
-    EXPECT_EQ(w.cond.w->ne[2], 512);
+    EXPECT_EQ(w.cond.w->ne[2], 1);
 
     const auto & s0 = w.stages[0];
     ASSERT_NE(s0.up.w, nullptr);
@@ -129,12 +135,12 @@ TEST(SoVITSGenerator, WeightPointersAndShapesLookCorrect) {
     ASSERT_NE(rb0.convs1[0].b, nullptr);
     ASSERT_NE(rb0.convs2[0].w, nullptr);
     ASSERT_NE(rb0.convs2[0].b, nullptr);
-    EXPECT_EQ(rb0.convs1[0].w->ne[0], 3);
+    EXPECT_EQ(rb0.convs1[0].w->ne[0], 256 * 3);
     EXPECT_EQ(rb0.convs1[0].w->ne[1], 256);
-    EXPECT_EQ(rb0.convs1[0].w->ne[2], 256);
+    EXPECT_EQ(rb0.convs1[0].w->ne[2], 1);
 
-    EXPECT_EQ(w.conv_post_w->ne[0], 7);
-    EXPECT_EQ(w.conv_post_w->ne[1], 16);
+    EXPECT_EQ(w.conv_post_w->ne[0], 16 * 7);
+    EXPECT_EQ(w.conv_post_w->ne[1], 1);
     EXPECT_EQ(w.conv_post_w->ne[2], 1);
 
     gpt_sovits::sovits_generator_model_free(model);
@@ -212,6 +218,75 @@ TEST(SoVITSGenerator, NonExistentFileReturnsFalse) {
     EXPECT_FALSE(gpt_sovits::sovits_generator_model_load("/nonexistent/path.gguf", model, backend));
 
     ggml_backend_free(backend);
+}
+
+TEST(SoVITSGenerator, QuantizedModelsLoadSuccessfully) {
+    for (const std::string & path : {kModelQ8, kModelQ5, kModelQ4}) {
+        ASSERT_MODEL_EXISTS(path);
+
+        ggml_backend_t backend = create_test_backend();
+        ASSERT_NE(backend, nullptr);
+
+        gpt_sovits::sovits_generator_model model{};
+        ASSERT_TRUE(gpt_sovits::sovits_generator_model_load(path, model, backend));
+
+        gpt_sovits::sovits_generator_model_free(model);
+        ggml_backend_free(backend);
+    }
+}
+
+TEST(SoVITSGenerator, QuantizedModelsRunInference) {
+    for (const std::string & path : {kModelQ8, kModelQ5, kModelQ4}) {
+        ASSERT_MODEL_EXISTS(path);
+
+        ggml_backend_t backend = create_test_backend();
+        ASSERT_NE(backend, nullptr);
+
+        gpt_sovits::sovits_generator_model model{};
+        ASSERT_TRUE(gpt_sovits::sovits_generator_model_load(path, model, backend));
+
+        GraphContext gctx(kMaxNodes);
+        ASSERT_NE(gctx.ctx, nullptr);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+        ASSERT_NE(gf, nullptr);
+
+        struct ggml_tensor * z = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeneratorIn, kTime);
+        ggml_set_input(z);
+        struct ggml_tensor * ge = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeneratorGin, 1);
+        ggml_set_input(ge);
+
+        struct ggml_tensor * out =
+            gpt_sovits::sovits_generator_block_forward(gctx, z, ge, model.weights);
+        ASSERT_NE(out, nullptr);
+        ggml_set_output(out);
+        ggml_build_forward_expand(gf, out);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        ASSERT_NE(alloc, nullptr);
+        ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+        std::vector<float> z_data(static_cast<size_t>(kGeneratorIn * kTime));
+        fill_input(z_data, kGeneratorIn, kTime);
+        ggml_backend_tensor_set(z, z_data.data(), 0, z_data.size() * sizeof(float));
+
+        std::vector<float> ge_data(static_cast<size_t>(kGeneratorGin));
+        fill_input(ge_data, kGeneratorGin, 1);
+        ggml_backend_tensor_set(ge, ge_data.data(), 0, ge_data.size() * sizeof(float));
+
+        ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+
+        std::vector<float> output(ggml_nbytes(out) / sizeof(float));
+        ggml_backend_tensor_get(out, output.data(), 0, ggml_nbytes(out));
+        for (float v : output) {
+            EXPECT_TRUE(std::isfinite(v));
+        }
+
+        ggml_gallocr_free(alloc);
+        gpt_sovits::sovits_generator_model_free(model);
+        ggml_backend_free(backend);
+    }
 }
 
 TEST(SoVITSGenerator, FreeOnDefaultInitializedModelIsSafe) {

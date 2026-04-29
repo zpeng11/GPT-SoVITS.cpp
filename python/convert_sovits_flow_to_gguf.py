@@ -69,6 +69,19 @@ def fuse_weight_norm(
     return fused, bias.astype(np.float32)
 
 
+def linearize_conv1x1(weight: np.ndarray) -> np.ndarray:
+    if weight.ndim == 3 and weight.shape[2] == 1:
+        return weight[:, :, 0].astype(np.float32)
+    return weight.astype(np.float32)
+
+
+def flatten_conv1d(weight: np.ndarray) -> np.ndarray:
+    if weight.ndim != 3:
+        return weight.astype(np.float32)
+    out_ch, in_ch, kernel = weight.shape
+    return weight.reshape(out_ch, in_ch * kernel).astype(np.float32)
+
+
 def convert_tensor(
     gguf_name: str,
     tensor_np: np.ndarray,
@@ -130,6 +143,7 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
 
             w = ckpt_weights[ckpt_weight_name].astype(np.float32)
             b = ckpt_weights[ckpt_bias_name].astype(np.float32)
+            w = flatten_conv1d(w)
 
             w_data, w_type = convert_tensor(gguf_w_name, w, target_type)
             writer.add_tensor(gguf_w_name, w_data, raw_dtype=w_type)
@@ -147,6 +161,7 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
         cond_v  = ckpt_weights[f"{ckpt_prefix}.weight_v"]
         cond_b  = ckpt_weights[f"{ckpt_prefix}.bias"]
         cond_fused_w, cond_fused_b = fuse_weight_norm(cond_g, cond_v, cond_b)
+        cond_fused_w = flatten_conv1d(cond_fused_w)
 
         w_data, w_type = convert_tensor(f"flow.layers.{L}.enc.cond_w", cond_fused_w, target_type)
         writer.add_tensor(f"flow.layers.{L}.enc.cond_w", w_data, raw_dtype=w_type)
@@ -173,6 +188,7 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
                     ckpt_weights[v_name],
                     ckpt_weights[b_name],
                 )
+                fused_w = flatten_conv1d(fused_w)
 
                 w_data, w_type = convert_tensor(gguf_w_name, fused_w, target_type)
                 writer.add_tensor(gguf_w_name, w_data, raw_dtype=w_type)

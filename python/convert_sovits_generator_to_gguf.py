@@ -61,6 +61,19 @@ def fuse_weight_norm(
     return fused, bias.astype(np.float32)
 
 
+def linearize_conv1x1(weight: np.ndarray) -> np.ndarray:
+    if weight.ndim == 3 and weight.shape[2] == 1:
+        return weight[:, :, 0].astype(np.float32)
+    return weight.astype(np.float32)
+
+
+def flatten_conv1d(weight: np.ndarray) -> np.ndarray:
+    if weight.ndim != 3:
+        return weight.astype(np.float32)
+    out_ch, in_ch, kernel = weight.shape
+    return weight.reshape(out_ch, in_ch * kernel).astype(np.float32)
+
+
 def convert_tensor(
     gguf_name: str,
     tensor_np: np.ndarray,
@@ -115,7 +128,8 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     for gguf_name, ckpt_name in DIRECT_MAP:
         if ckpt_name not in weights:
             raise KeyError(f"Tensor '{ckpt_name}' not found in checkpoint")
-        n_converted = add_tensor(writer, gguf_name, weights[ckpt_name].astype(np.float32), target_type, ckpt_name, n_converted)
+        tensor_np = flatten_conv1d(weights[ckpt_name]) if gguf_name.endswith("_w") else weights[ckpt_name].astype(np.float32)
+        n_converted = add_tensor(writer, gguf_name, tensor_np, target_type, ckpt_name, n_converted)
 
     for stage in range(N_STAGES):
         up_prefix = f"dec.ups.{stage}"
@@ -143,6 +157,8 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
                     weights[f"{c2_prefix}.weight_v"],
                     weights[f"{c2_prefix}.bias"],
                 )
+                c1_w = flatten_conv1d(c1_w)
+                c2_w = flatten_conv1d(c2_w)
 
                 base = f"generator.stages.{stage}.resblocks.{branch}"
                 n_converted = add_tensor(writer, f"{base}.convs1.{layer}.w", c1_w, target_type, f"fused {c1_prefix}", n_converted)
