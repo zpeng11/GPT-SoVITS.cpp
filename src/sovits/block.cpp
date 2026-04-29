@@ -53,6 +53,11 @@ static constexpr std::array<int, kSovitsGeneratorResLayers> kGeneratorResblockDi
     1, 3, 5,
 };
 
+enum class seq_layout {
+    channels_first,
+    time_first,
+};
+
 static ::ggml_tensor * flatten_vector_1d(
     ::ggml_context * ctx,
     ::ggml_tensor  * x)
@@ -71,7 +76,7 @@ static ::ggml_tensor * flatten_vector_1d(
     return ggml_cont(ctx, flat);
 }
 
-static ::ggml_tensor * reshape_bias_2d(
+static ::ggml_tensor * reshape_bias_channels_first(
     ::ggml_context * ctx,
     ::ggml_tensor  * bias)
 {
@@ -129,24 +134,6 @@ static ::ggml_tensor * as_linear_weight_2d(
     return ggml_reshape_2d(ctx, weight, weight->ne[1], weight->ne[2]);
 }
 
-static ::ggml_tensor * conv1d_weight_shape_view(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * weight,
-    int64_t          in_channels)
-{
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(weight != nullptr);
-
-    if (!is_linear_weight_2d(weight)) {
-        GGML_ASSERT(weight->ne[1] == in_channels);
-        return weight;
-    }
-
-    const int64_t kernel_size = conv1d_weight_kernel_size(weight, in_channels);
-    const int64_t out_channels = conv1d_weight_out_channels(weight);
-    return ggml_reshape_3d(ctx, weight, kernel_size, in_channels, out_channels);
-}
-
 static ::ggml_tensor * conv1d_weight_shape_template(
     ::ggml_context * ctx,
     ::ggml_tensor  * weight,
@@ -180,12 +167,6 @@ static ::ggml_tensor * conv1d_weight_kernel_2d(
     return ggml_reshape_2d(ctx, weight, weight->ne[0] * weight->ne[1], weight->ne[2]);
 }
 
-static ::ggml_tensor * slice_time_range(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * x,
-    int64_t          start,
-    int64_t          length);
-
 static ::ggml_tensor * layer_norm_2d(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
@@ -200,8 +181,8 @@ static ::ggml_tensor * layer_norm_2d(
     GGML_ASSERT(bias->ne[0] == x->ne[0]);
 
     ::ggml_tensor * y = ggml_norm(ctx, x, kLayerNormEps);
-    y = ggml_mul(ctx, y, reshape_bias_2d(ctx, weight));
-    return ggml_add(ctx, y, reshape_bias_2d(ctx, bias));
+    y = ggml_mul(ctx, y, reshape_bias_channels_first(ctx, weight));
+    return ggml_add(ctx, y, reshape_bias_channels_first(ctx, bias));
 }
 
 static ::ggml_tensor * linear_2d(
@@ -217,7 +198,7 @@ static ::ggml_tensor * linear_2d(
     GGML_ASSERT(weight->ne[1] == bias->ne[0]);
 
     ::ggml_tensor * y = ggml_mul_mat(ctx, weight, x);
-    return ggml_add(ctx, y, reshape_bias_2d(ctx, bias));
+    return ggml_add(ctx, y, reshape_bias_channels_first(ctx, bias));
 }
 
 static ::ggml_tensor * linear_2d_time_first(
@@ -237,6 +218,10 @@ static ::ggml_tensor * linear_2d_time_first(
     ::ggml_tensor * y_cf = linear_2d(ctx, x_cf, weight, bias); // {C_out, T}
     return ggml_cont(ctx, ggml_permute(ctx, y_cf, 1, 0, 2, 3));
 }
+
+static ::ggml_tensor * reshape_bias_time_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * bias);
 
 static ::ggml_tensor * mish_2d(
     ::ggml_context * ctx,
@@ -322,23 +307,46 @@ static ::ggml_tensor * ensure_f32(
     return ggml_cont(ctx, ggml_cast(ctx, x, GGML_TYPE_F32));
 }
 
-static ::ggml_tensor * conv1d_forward_channels_first(
+static int64_t conv1d_input_channels(
+    const ::ggml_tensor * x,
+    seq_layout            layout)
+{
+    GGML_ASSERT(x != nullptr);
+    return layout == seq_layout::channels_first ? x->ne[0] : x->ne[1];
+}
+
+static ::ggml_tensor * conv1d_im2col_input(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    seq_layout       layout)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+
+    if (layout == seq_layout::channels_first) {
+        return ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
+    }
+
+    return x;
+}
+
+static ::ggml_tensor * conv1d_forward_core(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
     ::ggml_tensor  * weight,
     int              stride,
     int              padding,
-    int              dilation = 1)
+    int              dilation,
+    seq_layout       layout)
 {
+    GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(weight != nullptr);
 
-    const int64_t in_channels = x->ne[0];
+    const int64_t in_channels = conv1d_input_channels(x, layout);
     const int64_t kernel_size = conv1d_weight_kernel_size(weight, in_channels);
     ::ggml_tensor * weight_shape = conv1d_weight_shape_template(ctx, weight, in_channels);
-
-    ::ggml_tensor * conv_in = ggml_permute(ctx, x, 1, 0, 2, 3);
-    conv_in = ggml_cont(ctx, conv_in);
+    ::ggml_tensor * conv_in = conv1d_im2col_input(ctx, x, layout);
 
     const ggml_type im2col_type = x->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     ::ggml_tensor * im2col = ggml_im2col(
@@ -367,8 +375,67 @@ static ::ggml_tensor * conv1d_forward_channels_first(
     // quantized matmul kernels instead of forcing an explicit cast to F32.
     GGML_ASSERT(patches->ne[0] == in_channels * kernel_size);
     ::ggml_tensor * kernel = conv1d_weight_kernel_2d(ctx, weight, in_channels);
+    ::ggml_tensor * y = ggml_mul_mat(ctx, kernel, patches);
 
-    return ggml_mul_mat(ctx, kernel, patches);
+    if (layout == seq_layout::time_first) {
+        y = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));
+    }
+
+    return y;
+}
+
+static ::ggml_tensor * conv1d_with_bias_core(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * weight,
+    ::ggml_tensor  * bias,
+    int              stride,
+    int              padding,
+    int              dilation,
+    seq_layout       layout)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(weight != nullptr);
+    GGML_ASSERT(bias != nullptr);
+
+    const int64_t in_channels = conv1d_input_channels(x, layout);
+
+    // Conv1d with kernel=1/stride=1/pad=0 is exactly a per-time-step linear
+    // projection on the channel axis, so avoid the im2col path.
+    if (conv1d_weight_kernel_size(weight, in_channels) == 1
+        && stride == 1 && padding == 0 && dilation == 1) {
+        ::ggml_tensor * linear_w = as_linear_weight_2d(ctx, weight);
+        if (layout == seq_layout::channels_first) {
+            return linear_2d(ctx, x, linear_w, bias);
+        }
+        return linear_2d_time_first(ctx, x, linear_w, bias);
+    }
+
+    ::ggml_tensor * y = conv1d_forward_core(ctx, x, weight, stride, padding, dilation, layout);
+    y = ensure_f32(ctx, y);
+    if (layout == seq_layout::channels_first) {
+        return ggml_add(ctx, y, reshape_bias_channels_first(ctx, bias));
+    }
+    return ggml_add(ctx, y, reshape_bias_time_first(ctx, bias));
+}
+
+static ::ggml_tensor * conv1d_forward_channels_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * weight,
+    int              stride,
+    int              padding,
+    int              dilation = 1)
+{
+    return conv1d_forward_core(
+        ctx,
+        x,
+        weight,
+        stride,
+        padding,
+        dilation,
+        seq_layout::channels_first);
 }
 
 static ::ggml_tensor * conv1d_with_bias_channels_first(
@@ -380,25 +447,18 @@ static ::ggml_tensor * conv1d_with_bias_channels_first(
     int              padding,
     int              dilation = 1)
 {
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(weight != nullptr);
-    GGML_ASSERT(bias != nullptr);
-
-    // Conv1d with kernel=1/stride=1/pad=0 is exactly a per-time-step linear
-    // projection on the channel axis, so avoid the im2col path.
-    if (conv1d_weight_kernel_size(weight, x->ne[0]) == 1
-        && stride == 1 && padding == 0 && dilation == 1) {
-        ::ggml_tensor * linear_w = as_linear_weight_2d(ctx, weight);
-        return linear_2d(ctx, x, linear_w, bias);
-    }
-
-    ::ggml_tensor * y = conv1d_forward_channels_first(ctx, x, weight, stride, padding, dilation);
-    y = ensure_f32(ctx, y);
-    return ggml_add(ctx, y, reshape_bias_2d(ctx, bias));
+    return conv1d_with_bias_core(
+        ctx,
+        x,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        seq_layout::channels_first);
 }
 
-static ::ggml_tensor * reshape_bias_2d_time_first(
+static ::ggml_tensor * reshape_bias_time_first(
     ::ggml_context * ctx,
     ::ggml_tensor  * bias)
 {
@@ -432,45 +492,14 @@ static ::ggml_tensor * conv1d_forward_time_first(
     int              padding,
     int              dilation = 1)
 {
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(weight != nullptr);
-
-    const int64_t in_channels = x->ne[1];
-    const int64_t kernel_size = conv1d_weight_kernel_size(weight, in_channels);
-    ::ggml_tensor * weight_shape = conv1d_weight_shape_template(ctx, weight, in_channels);
-
-    const ggml_type im2col_type = x->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
-    ::ggml_tensor * im2col = ggml_im2col(
+    return conv1d_forward_core(
         ctx,
-        weight_shape,
         x,
+        weight,
         stride,
-        /*s1=*/0,
         padding,
-        /*p1=*/0,
-        /*d0=*/dilation,
-        /*d1=*/0,
-        /*is_2D=*/false,
-        im2col_type);
-
-    ::ggml_tensor * patches = ggml_reshape_2d(
-        ctx,
-        im2col,
-        im2col->ne[0],
-        im2col->ne[1] * im2col->ne[2]);
-    if (im2col_type == GGML_TYPE_F32) {
-        patches = ensure_f32(ctx, patches);
-    }
-
-    // Keep weights as src0 so ggml backends can pick native mixed-dtype or
-    // quantized matmul kernels instead of forcing an explicit cast to F32.
-    GGML_ASSERT(patches->ne[0] == in_channels * kernel_size);
-    ::ggml_tensor * kernel = conv1d_weight_kernel_2d(ctx, weight, in_channels);
-
-    ::ggml_tensor * y = ggml_mul_mat(ctx, kernel, patches); // {C_out, T_out}
-    y = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));  // {T_out, C_out}
-    return y;
+        dilation,
+        seq_layout::time_first);
 }
 
 static ::ggml_tensor * conv1d_with_bias_time_first(
@@ -482,22 +511,15 @@ static ::ggml_tensor * conv1d_with_bias_time_first(
     int              padding,
     int              dilation = 1)
 {
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(weight != nullptr);
-    GGML_ASSERT(bias != nullptr);
-
-    // Time-first Conv1d with kernel=1/stride=1/pad=0 is the same per-step
-    // linear projection as the channels-first path, so skip im2col here too.
-    if (conv1d_weight_kernel_size(weight, x->ne[1]) == 1
-        && stride == 1 && padding == 0 && dilation == 1) {
-        ::ggml_tensor * linear_w = as_linear_weight_2d(ctx, weight);
-        return linear_2d_time_first(ctx, x, linear_w, bias);
-    }
-
-    ::ggml_tensor * y = conv1d_forward_time_first(ctx, x, weight, stride, padding, dilation);
-    y = ensure_f32(ctx, y);
-    return ggml_add(ctx, y, reshape_bias_2d_time_first(ctx, bias));
+    return conv1d_with_bias_core(
+        ctx,
+        x,
+        weight,
+        bias,
+        stride,
+        padding,
+        dilation,
+        seq_layout::time_first);
 }
 
 static ::ggml_tensor * conv_transpose1d_with_bias_time_first(
@@ -522,7 +544,7 @@ static ::ggml_tensor * conv_transpose1d_with_bias_time_first(
     }
 
     y = ensure_f32(ctx, y);
-    return ggml_add(ctx, y, reshape_bias_2d_time_first(ctx, bias));
+    return ggml_add(ctx, y, reshape_bias_time_first(ctx, bias));
 }
 
 static ::ggml_tensor * generator_resblock1_forward(
@@ -542,6 +564,10 @@ static ::ggml_tensor * generator_resblock1_forward(
         GGML_ASSERT(c2.w != nullptr);
         GGML_ASSERT(c2.b != nullptr);
 
+        const int dilation = kGeneratorResblockDilations[i];
+        const int dilation_padding = ((kernel_size * dilation) - dilation) / 2;
+        const int same_padding = (kernel_size - 1) / 2;
+
         ::ggml_tensor * xt = ggml_leaky_relu(ctx, x, kGeneratorLreluSlope, false);
         xt = conv1d_with_bias_time_first(
             ctx,
@@ -549,8 +575,8 @@ static ::ggml_tensor * generator_resblock1_forward(
             c1.w,
             c1.b,
             /*stride=*/1,
-            /*padding=*/((kernel_size * kGeneratorResblockDilations[i]) - kGeneratorResblockDilations[i]) / 2,
-            /*dilation=*/kGeneratorResblockDilations[i]);
+            /*padding=*/dilation_padding,
+            /*dilation=*/dilation);
         xt = ggml_leaky_relu(ctx, xt, kGeneratorLreluSlope, false);
         xt = conv1d_with_bias_time_first(
             ctx,
@@ -558,7 +584,7 @@ static ::ggml_tensor * generator_resblock1_forward(
             c2.w,
             c2.b,
             /*stride=*/1,
-            /*padding=*/(kernel_size - 1) / 2,
+            /*padding=*/same_padding,
             /*dilation=*/1);
         x = ggml_add(ctx, x, xt);
     }
@@ -600,23 +626,6 @@ static ::ggml_tensor * generator_stage_forward(
     return ggml_scale(ctx, sum, 1.0f / static_cast<float>(kSovitsGeneratorBranches));
 }
 
-static ::ggml_tensor * slice_time_range(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * x,
-    int64_t          start,
-    int64_t          length)
-{
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(start >= 0);
-    GGML_ASSERT(length >= 0);
-    GGML_ASSERT(start + length <= x->ne[1]);
-
-    const size_t offset = (size_t) start * x->nb[1];
-    ::ggml_tensor * view = ggml_view_2d(ctx, x, x->ne[0], length, x->nb[1], offset);
-    return ggml_cont(ctx, view);
-}
-
 static ::ggml_tensor * zeros_2d(
     ::ggml_context * ctx,
     int64_t          ne0,
@@ -624,58 +633,6 @@ static ::ggml_tensor * zeros_2d(
 {
     ::ggml_tensor * tmpl = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, ne1);
     return ggml_fill(ctx, tmpl, 0.0f);
-}
-
-static ::ggml_tensor * add_relative_logits_for_head(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * scores,
-    ::ggml_tensor  * q_head,
-    ::ggml_tensor  * rel_k)
-{
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(scores != nullptr);
-    GGML_ASSERT(q_head != nullptr);
-    GGML_ASSERT(rel_k != nullptr);
-    GGML_ASSERT(scores->type == GGML_TYPE_F32);
-    GGML_ASSERT(scores->ne[0] == q_head->ne[1]);
-    GGML_ASSERT(scores->ne[1] == q_head->ne[1]);
-    GGML_ASSERT(q_head->ne[0] == kTextEncoderSslHeadDim);
-    GGML_ASSERT(rel_k->ne[0] == kTextEncoderSslHeadDim);
-    GGML_ASSERT(rel_k->ne[1] == kTextEncoderSslRelSize);
-
-    const int64_t time = q_head->ne[1];
-    ::ggml_tensor * rel_dot = ggml_mul_mat(ctx, rel_k, q_head); // {rel, T}
-    rel_dot = ensure_f32(ctx, rel_dot);
-
-    for (int64_t rel_idx = 0; rel_idx < kTextEncoderSslRelSize; ++rel_idx) {
-        const int64_t shift = rel_idx - kTextEncoderSslWindow;
-        int64_t length = time - (shift >= 0 ? shift : -shift);
-        if (length <= 0) {
-            continue;
-        }
-
-        const int64_t q_start = shift >= 0 ? 0 : -shift;
-        const int64_t key_start = shift >= 0 ? shift : 0;
-        ::ggml_tensor * dot = ggml_view_2d(
-            ctx,
-            rel_dot,
-            1,
-            length,
-            rel_dot->nb[1],
-            (size_t) rel_idx * rel_dot->nb[0] + (size_t) q_start * rel_dot->nb[1]);
-        dot = ensure_f32(ctx, dot);
-
-        scores = ggml_acc_inplace(
-            ctx,
-            scores,
-            dot,
-            scores->nb[0] + scores->nb[1],
-            scores->nb[2],
-            scores->nb[3],
-            (size_t) key_start * scores->nb[0] + (size_t) q_start * scores->nb[1]);
-    }
-
-    return scores;
 }
 
 static ::ggml_tensor * add_relative_logits_batched(
@@ -733,45 +690,6 @@ static ::ggml_tensor * add_relative_logits_batched(
     return scores;
 }
 
-static ::ggml_tensor * build_relative_value_for_head(
-    ::ggml_context * ctx,
-    ::ggml_tensor  * attn_head,
-    ::ggml_tensor  * rel_v_t)
-{
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(attn_head != nullptr);
-    GGML_ASSERT(rel_v_t != nullptr);
-    GGML_ASSERT(rel_v_t->ne[0] == kTextEncoderSslRelSize);
-    GGML_ASSERT(rel_v_t->ne[1] == kTextEncoderSslHeadDim);
-
-    const int64_t time = attn_head->ne[0];
-    ::ggml_tensor * rel_weights = zeros_2d(ctx, kTextEncoderSslRelSize, time);
-
-    for (int64_t rel_idx = 0; rel_idx < kTextEncoderSslRelSize; ++rel_idx) {
-        const int64_t shift = rel_idx - kTextEncoderSslWindow;
-        int64_t length = time - (shift >= 0 ? shift : -shift);
-        if (length <= 0) {
-            continue;
-        }
-
-        const int64_t key_start = shift >= 0 ? shift : 0;
-        const int64_t query_start = shift >= 0 ? 0 : -shift;
-        const size_t offset = (size_t) key_start * attn_head->nb[0] + (size_t) query_start * attn_head->nb[1];
-        ::ggml_tensor * diag = ggml_view_2d(ctx, attn_head, 1, length, attn_head->nb[0] + attn_head->nb[1], offset);
-        diag = ensure_f32(ctx, diag);
-
-        rel_weights = ggml_set_2d_inplace(
-            ctx,
-            rel_weights,
-            diag,
-            rel_weights->nb[1],
-            (size_t) rel_idx * rel_weights->nb[0] + (size_t) query_start * rel_weights->nb[1]);
-    }
-
-    ::ggml_tensor * output = ggml_mul_mat(ctx, rel_v_t, rel_weights);
-    return ensure_f32(ctx, output);
-}
-
 static ::ggml_tensor * build_relative_value_batched(
     ::ggml_context * ctx,
     ::ggml_tensor  * attn,
@@ -825,6 +743,38 @@ static ::ggml_tensor * build_relative_value_batched(
 
     ::ggml_tensor * output = ggml_mul_mat(ctx, rel_v_t, rel_weights);
     return ensure_f32(ctx, output);
+}
+
+static ::ggml_tensor * flash_attention_from_qkv_2d(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * q,
+    ::ggml_tensor  * k,
+    ::ggml_tensor  * v,
+    int64_t          head_dim,
+    int64_t          n_heads,
+    float            scale)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(q != nullptr);
+    GGML_ASSERT(k != nullptr);
+    GGML_ASSERT(v != nullptr);
+    GGML_ASSERT(q->ne[0] == head_dim * n_heads);
+    GGML_ASSERT(k->ne[0] == head_dim * n_heads);
+    GGML_ASSERT(v->ne[0] == head_dim * n_heads);
+
+    ::ggml_tensor * q_heads = split_heads_3d(ctx, q, head_dim, n_heads);
+    ::ggml_tensor * k_heads = split_heads_3d(ctx, k, head_dim, n_heads);
+    ::ggml_tensor * v_heads = split_heads_3d(ctx, v, head_dim, n_heads);
+    ::ggml_tensor * attn = ggml_flash_attn_ext(
+        ctx,
+        q_heads,
+        k_heads,
+        v_heads,
+        /*mask=*/ nullptr,
+        scale,
+        /*max_bias=*/ 0.0f,
+        /*logit_softcap=*/ 0.0f);
+    return ggml_reshape_2d(ctx, attn, q->ne[0], q->ne[1]);
 }
 
 static ::ggml_tensor * self_attention_with_relative_position(
@@ -955,7 +905,7 @@ static ::ggml_tensor * conv_glu_block_forward(
     GGML_ASSERT(weights.conv_b->ne[0] == 2 * kStyleHidden);
 
     ::ggml_tensor * conv = conv1d_forward_channels_first(ctx, x, weights.conv_w, /*stride=*/1, /*padding=*/2);
-    conv = ggml_add(ctx, conv, reshape_bias_2d(ctx, weights.conv_b));
+    conv = ggml_add(ctx, conv, reshape_bias_channels_first(ctx, weights.conv_b));
 
     ::ggml_tensor * a = split_channels(ctx, conv, 0, kStyleHidden);
     ::ggml_tensor * b = split_channels(ctx, conv, kStyleHidden, kStyleHidden);
@@ -980,37 +930,19 @@ static ::ggml_tensor * attention_block_forward(
     GGML_ASSERT(weights.out_w != nullptr);
     GGML_ASSERT(weights.out_b != nullptr);
 
-    const int64_t time = x->ne[1];
-    const size_t esz = ggml_element_size(x);
-
     ::ggml_tensor * q = linear_2d(ctx, x, weights.q_w, weights.q_b);
     ::ggml_tensor * k = linear_2d(ctx, x, weights.k_w, weights.k_b);
     ::ggml_tensor * v = linear_2d(ctx, x, weights.v_w, weights.v_b);
 
-    ::ggml_tensor * q_3d = ggml_view_3d(ctx, q,
-        kStyleHeadDim, kStyleHeads, time,
-        /*nb1=*/ esz * kStyleHeadDim,
-        /*nb2=*/ q->nb[1],
-        /*off=*/ 0);
-    q_3d = ggml_permute(ctx, q_3d, 0, 2, 1, 3);
-
-    ::ggml_tensor * k_3d = ggml_view_3d(ctx, k,
-        kStyleHeadDim, kStyleHeads, time,
-        /*nb1=*/ esz * kStyleHeadDim,
-        /*nb2=*/ k->nb[1],
-        /*off=*/ 0);
-    k_3d = ggml_permute(ctx, k_3d, 0, 2, 1, 3);
-
-    ::ggml_tensor * v_3d = ggml_view_3d(ctx, v,
-        kStyleHeadDim, kStyleHeads, time,
-        /*nb1=*/ esz * kStyleHeadDim,
-        /*nb2=*/ v->nb[1],
-        /*off=*/ 0);
-    v_3d = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-
     const float scale = 1.0f / sqrtf(static_cast<float>(kStyleHidden));
-    ::ggml_tensor * attn = ggml_flash_attn_ext(ctx, q_3d, k_3d, v_3d, nullptr, scale, 0.0f, 0.0f);
-    attn = ggml_reshape_2d(ctx, attn, kStyleHidden, time);
+    ::ggml_tensor * attn = flash_attention_from_qkv_2d(
+        ctx,
+        q,
+        k,
+        v,
+        kStyleHeadDim,
+        kStyleHeads,
+        scale);
 
     ::ggml_tensor * projected = linear_2d(ctx, attn, weights.out_w, weights.out_b);
     return ggml_add(ctx, projected, x);
@@ -1030,42 +962,15 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     GGML_ASSERT(k->ne[0] == kTextEncoderMrteHidden);
     GGML_ASSERT(v->ne[0] == kTextEncoderMrteHidden);
 
-    const int64_t q_time = q->ne[1];
-    const int64_t kv_time = k->ne[1];
-    const size_t esz = ggml_element_size(q);
-
-    ::ggml_tensor * q_3d = ggml_view_3d(ctx, q,
-        kTextEncoderMrteHeadDim, kTextEncoderMrteHeads, q_time,
-        /*nb1=*/ esz * kTextEncoderMrteHeadDim,
-        /*nb2=*/ q->nb[1],
-        /*off=*/ 0);
-    q_3d = ggml_permute(ctx, q_3d, 0, 2, 1, 3);
-
-    ::ggml_tensor * k_3d = ggml_view_3d(ctx, k,
-        kTextEncoderMrteHeadDim, kTextEncoderMrteHeads, kv_time,
-        /*nb1=*/ esz * kTextEncoderMrteHeadDim,
-        /*nb2=*/ k->nb[1],
-        /*off=*/ 0);
-    k_3d = ggml_permute(ctx, k_3d, 0, 2, 1, 3);
-
-    ::ggml_tensor * v_3d = ggml_view_3d(ctx, v,
-        kTextEncoderMrteHeadDim, kTextEncoderMrteHeads, kv_time,
-        /*nb1=*/ esz * kTextEncoderMrteHeadDim,
-        /*nb2=*/ v->nb[1],
-        /*off=*/ 0);
-    v_3d = ggml_permute(ctx, v_3d, 0, 2, 1, 3);
-
     const float scale = 1.0f / sqrtf(static_cast<float>(kTextEncoderMrteHeadDim));
-    ::ggml_tensor * attn = ggml_flash_attn_ext(
+    return flash_attention_from_qkv_2d(
         ctx,
-        q_3d,
-        k_3d,
-        v_3d,
-        /*mask=*/ nullptr,
-        scale,
-        /*max_bias=*/ 0.0f,
-        /*logit_softcap=*/ 0.0f);
-    return ggml_reshape_2d(ctx, attn, kTextEncoderMrteHidden, q_time);
+        q,
+        k,
+        v,
+        kTextEncoderMrteHeadDim,
+        kTextEncoderMrteHeads,
+        scale);
 }
 
 } // namespace
