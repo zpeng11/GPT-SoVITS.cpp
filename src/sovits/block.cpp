@@ -219,10 +219,7 @@ static ::ggml_tensor * conv1d_forward_channels_first(
     ::ggml_tensor * conv_in = ggml_permute(ctx, x, 1, 0, 2, 3);
     conv_in = ggml_cont(ctx, conv_in);
 
-    const ggml_type im2col_type =
-        (weight->type == GGML_TYPE_F16 && x->type == GGML_TYPE_F16)
-            ? GGML_TYPE_F16
-            : GGML_TYPE_F32;
+    const ggml_type im2col_type = x->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
     ::ggml_tensor * im2col = ggml_im2col(
         ctx,
         weight,
@@ -245,11 +242,13 @@ static ::ggml_tensor * conv1d_forward_channels_first(
         patches = ensure_f32(ctx, patches);
     }
 
-    ::ggml_tensor * kernel_src = weight;
-    if (im2col_type == GGML_TYPE_F32 && weight->type != GGML_TYPE_F32) {
-        kernel_src = ggml_cast(ctx, weight, GGML_TYPE_F32);
-    }
-    ::ggml_tensor * kernel = ggml_reshape_2d(ctx, kernel_src, kernel_src->ne[0] * kernel_src->ne[1], kernel_src->ne[2]);
+    // Keep weights as src0 so ggml backends can pick native mixed-dtype or
+    // quantized matmul kernels instead of forcing an explicit cast to F32.
+    ::ggml_tensor * kernel = ggml_reshape_2d(
+        ctx,
+        weight,
+        weight->ne[0] * weight->ne[1],
+        weight->ne[2]);
 
     return ggml_mul_mat(ctx, kernel, patches);
 }
