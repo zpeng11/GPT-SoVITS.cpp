@@ -12,6 +12,14 @@ static constexpr int kSovitsTextEncoderSslLayers = 3;
 static constexpr int kSovitsTextEncoderTextLayers = 6;
 static constexpr int kSovitsTextEncoderPostLayers = 3;
 
+static constexpr int kSovitsFlowChannels = 192;
+static constexpr int kSovitsFlowHidden = 192;
+static constexpr int kSovitsFlowHalfChannels = 96;
+static constexpr int kSovitsFlowKernel = 5;
+static constexpr int kSovitsFlowWNLayers = 4;
+static constexpr int kSovitsFlowNFlows = 4;
+static constexpr int kSovitsFlowGin = 512;
+
 // SoVITS v2 reference encoder (`ref_enc`) inference block.
 //
 // This block implements the `MelStyleEncoder` used by the SoVITS v2
@@ -204,6 +212,74 @@ struct sovits_text_encoder_block_weights {
     sovits_text_encoder_post_block_weights post;
 };
 
+// ---------------------------------------------------------------------------
+// SoVITS v2 flow (ResidualCouplingBlock) inference block.
+//
+// This block implements the inverse flow used by SynthesizerTrn.forward
+// with reverse=True.  The flow turns a Gaussian sample z_p {192, T} into
+// the decoder input z {192, T}, conditioned on the style embedding
+// g = ge {512, 1}.
+//
+// Architecture (v2 hyperparameters from the shipped checkpoint):
+//   ResidualCouplingBlock(channels=192, hidden=192, kernel=5,
+//                         dilation=1, n_layers=4, n_flows=4, gin=512,
+//                         mean_only=True)
+//
+// Each of the 4 coupling layers contains a WaveNet (WN) with 4 dilated-
+// Conv1d layers and gated tanh·sigmoid activations.  Channel flipping
+// (torch.flip along the channel axis) alternates which half is
+// transformed.
+//
+// Scope:
+//   - single-sample inference (reverse mode) only
+//   - x_mask is all-ones (fixed-length input, no padding)
+//   - dropout is skipped (eval-mode behaviour)
+//   - weight_norm is fused at GGUF-conversion time
+// ---------------------------------------------------------------------------
+
+// One WN layer: dilated Conv1d(k=5, dil=1) + gated activation + 1x1 projection.
+struct sovits_wn_layer_weights {
+    // in_layer: weight_norm Conv1d(H, 2H, K=5, dil=1, pad=2)
+    // ggml layout: {kernel, in_channels, out_channels}
+    struct ggml_tensor * in_w;     // {5, 192, 384}
+    struct ggml_tensor * in_b;     // {384}
+
+    // res_skip_layer: weight_norm Conv1d(H, out, K=1)
+    // out = 2H for layers 0..2, out = H for the last layer
+    struct ggml_tensor * rs_w;     // {1, 192, 384} or {1, 192, 192}
+    struct ggml_tensor * rs_b;     // {384} or {192}
+};
+
+// WaveNet inside one coupling layer (4 dilated layers + global condition).
+struct sovits_wn_weights {
+    // cond_layer: Conv1d(gin, 2*H*n_layers, K=1)  -- feeds g into each layer
+    struct ggml_tensor * cond_w;   // {1, 512, 1536}
+    struct ggml_tensor * cond_b;   // {1536}
+
+    std::array<sovits_wn_layer_weights, kSovitsFlowWNLayers> layers;
+};
+
+// One coupling (affine-coupling) layer.
+// input {192, T} is split into x0 {96, T} and x1 {96, T}.
+// x0 passes through pre → WN → post to predict a mean correction m {96, T}.
+// With mean_only=True the reverse step is simply  x1 = x1 - m.
+struct sovits_flow_layer_weights {
+    // pre: Conv1d(half, H, K=1)
+    struct ggml_tensor * pre_w;    // {1, 96, 192}
+    struct ggml_tensor * pre_b;    // {192}
+
+    sovits_wn_weights enc;
+
+    // post: Conv1d(H, half, K=1)  -- mean_only → 96 output channels
+    struct ggml_tensor * post_w;   // {1, 192, 96}
+    struct ggml_tensor * post_b;   // {96}
+};
+
+// Full flow block: 4 coupling layers interspersed with channel flips.
+struct sovits_flow_block_weights {
+    std::array<sovits_flow_layer_weights, kSovitsFlowNFlows> layers;
+};
+
 struct sovits_text_encoder_result {
     struct ggml_tensor * x;     // {192, T_ssl}
     struct ggml_tensor * m;     // {192, T_ssl}
@@ -257,6 +333,27 @@ sovits_text_encoder_result sovits_text_encoder_block_forward(
     struct ggml_tensor                            * ge,
     const sovits_text_encoder_block_weights       & weights);
 
+// Build the SoVITS v2 flow (ResidualCouplingBlock) inverse graph.
+//
+// This implements the inference path of SynthesizerTrn.forward where
+//   z = self.flow(z_p, y_mask, g=ge, reverse=True)
+// The flow turns a Gaussian sample z_p {192, T} into the decoder input
+// z {192, T}, conditioned on the style embedding g = ge {512, 1}.
+//
+// Parameters:
+//   ctx      - ggml context for tensor/op allocation
+//   x        - Gaussian sample z_p {192, T}
+//   g        - style embedding ge {512, 1}
+//   weights  - flow block weights
+//
+// Returns:
+//   decoder input z {192, T}
+struct ggml_tensor * sovits_flow_block_inverse_forward(
+    struct ggml_context                        * ctx,
+    struct ggml_tensor                         * x,
+    struct ggml_tensor                         * g,
+    const sovits_flow_block_weights            & weights);
+
 // ---------------------------------------------------------------------------
 // SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
 // (except backend, which is borrowed from the caller).
@@ -284,6 +381,16 @@ struct sovits_quantizer_model {
 // resources (except backend, which is borrowed from the caller).
 struct sovits_text_encoder_model {
     sovits_text_encoder_block_weights weights = {};
+
+    ggml_backend_t            backend = nullptr;
+    ggml_backend_buffer_t     buf_w   = nullptr;
+    struct ggml_context     * ctx_w   = nullptr;
+};
+
+// SoVITS flow model: owns the loaded GGUF weights and ggml resources
+// (except backend, which is borrowed from the caller).
+struct sovits_flow_model {
+    sovits_flow_block_weights weights = {};
 
     ggml_backend_t            backend = nullptr;
     ggml_backend_buffer_t     buf_w   = nullptr;
@@ -320,6 +427,13 @@ bool sovits_text_encoder_model_load(
     sovits_text_encoder_model & model,
     ggml_backend_t backend);
 
+// Load a SoVITS flow model from a GGUF file produced by
+// `convert_sovits_flow_to_gguf.py`.
+bool sovits_flow_model_load(
+    const std::string & fname,
+    sovits_flow_model & model,
+    ggml_backend_t backend);
+
 // Free all resources owned by a SoVITS ref_enc model.
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model);
 
@@ -328,5 +442,8 @@ void sovits_quantizer_model_free(sovits_quantizer_model & model);
 
 // Free all resources owned by a SoVITS text_encoder model.
 void sovits_text_encoder_model_free(sovits_text_encoder_model & model);
+
+// Free all resources owned by a SoVITS flow model.
+void sovits_flow_model_free(sovits_flow_model & model);
 
 } // namespace gpt_sovits

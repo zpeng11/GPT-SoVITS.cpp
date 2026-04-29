@@ -951,4 +951,169 @@ sovits_text_encoder_result sovits_text_encoder_block_forward(
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Flow block helpers
+// ---------------------------------------------------------------------------
+
+static ::ggml_tensor * fused_add_tanh_sigmoid_multiply(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * input_a,
+    ::ggml_tensor  * input_b,
+    int64_t          n_channels)
+{
+    GGML_ASSERT(input_a != nullptr);
+    GGML_ASSERT(input_b != nullptr);
+    GGML_ASSERT(input_a->ne[0] == 2 * n_channels);
+
+    ::ggml_tensor * in_act = ggml_add(ctx, input_a, input_b);
+    ::ggml_tensor * t_act = split_channels(ctx, in_act, 0, n_channels);
+    ::ggml_tensor * s_act = split_channels(ctx, in_act, n_channels, n_channels);
+    t_act = ggml_tanh(ctx, t_act);
+    s_act = ggml_sigmoid(ctx, s_act);
+    return ggml_mul(ctx, t_act, s_act);
+}
+
+static ::ggml_tensor * sovits_wn_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * g,
+    const sovits_wn_weights & w)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(g != nullptr);
+    GGML_ASSERT(x->ne[0] == kSovitsFlowHidden);
+    GGML_ASSERT(g->ne[0] == kSovitsFlowGin);
+    GGML_ASSERT(w.cond_w != nullptr);
+    GGML_ASSERT(w.cond_b != nullptr);
+
+    const int64_t H = kSovitsFlowHidden;
+    const int64_t T = x->ne[1];
+
+    // cond_layer: Conv1d(gin, 2*H*N, k=1)
+    ::ggml_tensor * cond_w_2d = ggml_reshape_2d(ctx, w.cond_w, w.cond_w->ne[1], w.cond_w->ne[2]);
+    ::ggml_tensor * cond = linear_2d(ctx, g, cond_w_2d, w.cond_b);  // {2*H*N, 1}
+
+    // Broadcast condition to full time dimension once (shared across all WN layers)
+    cond = ggml_repeat_4d(ctx, cond, cond->ne[0], T, 1, 1);  // {2*H*N, T}
+
+    ::ggml_tensor * output = zeros_2d(ctx, H, T);
+
+    for (int i = 0; i < kSovitsFlowWNLayers; ++i) {
+        GGML_ASSERT(w.layers[i].in_w != nullptr);
+        GGML_ASSERT(w.layers[i].in_b != nullptr);
+        GGML_ASSERT(w.layers[i].rs_w != nullptr);
+        GGML_ASSERT(w.layers[i].rs_b != nullptr);
+
+        // in_layer: dilated Conv1d(H, 2*H, K=5, dil=1, pad=2)
+        ::ggml_tensor * x_in = conv1d_with_bias_channels_first(
+            ctx, x, w.layers[i].in_w, w.layers[i].in_b, 1, 2);  // {2H, T}
+
+        // Condition slice — already broadcasted to full time
+        ::ggml_tensor * g_l = split_channels(ctx, cond, i * 2 * H, 2 * H);  // {2H, T}
+
+        // Gated activation: tanh(a) * sigmoid(b)
+        ::ggml_tensor * acts = fused_add_tanh_sigmoid_multiply(ctx, x_in, g_l, H);  // {H, T}
+
+        // res_skip_layer: Conv1d(H, out_ch, K=1)
+        ::ggml_tensor * res_skip = conv1d_with_bias_channels_first(
+            ctx, acts, w.layers[i].rs_w, w.layers[i].rs_b, 1, 0);  // {2H, T} or {H, T}
+
+        const int64_t out_ch = w.layers[i].rs_w->ne[2];  // 2*H for layers 0..2, H for layer 3
+
+        if (i < kSovitsFlowWNLayers - 1) {
+            GGML_ASSERT(out_ch == 2 * H);
+            ::ggml_tensor * res  = split_channels(ctx, res_skip, 0, H);
+            ::ggml_tensor * skip = split_channels(ctx, res_skip, H, H);
+            x = ggml_add(ctx, x, res);
+            output = ggml_add(ctx, output, skip);
+        } else {
+            output = ggml_add(ctx, output, res_skip);
+        }
+    }
+
+    return output;
+}
+
+static ::ggml_tensor * sovits_flow_layer_inverse_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * g,
+    const sovits_flow_layer_weights & w,
+    bool             flip_input)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(g != nullptr);
+    GGML_ASSERT(x->ne[0] == kSovitsFlowChannels);
+    GGML_ASSERT(w.pre_w != nullptr);
+    GGML_ASSERT(w.pre_b != nullptr);
+    GGML_ASSERT(w.post_w != nullptr);
+    GGML_ASSERT(w.post_b != nullptr);
+
+    const int64_t half = kSovitsFlowHalfChannels;
+
+    // Split: when flip_input=true swap which half is used as conditioning
+    ::ggml_tensor * x0;  // conditioning half (fed into pre → WN → post)
+    ::ggml_tensor * x1;  // transform half (will be x1 = x1 - m)
+    if (flip_input) {
+        x0 = split_channels(ctx, x, half, half);   // second half → conditioning
+        x1 = split_channels(ctx, x, 0,    half);    // first half  → transform
+    } else {
+        x0 = split_channels(ctx, x, 0,    half);    // first half  → conditioning
+        x1 = split_channels(ctx, x, half, half);    // second half → transform
+    }
+
+    // pre: Conv1d(half, H, k=1)
+    ::ggml_tensor * pre_w_2d = ggml_reshape_2d(ctx, w.pre_w, w.pre_w->ne[1], w.pre_w->ne[2]);
+    ::ggml_tensor * h = linear_2d(ctx, x0, pre_w_2d, w.pre_b);  // {H, T}
+
+    // WaveNet
+    h = sovits_wn_forward(ctx, h, g, w.enc);  // {H, T}
+
+    // post: Conv1d(H, half, k=1) → mean_only → only m, no logs
+    // Inverse step: x1 = (x1 - m) * exp(-logs), with logs=0 → x1 = x1 - m
+    ::ggml_tensor * post_w_2d = ggml_reshape_2d(ctx, w.post_w, w.post_w->ne[1], w.post_w->ne[2]);
+    ::ggml_tensor * m = linear_2d(ctx, h, post_w_2d, w.post_b);  // {half, T}
+    x1 = ggml_sub(ctx, x1, m);  // output is contiguous (no ggml_cont needed)
+
+    // Merge: cat in original channel order
+    // x0 is a view — must make contiguous before concat
+    if (flip_input) {
+        // x1 (modified first half) goes first, x0 (original second half) goes second
+        x0 = ggml_cont(ctx, x0);
+        return ggml_concat(ctx, x1, x0, 0);
+    } else {
+        x0 = ggml_cont(ctx, x0);
+        return ggml_concat(ctx, x0, x1, 0);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Flow block public interface (inference-only, inverse pass)
+// ---------------------------------------------------------------------------
+
+::ggml_tensor * sovits_flow_block_inverse_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * g,
+    const sovits_flow_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(g != nullptr);
+    GGML_ASSERT(x->ne[0] == kSovitsFlowChannels);
+    GGML_ASSERT(g->ne[0] == kSovitsFlowGin);
+
+    // Inverse pass in reverse order, flip_input toggles per layer to
+    // alternate which half is conditioned on — replaces explicit channel flips.
+    bool flip_input = true;
+    for (int i = kSovitsFlowNFlows - 1; i >= 0; --i) {
+        x = sovits_flow_layer_inverse_forward(ctx, x, g, weights.layers[i], flip_input);
+        flip_input = !flip_input;
+    }
+
+    return x;
+}
+
 } // namespace gpt_sovits

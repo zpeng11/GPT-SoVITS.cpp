@@ -445,4 +445,78 @@ void sovits_text_encoder_model_free(sovits_text_encoder_model & model) {
     model.backend = nullptr;
 }
 
+bool sovits_flow_model_load(
+    const std::string & fname,
+    sovits_flow_model & model,
+    ggml_backend_t backend)
+{
+    auto populate = [](struct ggml_context * ctx, sovits_flow_block_weights & w) -> bool {
+        for (int L = 0; L < kSovitsFlowNFlows; ++L) {
+            auto & layer = w.layers[L];
+            char name[64];
+
+            snprintf(name, sizeof(name), "flow.layers.%d.pre_w", L);
+            layer.pre_w = checked_get_tensor(ctx, name);
+            snprintf(name, sizeof(name), "flow.layers.%d.pre_b", L);
+            layer.pre_b = checked_get_tensor(ctx, name);
+
+            snprintf(name, sizeof(name), "flow.layers.%d.post_w", L);
+            layer.post_w = checked_get_tensor(ctx, name);
+            snprintf(name, sizeof(name), "flow.layers.%d.post_b", L);
+            layer.post_b = checked_get_tensor(ctx, name);
+
+            if (!layer.pre_w || !layer.pre_b || !layer.post_w || !layer.post_b) {
+                return false;
+            }
+
+            auto & enc = layer.enc;
+            snprintf(name, sizeof(name), "flow.layers.%d.enc.cond_w", L);
+            enc.cond_w = checked_get_tensor(ctx, name);
+            snprintf(name, sizeof(name), "flow.layers.%d.enc.cond_b", L);
+            enc.cond_b = checked_get_tensor(ctx, name);
+
+            if (!enc.cond_w || !enc.cond_b) {
+                return false;
+            }
+
+            for (int j = 0; j < kSovitsFlowWNLayers; ++j) {
+                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.in_w", L, j);
+                enc.layers[j].in_w = checked_get_tensor(ctx, name);
+                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.in_b", L, j);
+                enc.layers[j].in_b = checked_get_tensor(ctx, name);
+
+                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.rs_w", L, j);
+                enc.layers[j].rs_w = checked_get_tensor(ctx, name);
+                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.rs_b", L, j);
+                enc.layers[j].rs_b = checked_get_tensor(ctx, name);
+
+                if (!enc.layers[j].in_w || !enc.layers[j].in_b
+                    || !enc.layers[j].rs_w || !enc.layers[j].rs_b) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    };
+
+    return load_model_from_gguf(
+        fname,
+        model,
+        backend,
+        populate,
+        sovits_flow_model_free);
+}
+
+void sovits_flow_model_free(sovits_flow_model & model) {
+    if (model.buf_w) {
+        ggml_backend_buffer_free(model.buf_w);
+        model.buf_w = nullptr;
+    }
+    if (model.ctx_w) {
+        ggml_free(model.ctx_w);
+        model.ctx_w = nullptr;
+    }
+    model.backend = nullptr;
+}
+
 } // namespace gpt_sovits
