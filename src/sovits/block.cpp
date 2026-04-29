@@ -714,8 +714,12 @@ static ::ggml_tensor * self_attention_with_relative_position(
     GGML_ASSERT(weights.out_b != nullptr);
     GGML_ASSERT(weights.rel_k != nullptr);
     GGML_ASSERT(weights.rel_v_t != nullptr);
+    GGML_ASSERT(weights.qkv_w->ne[0] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.qkv_w->ne[1] == 3 * kTextEncoderSslHidden);
+    GGML_ASSERT(weights.out_w->ne[0] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.out_w->ne[1] == kTextEncoderSslHidden);
 
-    ::ggml_tensor * qkv = conv1d_with_bias_channels_first(ctx, x, weights.qkv_w, weights.qkv_b, 1, 0);
+    ::ggml_tensor * qkv = linear_2d(ctx, x, weights.qkv_w, weights.qkv_b);
     ::ggml_tensor * q = split_qkv_projection(ctx, qkv, 0);
     ::ggml_tensor * k = split_qkv_projection(ctx, qkv, 1);
     ::ggml_tensor * v = split_qkv_projection(ctx, qkv, 2);
@@ -742,7 +746,7 @@ static ::ggml_tensor * self_attention_with_relative_position(
     ::ggml_tensor * merged = ggml_add(ctx, content_out, rel_out); // {D, T, H}
     merged = merge_heads_3d(ctx, merged, kTextEncoderSslHidden);
 
-    return conv1d_with_bias_channels_first(ctx, merged, weights.out_w, weights.out_b, 1, 0);
+    return linear_2d(ctx, merged, weights.out_w, weights.out_b);
 }
 
 static ::ggml_tensor * relpos_encoder_layer_forward(
@@ -1005,18 +1009,11 @@ static ::ggml_tensor * sovits_text_encoder_ssl_block_forward(
     GGML_ASSERT(weights.ssl_proj_w != nullptr);
     GGML_ASSERT(weights.ssl_proj_b != nullptr);
     GGML_ASSERT(ssl->ne[0] == kTextEncoderSslIn);
-    GGML_ASSERT(weights.ssl_proj_w->ne[0] == 1);
-    GGML_ASSERT(weights.ssl_proj_w->ne[1] == kTextEncoderSslIn);
-    GGML_ASSERT(weights.ssl_proj_w->ne[2] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.ssl_proj_w->ne[0] == kTextEncoderSslIn);
+    GGML_ASSERT(weights.ssl_proj_w->ne[1] == kTextEncoderSslHidden);
     GGML_ASSERT(weights.ssl_proj_b->ne[0] == kTextEncoderSslHidden);
 
-    ::ggml_tensor * x = conv1d_with_bias_channels_first(
-        ctx,
-        ssl,
-        weights.ssl_proj_w,
-        weights.ssl_proj_b,
-        /*stride=*/1,
-        /*padding=*/0);
+    ::ggml_tensor * x = linear_2d(ctx, ssl, weights.ssl_proj_w, weights.ssl_proj_b);
 
     return relpos_encoder_stack_forward(ctx, x, weights.layers);
 }
@@ -1061,58 +1058,30 @@ static ::ggml_tensor * sovits_text_encoder_mrte_block_forward(
     GGML_ASSERT(text->ne[0] == kTextEncoderSslHidden);
     GGML_ASSERT(ge->ne[0] == kTextEncoderMrteHidden);
     GGML_ASSERT(ge->ne[1] == 1);
-    GGML_ASSERT(weights.ssl_fused_w->ne[0] == 1);
-    GGML_ASSERT(weights.ssl_fused_w->ne[1] == kTextEncoderSslHidden);
-    GGML_ASSERT(weights.ssl_fused_w->ne[2] == kTextEncoderMrteSslFusedDim);
+    GGML_ASSERT(weights.ssl_fused_w->ne[0] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.ssl_fused_w->ne[1] == kTextEncoderMrteSslFusedDim);
     GGML_ASSERT(weights.ssl_fused_b->ne[0] == kTextEncoderMrteSslFusedDim);
-    GGML_ASSERT(weights.text_kv_w->ne[0] == 1);
-    GGML_ASSERT(weights.text_kv_w->ne[1] == kTextEncoderSslHidden);
-    GGML_ASSERT(weights.text_kv_w->ne[2] == kTextEncoderMrteKvDim);
+    GGML_ASSERT(weights.text_kv_w->ne[0] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.text_kv_w->ne[1] == kTextEncoderMrteKvDim);
     GGML_ASSERT(weights.text_kv_b->ne[0] == kTextEncoderMrteKvDim);
-    GGML_ASSERT(weights.attn_out_w->ne[0] == 1);
-    GGML_ASSERT(weights.attn_out_w->ne[1] == kTextEncoderMrteHidden);
-    GGML_ASSERT(weights.attn_out_w->ne[2] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.attn_out_w->ne[0] == kTextEncoderMrteHidden);
+    GGML_ASSERT(weights.attn_out_w->ne[1] == kTextEncoderSslHidden);
     GGML_ASSERT(weights.attn_out_b->ne[0] == kTextEncoderSslHidden);
-    GGML_ASSERT(weights.ge_out_w->ne[0] == 1);
-    GGML_ASSERT(weights.ge_out_w->ne[1] == kTextEncoderMrteHidden);
-    GGML_ASSERT(weights.ge_out_w->ne[2] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.ge_out_w->ne[0] == kTextEncoderMrteHidden);
+    GGML_ASSERT(weights.ge_out_w->ne[1] == kTextEncoderSslHidden);
     GGML_ASSERT(weights.ge_out_b->ne[0] == kTextEncoderSslHidden);
 
-    ::ggml_tensor * ssl_fused = conv1d_with_bias_channels_first(
-        ctx,
-        ssl,
-        weights.ssl_fused_w,
-        weights.ssl_fused_b,
-        /*stride=*/1,
-        /*padding=*/0);
+    ::ggml_tensor * ssl_fused = linear_2d(ctx, ssl, weights.ssl_fused_w, weights.ssl_fused_b);
     ::ggml_tensor * q = split_channels(ctx, ssl_fused, 0, kTextEncoderMrteQDim);
     ::ggml_tensor * skip = split_channels(ctx, ssl_fused, kTextEncoderMrteQDim, kTextEncoderMrteSkipDim);
 
-    ::ggml_tensor * text_kv = conv1d_with_bias_channels_first(
-        ctx,
-        text,
-        weights.text_kv_w,
-        weights.text_kv_b,
-        /*stride=*/1,
-        /*padding=*/0);
+    ::ggml_tensor * text_kv = linear_2d(ctx, text, weights.text_kv_w, weights.text_kv_b);
     ::ggml_tensor * k = split_channels(ctx, text_kv, 0, kTextEncoderMrteHidden);
     ::ggml_tensor * v = split_channels(ctx, text_kv, kTextEncoderMrteHidden, kTextEncoderMrteHidden);
 
     ::ggml_tensor * attn = mrte_cross_attention_from_qkv(ctx, q, k, v);
-    ::ggml_tensor * attn_out = conv1d_with_bias_channels_first(
-        ctx,
-        attn,
-        weights.attn_out_w,
-        weights.attn_out_b,
-        /*stride=*/1,
-        /*padding=*/0);
-    ::ggml_tensor * ge_out = conv1d_with_bias_channels_first(
-        ctx,
-        ge,
-        weights.ge_out_w,
-        weights.ge_out_b,
-        /*stride=*/1,
-        /*padding=*/0);
+    ::ggml_tensor * attn_out = linear_2d(ctx, attn, weights.attn_out_w, weights.attn_out_b);
+    ::ggml_tensor * ge_out = linear_2d(ctx, ge, weights.ge_out_w, weights.ge_out_b);
     ge_out = ggml_repeat(ctx, ge_out, skip);
 
     return ggml_add(ctx, ggml_add(ctx, attn_out, skip), ge_out);
@@ -1143,9 +1112,8 @@ sovits_text_encoder_result sovits_text_encoder_block_forward(
     GGML_ASSERT(ge != nullptr);
     GGML_ASSERT(weights.post.proj_w != nullptr);
     GGML_ASSERT(weights.post.proj_b != nullptr);
-    GGML_ASSERT(weights.post.proj_w->ne[0] == 1);
-    GGML_ASSERT(weights.post.proj_w->ne[1] == kTextEncoderSslHidden);
-    GGML_ASSERT(weights.post.proj_w->ne[2] == 2 * kTextEncoderSslHidden);
+    GGML_ASSERT(weights.post.proj_w->ne[0] == kTextEncoderSslHidden);
+    GGML_ASSERT(weights.post.proj_w->ne[1] == 2 * kTextEncoderSslHidden);
     GGML_ASSERT(weights.post.proj_b->ne[0] == 2 * kTextEncoderSslHidden);
 
     ::ggml_tensor * ssl_x = sovits_text_encoder_ssl_block_forward(ctx, ssl, weights.ssl);
@@ -1153,13 +1121,7 @@ sovits_text_encoder_result sovits_text_encoder_block_forward(
     ::ggml_tensor * fused = sovits_text_encoder_mrte_block_forward(ctx, ssl_x, text_x, ge, weights.mrte);
     ::ggml_tensor * x = sovits_text_encoder_post_block_forward(ctx, fused, weights.post);
 
-    ::ggml_tensor * stats = conv1d_with_bias_channels_first(
-        ctx,
-        x,
-        weights.post.proj_w,
-        weights.post.proj_b,
-        /*stride=*/1,
-        /*padding=*/0);
+    ::ggml_tensor * stats = linear_2d(ctx, x, weights.post.proj_w, weights.post.proj_b);
 
     sovits_text_encoder_result result;
     result.x = x;

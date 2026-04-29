@@ -2,10 +2,15 @@
 """Convert full SoVITS v2 `enc_p` weights to a single GGUF.
 
 Usage:
-    python convert_sovits_text_encoder_to_gguf.py <sovits_ckpt> [--output <path>] [--type f32|f16]
+    python convert_sovits_text_encoder_to_gguf.py <sovits_ckpt> [--output <path>] [--type f32|f16|q8|q5|q4]
 
-This converter is torch-free. It reads the checkpoint with `torch_ckpt_utils`
-and exports the tensors needed by `sovits_text_encoder_block_weights`.
+This converter exports the optimized tensor layout consumed by
+`src/sovits/block.cpp`:
+
+* all Conv1d(kernel=1) weights are exported as 2D linear weights
+* relative-position tensors stay prepacked for inference
+* MRTE weights are fused offline into the exact runtime projections
+* only 2D weights are quantized for weight-only inference
 """
 
 from __future__ import annotations
@@ -22,6 +27,9 @@ from torch_ckpt_utils import load_checkpoint
 GGML_TYPES = {
     "f32": gguf.GGMLQuantizationType.F32,
     "f16": gguf.GGMLQuantizationType.F16,
+    "q8": gguf.GGMLQuantizationType.Q8_0,
+    "q5": gguf.GGMLQuantizationType.Q5_0,
+    "q4": gguf.GGMLQuantizationType.Q4_0,
 }
 
 
@@ -84,30 +92,25 @@ for i in range(3):
     ])
 
 
+def _linearize_conv1x1(weight: np.ndarray, bias: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    if weight.ndim != 3 or weight.shape[2] != 1:
+        raise ValueError(f"Expected Conv1d(kernel=1) weight, got shape {weight.shape}")
+    return weight[:, :, 0].astype(np.float32), bias.astype(np.float32)
+
+
 def _fused_qkv(weights: dict[str, np.ndarray], prefix: str) -> tuple[np.ndarray, np.ndarray]:
-    q_w = weights[f"{prefix}.conv_q.weight"]
-    k_w = weights[f"{prefix}.conv_k.weight"]
-    v_w = weights[f"{prefix}.conv_v.weight"]
-    q_b = weights[f"{prefix}.conv_q.bias"]
-    k_b = weights[f"{prefix}.conv_k.bias"]
-    v_b = weights[f"{prefix}.conv_v.bias"]
+    q_w, q_b = _linearize_conv1x1(weights[f"{prefix}.conv_q.weight"], weights[f"{prefix}.conv_q.bias"])
+    k_w, k_b = _linearize_conv1x1(weights[f"{prefix}.conv_k.weight"], weights[f"{prefix}.conv_k.bias"])
+    v_w, v_b = _linearize_conv1x1(weights[f"{prefix}.conv_v.weight"], weights[f"{prefix}.conv_v.bias"])
     return np.concatenate([q_w, k_w, v_w], axis=0), np.concatenate([q_b, k_b, v_b], axis=0)
 
 
 def _packed_rel_k(weights: dict[str, np.ndarray], prefix: str) -> np.ndarray:
-    rel_k = weights[f"{prefix}.emb_rel_k"]
-    return rel_k[0].copy()
+    return weights[f"{prefix}.emb_rel_k"][0].astype(np.float32).copy()
 
 
 def _packed_rel_v_t(weights: dict[str, np.ndarray], prefix: str) -> np.ndarray:
-    rel_v = weights[f"{prefix}.emb_rel_v"]
-    return rel_v[0].transpose(1, 0).copy()
-
-
-def _linearize_conv1x1(weight: np.ndarray, bias: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    if weight.shape[2] != 1:
-        raise ValueError(f"Expected Conv1d(kernel=1) weight, got shape {weight.shape}")
-    return weight[:, :, 0].astype(np.float32), bias.astype(np.float32)
+    return weights[f"{prefix}.emb_rel_v"][0].transpose(1, 0).astype(np.float32).copy()
 
 
 def _compose_affine(
@@ -119,16 +122,47 @@ def _compose_affine(
     return w2 @ w1, w2 @ b1 + b2
 
 
-def _stack_conv1x1(weights: list[np.ndarray], biases: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+def _stack_weights(weights: list[np.ndarray], biases: list[np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
     return np.concatenate(weights, axis=0), np.concatenate(biases, axis=0)
 
 
-def _convert_tensor(gguf_name: str, tensor_np: np.ndarray, target_type) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
+def _convert_tensor(
+    gguf_name: str,
+    tensor_np: np.ndarray,
+    target_type,
+) -> tuple[np.ndarray, gguf.GGMLQuantizationType]:
+    if gguf_name.endswith("text_embedding"):
+        return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
+
     if gguf_name.endswith("ffn_up_w") or gguf_name.endswith("ffn_down_w"):
         return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
-    if target_type == gguf.GGMLQuantizationType.F16 and tensor_np.ndim >= 2:
+
+    if tensor_np.ndim <= 1:
+        return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
+
+    if target_type == gguf.GGMLQuantizationType.F32:
+        return tensor_np.astype(np.float32), target_type
+
+    if target_type == gguf.GGMLQuantizationType.F16:
         return tensor_np.astype(np.float16), target_type
+
+    if tensor_np.ndim == 2:
+        block_size = gguf.GGML_QUANT_SIZES[target_type][0]
+        if tensor_np.shape[1] % block_size == 0:
+            quantized = gguf.quantize(tensor_np.astype(np.float32), target_type)
+            return quantized, target_type
+
     return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
+
+
+def _prepare_direct_tensor(gguf_name: str, tensor_np: np.ndarray) -> np.ndarray:
+    if gguf_name.endswith("text_embedding"):
+        return tensor_np.astype(np.float32).copy()
+
+    if gguf_name.endswith("_w") and tensor_np.ndim == 3 and tensor_np.shape[2] == 1:
+        return tensor_np[:, :, 0].astype(np.float32).copy()
+
+    return tensor_np.astype(np.float32)
 
 
 def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
@@ -146,6 +180,7 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     writer = gguf.GGUFWriter(output_path, "sovits_text_encoder")
     writer.add_string("sovits.block", "text_encoder")
     writer.add_string("sovits.version", version)
+    writer.add_string("sovits.text_encoder.layout", "optimized_v2")
     writer.add_uint32("sovits.text_encoder.ssl_in_dim", 768)
     writer.add_uint32("sovits.text_encoder.hidden_dim", 192)
     writer.add_uint32("sovits.text_encoder.ffn_dim", 768)
@@ -161,74 +196,36 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
 
     n_converted = 0
 
-    for i in range(3):
-        prefix = f"enc_p.encoder_ssl.attn_layers.{i}"
-        qkv_w, qkv_b = _fused_qkv(weights, prefix)
-        rel_k = _packed_rel_k(weights, prefix).astype(np.float32)
-        rel_v_t = _packed_rel_v_t(weights, prefix).astype(np.float32)
+    for section, n_layers in (("ssl", 3), ("text", 6), ("post", 3)):
+        branch = {
+            "ssl": "encoder_ssl",
+            "text": "encoder_text",
+            "post": "encoder2",
+        }[section]
 
-        qkv_w, qkv_type = _convert_tensor(f"text_encoder_ssl.layers.{i}.qkv_w", qkv_w, target_type)
-        writer.add_tensor(f"text_encoder_ssl.layers.{i}.qkv_w", qkv_w, raw_dtype=qkv_type)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.qkv_w':36s} <- fused q/k/v weights     {list(qkv_w.shape)!s:16s} {qkv_w.dtype}")
+        for i in range(n_layers):
+            prefix = f"enc_p.{branch}.attn_layers.{i}"
+            qkv_w, qkv_b = _fused_qkv(weights, prefix)
+            rel_k = _packed_rel_k(weights, prefix)
+            rel_v_t = _packed_rel_v_t(weights, prefix)
 
-        writer.add_tensor(f"text_encoder_ssl.layers.{i}.qkv_b", qkv_b.astype(np.float32), raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.qkv_b':36s} <- fused q/k/v bias        {list(qkv_b.shape)!s:16s} {qkv_b.dtype}")
+            name_base = f"text_encoder_{section}.layers.{i}"
+            qkv_w, qkv_type = _convert_tensor(f"{name_base}.qkv_w", qkv_w, target_type)
+            writer.add_tensor(f"{name_base}.qkv_w", qkv_w, raw_dtype=qkv_type)
+            n_converted += 1
+            print(f"  [{n_converted:3d}] {name_base + '.qkv_w':36s} <- fused q/k/v weights     {list(qkv_w.shape)!s:16s} {qkv_type.name}")
 
-        writer.add_tensor(f"text_encoder_ssl.layers.{i}.rel_k", rel_k, raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.rel_k':36s} <- packed rel_k            {list(rel_k.shape)!s:16s} {rel_k.dtype}")
+            writer.add_tensor(f"{name_base}.qkv_b", qkv_b.astype(np.float32), raw_dtype=gguf.GGMLQuantizationType.F32)
+            n_converted += 1
+            print(f"  [{n_converted:3d}] {name_base + '.qkv_b':36s} <- fused q/k/v bias        {list(qkv_b.shape)!s:16s} float32")
 
-        writer.add_tensor(f"text_encoder_ssl.layers.{i}.rel_v_t", rel_v_t, raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_ssl.layers.' + str(i) + '.rel_v_t':36s} <- packed rel_v_t          {list(rel_v_t.shape)!s:16s} {rel_v_t.dtype}")
+            writer.add_tensor(f"{name_base}.rel_k", rel_k, raw_dtype=gguf.GGMLQuantizationType.F32)
+            n_converted += 1
+            print(f"  [{n_converted:3d}] {name_base + '.rel_k':36s} <- packed rel_k            {list(rel_k.shape)!s:16s} float32")
 
-    for i in range(6):
-        prefix = f"enc_p.encoder_text.attn_layers.{i}"
-        qkv_w, qkv_b = _fused_qkv(weights, prefix)
-        rel_k = _packed_rel_k(weights, prefix).astype(np.float32)
-        rel_v_t = _packed_rel_v_t(weights, prefix).astype(np.float32)
-
-        qkv_w, qkv_type = _convert_tensor(f"text_encoder_text.layers.{i}.qkv_w", qkv_w, target_type)
-        writer.add_tensor(f"text_encoder_text.layers.{i}.qkv_w", qkv_w, raw_dtype=qkv_type)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_text.layers.' + str(i) + '.qkv_w':36s} <- fused q/k/v weights     {list(qkv_w.shape)!s:16s} {qkv_w.dtype}")
-
-        writer.add_tensor(f"text_encoder_text.layers.{i}.qkv_b", qkv_b.astype(np.float32), raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_text.layers.' + str(i) + '.qkv_b':36s} <- fused q/k/v bias        {list(qkv_b.shape)!s:16s} {qkv_b.dtype}")
-
-        writer.add_tensor(f"text_encoder_text.layers.{i}.rel_k", rel_k, raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_text.layers.' + str(i) + '.rel_k':36s} <- packed rel_k            {list(rel_k.shape)!s:16s} {rel_k.dtype}")
-
-        writer.add_tensor(f"text_encoder_text.layers.{i}.rel_v_t", rel_v_t, raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_text.layers.' + str(i) + '.rel_v_t':36s} <- packed rel_v_t          {list(rel_v_t.shape)!s:16s} {rel_v_t.dtype}")
-
-    for i in range(3):
-        prefix = f"enc_p.encoder2.attn_layers.{i}"
-        qkv_w, qkv_b = _fused_qkv(weights, prefix)
-        rel_k = _packed_rel_k(weights, prefix).astype(np.float32)
-        rel_v_t = _packed_rel_v_t(weights, prefix).astype(np.float32)
-
-        qkv_w, qkv_type = _convert_tensor(f"text_encoder_post.layers.{i}.qkv_w", qkv_w, target_type)
-        writer.add_tensor(f"text_encoder_post.layers.{i}.qkv_w", qkv_w, raw_dtype=qkv_type)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_post.layers.' + str(i) + '.qkv_w':36s} <- fused q/k/v weights     {list(qkv_w.shape)!s:16s} {qkv_w.dtype}")
-
-        writer.add_tensor(f"text_encoder_post.layers.{i}.qkv_b", qkv_b.astype(np.float32), raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_post.layers.' + str(i) + '.qkv_b':36s} <- fused q/k/v bias        {list(qkv_b.shape)!s:16s} {qkv_b.dtype}")
-
-        writer.add_tensor(f"text_encoder_post.layers.{i}.rel_k", rel_k, raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_post.layers.' + str(i) + '.rel_k':36s} <- packed rel_k            {list(rel_k.shape)!s:16s} {rel_k.dtype}")
-
-        writer.add_tensor(f"text_encoder_post.layers.{i}.rel_v_t", rel_v_t, raw_dtype=gguf.GGMLQuantizationType.F32)
-        n_converted += 1
-        print(f"  [{n_converted:2d}] {'text_encoder_post.layers.' + str(i) + '.rel_v_t':36s} <- packed rel_v_t          {list(rel_v_t.shape)!s:16s} {rel_v_t.dtype}")
+            writer.add_tensor(f"{name_base}.rel_v_t", rel_v_t, raw_dtype=gguf.GGMLQuantizationType.F32)
+            n_converted += 1
+            print(f"  [{n_converted:3d}] {name_base + '.rel_v_t':36s} <- packed rel_v_t          {list(rel_v_t.shape)!s:16s} float32")
 
     c_pre_w, c_pre_b = _linearize_conv1x1(weights["enc_p.mrte.c_pre.weight"], weights["enc_p.mrte.c_pre.bias"])
     text_pre_w, text_pre_b = _linearize_conv1x1(weights["enc_p.mrte.text_pre.weight"], weights["enc_p.mrte.text_pre.bias"])
@@ -249,17 +246,17 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     skip_from_ssl_b = skip_from_ssl_b - c_post_b
     attn_out_b = attn_out_b - c_post_b
 
-    ssl_fused_w, ssl_fused_b = _stack_conv1x1([q_fused_w, skip_from_ssl_w], [q_fused_b, skip_from_ssl_b])
-    text_kv_w, text_kv_b = _stack_conv1x1([k_fused_w, v_fused_w], [k_fused_b, v_fused_b])
+    ssl_fused_w, ssl_fused_b = _stack_weights([q_fused_w, skip_from_ssl_w], [q_fused_b, skip_from_ssl_b])
+    text_kv_w, text_kv_b = _stack_weights([k_fused_w, v_fused_w], [k_fused_b, v_fused_b])
 
     mrte_tensors = [
-        ("text_encoder_mrte.ssl_fused_w", ssl_fused_w[:, :, None]),
+        ("text_encoder_mrte.ssl_fused_w", ssl_fused_w),
         ("text_encoder_mrte.ssl_fused_b", ssl_fused_b),
-        ("text_encoder_mrte.text_kv_w", text_kv_w[:, :, None]),
+        ("text_encoder_mrte.text_kv_w", text_kv_w),
         ("text_encoder_mrte.text_kv_b", text_kv_b),
-        ("text_encoder_mrte.attn_out_w", attn_out_w[:, :, None]),
+        ("text_encoder_mrte.attn_out_w", attn_out_w),
         ("text_encoder_mrte.attn_out_b", attn_out_b),
-        ("text_encoder_mrte.ge_out_w", ge_out_w[:, :, None]),
+        ("text_encoder_mrte.ge_out_w", ge_out_w),
         ("text_encoder_mrte.ge_out_b", ge_out_b),
     ]
 
@@ -267,7 +264,7 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
         tensor_np, tensor_type = _convert_tensor(gguf_name, tensor_np, target_type)
         writer.add_tensor(gguf_name, tensor_np, raw_dtype=tensor_type)
         n_converted += 1
-        print(f"  [{n_converted:2d}] {gguf_name:36s} <- fused MRTE                {list(tensor_np.shape)!s:16s} {tensor_np.dtype}")
+        print(f"  [{n_converted:3d}] {gguf_name:36s} <- fused MRTE                {list(tensor_np.shape)!s:16s} {tensor_type.name}")
 
     for mapping in (TEXT_ENCODER_SSL_MAP, TEXT_ENCODER_TEXT_MAP, TEXT_ENCODER_POST_MAP):
         for gguf_name, ckpt_name in mapping:
@@ -277,11 +274,14 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
                     f"(needed for GGUF tensor '{gguf_name}')"
                 )
 
-            tensor_np = weights[ckpt_name]
+            if gguf_name.endswith("qkv_w") or gguf_name.endswith("qkv_b"):
+                continue
+
+            tensor_np = _prepare_direct_tensor(gguf_name, weights[ckpt_name])
             tensor_np, tensor_type = _convert_tensor(gguf_name, tensor_np, target_type)
             writer.add_tensor(gguf_name, tensor_np, raw_dtype=tensor_type)
             n_converted += 1
-            print(f"  [{n_converted:2d}] {gguf_name:36s} <- {ckpt_name:48s} {list(tensor_np.shape)!s:16s} {tensor_np.dtype}")
+            print(f"  [{n_converted:3d}] {gguf_name:36s} <- {ckpt_name:48s} {list(tensor_np.shape)!s:16s} {tensor_type.name}")
 
     print(f"\nConverted {n_converted} tensors")
     print(f"Writing GGUF to {output_path}...")

@@ -23,6 +23,12 @@ static const std::string kModelF16 =
     kTestDir + "models/v2-text-encoder-f16.gguf";
 static const std::string kModelF32 =
     kTestDir + "models/v2-text-encoder-f32.gguf";
+static const std::string kModelQ8 =
+    kTestDir + "models/v2-text-encoder-q8.gguf";
+static const std::string kModelQ5 =
+    kTestDir + "models/v2-text-encoder-q5.gguf";
+static const std::string kModelQ4 =
+    kTestDir + "models/v2-text-encoder-q4.gguf";
 static const std::string kRefDir = kTestDir + "ref/";
 static const std::string kRefQuantizedInputNpy = kRefDir + "v2_enc_p_input_quantized.npy";
 static const std::string kRefTextInputNpy = kRefDir + "v2_enc_p_input_text.npy";
@@ -51,6 +57,17 @@ struct ErrorStats {
 struct NpyShapeInfo {
     std::vector<float> data;
     std::vector<size_t> shape;
+};
+
+struct TextEncoderRefData {
+    std::vector<float> packed_quantized;
+    std::vector<int32_t> text;
+    std::vector<float> packed_ge;
+    std::vector<float> expected_x;
+    std::vector<float> expected_m;
+    std::vector<float> expected_logs;
+    int64_t ssl_time = 0;
+    int64_t text_time = 0;
 };
 
 struct GraphContext {
@@ -176,6 +193,176 @@ static std::vector<float> pack_bct_to_ggml(
     return packed;
 }
 
+static bool file_exists(const std::string & path) {
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) {
+        return false;
+    }
+    fclose(f);
+    return true;
+}
+
+static TextEncoderRefData load_text_encoder_ref_data() {
+    EXPECT_TRUE(file_exists(kRefQuantizedInputNpy));
+    EXPECT_TRUE(file_exists(kRefTextInputNpy));
+    EXPECT_TRUE(file_exists(kRefGeInputNpy));
+    EXPECT_TRUE(file_exists(kRefXOutputNpy));
+    EXPECT_TRUE(file_exists(kRefMOutputNpy));
+    EXPECT_TRUE(file_exists(kRefLogsOutputNpy));
+
+    const auto ref_quantized = load_npy_with_shape(kRefQuantizedInputNpy);
+    const std::vector<int32_t> ref_text = load_npy_as_i32(kRefTextInputNpy);
+    const auto ref_ge = load_npy_with_shape(kRefGeInputNpy);
+    const auto ref_x = load_npy_with_shape(kRefXOutputNpy);
+    const auto ref_m = load_npy_with_shape(kRefMOutputNpy);
+    const auto ref_logs = load_npy_with_shape(kRefLogsOutputNpy);
+
+    EXPECT_FALSE(ref_quantized.data.empty());
+    EXPECT_FALSE(ref_text.empty());
+    EXPECT_FALSE(ref_ge.data.empty());
+    EXPECT_FALSE(ref_x.data.empty());
+    EXPECT_FALSE(ref_m.data.empty());
+    EXPECT_FALSE(ref_logs.data.empty());
+
+    EXPECT_EQ(ref_quantized.shape.size(), 3u);
+    EXPECT_EQ(ref_quantized.shape[0], 1u);
+    EXPECT_EQ(ref_quantized.shape[1], static_cast<size_t>(kSslIn));
+
+    EXPECT_EQ(ref_ge.shape.size(), 3u);
+    EXPECT_EQ(ref_ge.shape[0], 1u);
+    EXPECT_EQ(ref_ge.shape[1], static_cast<size_t>(kGeDim));
+    EXPECT_EQ(ref_ge.shape[2], 1u);
+
+    EXPECT_EQ(ref_x.shape.size(), 3u);
+    EXPECT_EQ(ref_x.shape[0], 1u);
+    EXPECT_EQ(ref_x.shape[1], static_cast<size_t>(kOutChannels));
+    EXPECT_EQ(ref_m.shape.size(), 3u);
+    EXPECT_EQ(ref_m.shape[0], 1u);
+    EXPECT_EQ(ref_m.shape[1], static_cast<size_t>(kOutChannels));
+    EXPECT_EQ(ref_logs.shape.size(), 3u);
+    EXPECT_EQ(ref_logs.shape[0], 1u);
+    EXPECT_EQ(ref_logs.shape[1], static_cast<size_t>(kOutChannels));
+    EXPECT_EQ(ref_x.shape[2], ref_quantized.shape[2]);
+    EXPECT_EQ(ref_m.shape[2], ref_quantized.shape[2]);
+    EXPECT_EQ(ref_logs.shape[2], ref_quantized.shape[2]);
+
+    TextEncoderRefData data;
+    data.ssl_time = static_cast<int64_t>(ref_quantized.shape[2]);
+    data.text_time = static_cast<int64_t>(ref_text.size());
+    data.text = ref_text;
+    data.packed_quantized = pack_bct_to_ggml(ref_quantized.data, ref_quantized.shape, kSslIn);
+    data.packed_ge = pack_bct_to_ggml(ref_ge.data, ref_ge.shape, kGeDim);
+    data.expected_x = pack_bct_to_ggml(ref_x.data, ref_x.shape, kOutChannels);
+    data.expected_m = pack_bct_to_ggml(ref_m.data, ref_m.shape, kOutChannels);
+    data.expected_logs = pack_bct_to_ggml(ref_logs.data, ref_logs.shape, kOutChannels);
+
+    EXPECT_GT(data.ssl_time, 0);
+    EXPECT_GT(data.text_time, 0);
+    EXPECT_EQ(data.packed_quantized.size(), static_cast<size_t>(kSslIn * data.ssl_time));
+    EXPECT_EQ(data.packed_ge.size(), static_cast<size_t>(kGeDim));
+    EXPECT_EQ(data.expected_x.size(), static_cast<size_t>(kOutChannels * data.ssl_time));
+    EXPECT_EQ(data.expected_m.size(), static_cast<size_t>(kOutChannels * data.ssl_time));
+    EXPECT_EQ(data.expected_logs.size(), static_cast<size_t>(kOutChannels * data.ssl_time));
+
+    return data;
+}
+
+static void run_text_encoder_parity(
+    const std::string & model_path,
+    const char * label,
+    double max_abs_tol,
+    double rmse_tol)
+{
+    ASSERT_TRUE(file_exists(model_path));
+    TextEncoderRefData ref = load_text_encoder_ref_data();
+
+    ggml_backend_t backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::sovits_text_encoder_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_text_encoder_model_load(model_path, model, backend));
+
+    GraphContext gctx(kMaxNodes);
+    ASSERT_NE(gctx.ctx, nullptr);
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+    ASSERT_NE(gf, nullptr);
+
+    struct ggml_tensor * ssl = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kSslIn, ref.ssl_time);
+    ggml_set_input(ssl);
+    struct ggml_tensor * text = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, ref.text_time);
+    ggml_set_input(text);
+    struct ggml_tensor * ge = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeDim, 1);
+    ggml_set_input(ge);
+
+    const gpt_sovits::sovits_text_encoder_result out =
+        gpt_sovits::sovits_text_encoder_block_forward(gctx, ssl, text, ge, model.weights);
+    ASSERT_NE(out.x, nullptr);
+    ASSERT_NE(out.m, nullptr);
+    ASSERT_NE(out.logs, nullptr);
+
+    struct ggml_tensor * x_out = ggml_cont(gctx, out.x);
+    struct ggml_tensor * m_out = ggml_cont(gctx, out.m);
+    struct ggml_tensor * logs_out = ggml_cont(gctx, out.logs);
+    ASSERT_NE(x_out, nullptr);
+    ASSERT_NE(m_out, nullptr);
+    ASSERT_NE(logs_out, nullptr);
+    ggml_set_output(x_out);
+    ggml_set_output(m_out);
+    ggml_set_output(logs_out);
+
+    ggml_build_forward_expand(gf, x_out);
+    ggml_build_forward_expand(gf, m_out);
+    ggml_build_forward_expand(gf, logs_out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    ASSERT_NE(alloc, nullptr);
+    ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+    ggml_backend_tensor_set(ssl, ref.packed_quantized.data(), 0, ref.packed_quantized.size() * sizeof(float));
+    ggml_backend_tensor_set(text, ref.text.data(), 0, ref.text.size() * sizeof(int32_t));
+    ggml_backend_tensor_set(ge, ref.packed_ge.data(), 0, ref.packed_ge.size() * sizeof(float));
+    ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+
+    const size_t out_elems = static_cast<size_t>(kOutChannels * ref.ssl_time);
+    const size_t out_nbytes = out_elems * sizeof(float);
+    std::vector<float> actual_x(out_elems);
+    std::vector<float> actual_m(out_elems);
+    std::vector<float> actual_logs(out_elems);
+    ggml_backend_tensor_get(x_out, actual_x.data(), 0, out_nbytes);
+    ggml_backend_tensor_get(m_out, actual_m.data(), 0, out_nbytes);
+    ggml_backend_tensor_get(logs_out, actual_logs.data(), 0, out_nbytes);
+
+    const auto err_x = compute_errors(actual_x, ref.expected_x);
+    const auto err_m = compute_errors(actual_m, ref.expected_m);
+    const auto err_logs = compute_errors(actual_logs, ref.expected_logs);
+    printf("[text_encoder %s parity] Tssl=%lld Ttext=%lld x(max_abs=%.6f rmse=%.6f mean_abs=%.6f) m(max_abs=%.6f rmse=%.6f mean_abs=%.6f) logs(max_abs=%.6f rmse=%.6f mean_abs=%.6f)\n",
+           label,
+           static_cast<long long>(ref.ssl_time),
+           static_cast<long long>(ref.text_time),
+           err_x.max_abs,
+           err_x.rmse,
+           err_x.mean_abs,
+           err_m.max_abs,
+           err_m.rmse,
+           err_m.mean_abs,
+           err_logs.max_abs,
+           err_logs.rmse,
+           err_logs.mean_abs);
+
+    EXPECT_LT(err_x.max_abs, max_abs_tol);
+    EXPECT_LT(err_x.rmse, rmse_tol);
+    EXPECT_LT(err_m.max_abs, max_abs_tol);
+    EXPECT_LT(err_m.rmse, rmse_tol);
+    EXPECT_LT(err_logs.max_abs, max_abs_tol);
+    EXPECT_LT(err_logs.rmse, rmse_tol);
+
+    ggml_gallocr_free(alloc);
+    gpt_sovits::sovits_text_encoder_model_free(model);
+    ggml_backend_free(backend);
+}
+
 // Helper: skip test if model file not found.
 #define ASSERT_MODEL_EXISTS(path) do { \
     FILE * f = fopen(path.c_str(), "rb"); \
@@ -217,14 +404,22 @@ TEST(SoVITSTextEncoder, WeightPointersAndShapesLookCorrect) {
     ASSERT_NE(w.post.proj_w, nullptr);
     ASSERT_NE(w.post.proj_b, nullptr);
 
-    EXPECT_EQ(w.ssl.ssl_proj_w->ne[0], 1);
-    EXPECT_EQ(w.ssl.ssl_proj_w->ne[1], kSslIn);
-    EXPECT_EQ(w.ssl.ssl_proj_w->ne[2], kHidden);
+    EXPECT_EQ(w.ssl.ssl_proj_w->ne[0], kSslIn);
+    EXPECT_EQ(w.ssl.ssl_proj_w->ne[1], kHidden);
     EXPECT_EQ(w.text.text_embedding->ne[0], kHidden);
     EXPECT_EQ(w.text.text_embedding->ne[1], kTextVocab);
-    EXPECT_EQ(w.post.proj_w->ne[0], 1);
-    EXPECT_EQ(w.post.proj_w->ne[1], kHidden);
-    EXPECT_EQ(w.post.proj_w->ne[2], 2 * kOutChannels);
+    EXPECT_EQ(w.ssl.layers[0].qkv_w->ne[0], kHidden);
+    EXPECT_EQ(w.ssl.layers[0].qkv_w->ne[1], 3 * kHidden);
+    EXPECT_EQ(w.ssl.layers[0].out_w->ne[0], kHidden);
+    EXPECT_EQ(w.ssl.layers[0].out_w->ne[1], kHidden);
+    EXPECT_EQ(w.mrte.ssl_fused_w->ne[0], kHidden);
+    EXPECT_EQ(w.mrte.ssl_fused_w->ne[1], 704);
+    EXPECT_EQ(w.mrte.text_kv_w->ne[0], kHidden);
+    EXPECT_EQ(w.mrte.text_kv_w->ne[1], 1024);
+    EXPECT_EQ(w.mrte.attn_out_w->ne[0], kGeDim);
+    EXPECT_EQ(w.mrte.attn_out_w->ne[1], kHidden);
+    EXPECT_EQ(w.post.proj_w->ne[0], kHidden);
+    EXPECT_EQ(w.post.proj_w->ne[1], 2 * kOutChannels);
     EXPECT_EQ(w.post.proj_b->ne[0], 2 * kOutChannels);
 
     gpt_sovits::sovits_text_encoder_model_free(model);
@@ -332,178 +527,209 @@ TEST(SoVITSTextEncoder, FreeOnEmptyModelIsSafe) {
 }
 
 TEST(SoVITSTextEncoder, MatchesPythonReference) {
-    ASSERT_MODEL_EXISTS(kModelF32);
-    ASSERT_MODEL_EXISTS(kRefQuantizedInputNpy);
-    ASSERT_MODEL_EXISTS(kRefTextInputNpy);
-    ASSERT_MODEL_EXISTS(kRefGeInputNpy);
-    ASSERT_MODEL_EXISTS(kRefXOutputNpy);
-    ASSERT_MODEL_EXISTS(kRefMOutputNpy);
-    ASSERT_MODEL_EXISTS(kRefLogsOutputNpy);
+    run_text_encoder_parity(kModelF32, "f32", kParityMaxAbsTol, kParityRmseTol);
+}
 
-    const auto ref_quantized = load_npy_with_shape(kRefQuantizedInputNpy);
-    const std::vector<int32_t> ref_text = load_npy_as_i32(kRefTextInputNpy);
-    const auto ref_ge = load_npy_with_shape(kRefGeInputNpy);
-    const auto ref_x = load_npy_with_shape(kRefXOutputNpy);
-    const auto ref_m = load_npy_with_shape(kRefMOutputNpy);
-    const auto ref_logs = load_npy_with_shape(kRefLogsOutputNpy);
-    ASSERT_FALSE(ref_quantized.data.empty());
-    ASSERT_FALSE(ref_text.empty());
-    ASSERT_FALSE(ref_ge.data.empty());
-    ASSERT_FALSE(ref_x.data.empty());
-    ASSERT_FALSE(ref_m.data.empty());
-    ASSERT_FALSE(ref_logs.data.empty());
+TEST(SoVITSTextEncoder, QuantizedQ8MatchesPythonReference) {
+    run_text_encoder_parity(kModelQ8, "q8", 6.0e-2, 8.0e-3);
+}
 
-    ASSERT_EQ(ref_quantized.shape.size(), 3u);
-    ASSERT_EQ(ref_quantized.shape[0], 1u);
-    ASSERT_EQ(ref_quantized.shape[1], static_cast<size_t>(kSslIn));
+TEST(SoVITSTextEncoder, QuantizedQ5MatchesPythonReference) {
+    run_text_encoder_parity(kModelQ5, "q5", 1.2e-1, 1.8e-2);
+}
 
-    ASSERT_EQ(ref_ge.shape.size(), 3u);
-    ASSERT_EQ(ref_ge.shape[0], 1u);
-    ASSERT_EQ(ref_ge.shape[1], static_cast<size_t>(kGeDim));
-    ASSERT_EQ(ref_ge.shape[2], 1u);
+TEST(SoVITSTextEncoder, QuantizedQ4MatchesPythonReference) {
+    run_text_encoder_parity(kModelQ4, "q4", 2.0e-1, 3.0e-2);
+}
 
-    ASSERT_EQ(ref_x.shape.size(), 3u);
-    ASSERT_EQ(ref_x.shape[0], 1u);
-    ASSERT_EQ(ref_x.shape[1], static_cast<size_t>(kOutChannels));
-    ASSERT_EQ(ref_m.shape.size(), 3u);
-    ASSERT_EQ(ref_m.shape[0], 1u);
-    ASSERT_EQ(ref_m.shape[1], static_cast<size_t>(kOutChannels));
-    ASSERT_EQ(ref_logs.shape.size(), 3u);
-    ASSERT_EQ(ref_logs.shape[0], 1u);
-    ASSERT_EQ(ref_logs.shape[1], static_cast<size_t>(kOutChannels));
-    ASSERT_EQ(ref_x.shape[2], ref_quantized.shape[2]);
-    ASSERT_EQ(ref_m.shape[2], ref_quantized.shape[2]);
-    ASSERT_EQ(ref_logs.shape[2], ref_quantized.shape[2]);
-    ASSERT_EQ(ref_text.size(), ref_text.size());
+TEST(SoVITSTextEncoder, QuantizedQ8RunsInference) {
+    auto run_quantized = [&](const std::string & path) {
+        ASSERT_MODEL_EXISTS(path);
 
-    const int64_t ssl_time = static_cast<int64_t>(ref_quantized.shape[2]);
-    const int64_t text_time = static_cast<int64_t>(ref_text.size());
-    ASSERT_GT(ssl_time, 0);
-    ASSERT_GT(text_time, 0);
+        ggml_backend_t backend = create_test_backend();
+        ASSERT_NE(backend, nullptr);
 
-    const std::vector<float> packed_quantized =
-        pack_bct_to_ggml(ref_quantized.data, ref_quantized.shape, kSslIn);
-    const std::vector<float> packed_ge =
-        pack_bct_to_ggml(ref_ge.data, ref_ge.shape, kGeDim);
-    const std::vector<float> expected_x =
-        pack_bct_to_ggml(ref_x.data, ref_x.shape, kOutChannels);
-    const std::vector<float> expected_m =
-        pack_bct_to_ggml(ref_m.data, ref_m.shape, kOutChannels);
-    const std::vector<float> expected_logs =
-        pack_bct_to_ggml(ref_logs.data, ref_logs.shape, kOutChannels);
-    ASSERT_EQ(packed_quantized.size(), static_cast<size_t>(kSslIn * ssl_time));
-    ASSERT_EQ(packed_ge.size(), static_cast<size_t>(kGeDim));
-    ASSERT_EQ(expected_x.size(), static_cast<size_t>(kOutChannels * ssl_time));
-    ASSERT_EQ(expected_m.size(), static_cast<size_t>(kOutChannels * ssl_time));
-    ASSERT_EQ(expected_logs.size(), static_cast<size_t>(kOutChannels * ssl_time));
+        gpt_sovits::sovits_text_encoder_model model{};
+        ASSERT_TRUE(gpt_sovits::sovits_text_encoder_model_load(path, model, backend));
 
-    ggml_backend_t backend = ggml_backend_cpu_init();
-    ASSERT_NE(backend, nullptr);
+        GraphContext gctx(kMaxNodes);
+        ASSERT_NE(gctx.ctx, nullptr);
 
-    gpt_sovits::sovits_text_encoder_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_text_encoder_model_load(kModelF32, model, backend));
+        struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+        ASSERT_NE(gf, nullptr);
 
-    GraphContext gctx(kMaxNodes);
-    ASSERT_NE(gctx.ctx, nullptr);
+        struct ggml_tensor * ssl = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kSslIn, kSslTime);
+        ggml_set_input(ssl);
+        struct ggml_tensor * text = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, kTextTime);
+        ggml_set_input(text);
+        struct ggml_tensor * ge = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeDim, 1);
+        ggml_set_input(ge);
 
-    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
-    ASSERT_NE(gf, nullptr);
+        const gpt_sovits::sovits_text_encoder_result out =
+            gpt_sovits::sovits_text_encoder_block_forward(gctx, ssl, text, ge, model.weights);
+        ASSERT_NE(out.logs, nullptr);
 
-    struct ggml_tensor * ssl = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kSslIn, ssl_time);
-    ggml_set_name(ssl, "enc_p_quantized");
-    ggml_set_input(ssl);
+        struct ggml_tensor * logs_out = ggml_cont(gctx, out.logs);
+        ASSERT_NE(logs_out, nullptr);
+        ggml_set_output(logs_out);
+        ggml_build_forward_expand(gf, logs_out);
 
-    struct ggml_tensor * text = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, text_time);
-    ggml_set_name(text, "enc_p_text");
-    ggml_set_input(text);
+        ggml_gallocr_t alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        ASSERT_NE(alloc, nullptr);
+        ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
 
-    struct ggml_tensor * ge = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeDim, 1);
-    ggml_set_name(ge, "enc_p_ge");
-    ggml_set_input(ge);
+        std::vector<float> ssl_input(static_cast<size_t>(kSslIn * kSslTime));
+        std::vector<int32_t> text_input = make_text_tokens();
+        std::vector<float> ge_input(static_cast<size_t>(kGeDim));
+        fill_ssl(ssl_input);
+        fill_ge(ge_input);
 
-    const gpt_sovits::sovits_text_encoder_result out =
-        gpt_sovits::sovits_text_encoder_block_forward(gctx, ssl, text, ge, model.weights);
-    ASSERT_NE(out.x, nullptr);
-    ASSERT_NE(out.m, nullptr);
-    ASSERT_NE(out.logs, nullptr);
+        ggml_backend_tensor_set(ssl, ssl_input.data(), 0, ssl_input.size() * sizeof(float));
+        ggml_backend_tensor_set(text, text_input.data(), 0, text_input.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(ge, ge_input.data(), 0, ge_input.size() * sizeof(float));
 
-    struct ggml_tensor * x_out = ggml_cont(gctx, out.x);
-    struct ggml_tensor * m_out = ggml_cont(gctx, out.m);
-    struct ggml_tensor * logs_out = ggml_cont(gctx, out.logs);
-    ASSERT_NE(x_out, nullptr);
-    ASSERT_NE(m_out, nullptr);
-    ASSERT_NE(logs_out, nullptr);
+        ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
 
-    ggml_set_name(x_out, "enc_p_x");
-    ggml_set_name(m_out, "enc_p_m");
-    ggml_set_name(logs_out, "enc_p_logs");
-    ggml_set_output(x_out);
-    ggml_set_output(m_out);
-    ggml_set_output(logs_out);
+        const size_t out_nbytes = ggml_nbytes(logs_out);
+        std::vector<float> output(out_nbytes / sizeof(float));
+        ggml_backend_tensor_get(logs_out, output.data(), 0, out_nbytes);
+        for (float value : output) {
+            EXPECT_TRUE(std::isfinite(value));
+        }
 
-    ASSERT_EQ(x_out->ne[0], kOutChannels);
-    ASSERT_EQ(x_out->ne[1], ssl_time);
-    ASSERT_EQ(m_out->ne[0], kOutChannels);
-    ASSERT_EQ(m_out->ne[1], ssl_time);
-    ASSERT_EQ(logs_out->ne[0], kOutChannels);
-    ASSERT_EQ(logs_out->ne[1], ssl_time);
+        ggml_gallocr_free(alloc);
+        gpt_sovits::sovits_text_encoder_model_free(model);
+        ggml_backend_free(backend);
+    };
 
-    ggml_build_forward_expand(gf, x_out);
-    ggml_build_forward_expand(gf, m_out);
-    ggml_build_forward_expand(gf, logs_out);
+    run_quantized(kModelQ8);
+}
 
-    ggml_gallocr_t alloc = ggml_gallocr_new(
-        ggml_backend_get_default_buffer_type(backend));
-    ASSERT_NE(alloc, nullptr);
-    ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+TEST(SoVITSTextEncoder, QuantizedQ5RunsInference) {
+    auto run_quantized = [&](const std::string & path) {
+        ASSERT_MODEL_EXISTS(path);
 
-    ggml_backend_tensor_set(ssl, packed_quantized.data(), 0, packed_quantized.size() * sizeof(float));
-    ggml_backend_tensor_set(text, ref_text.data(), 0, ref_text.size() * sizeof(int32_t));
-    ggml_backend_tensor_set(ge, packed_ge.data(), 0, packed_ge.size() * sizeof(float));
-    ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+        ggml_backend_t backend = create_test_backend();
+        ASSERT_NE(backend, nullptr);
 
-    const size_t out_elems = static_cast<size_t>(kOutChannels * ssl_time);
-    const size_t out_nbytes = out_elems * sizeof(float);
-    std::vector<float> actual_x(out_elems);
-    std::vector<float> actual_m(out_elems);
-    std::vector<float> actual_logs(out_elems);
-    ggml_backend_tensor_get(x_out, actual_x.data(), 0, out_nbytes);
-    ggml_backend_tensor_get(m_out, actual_m.data(), 0, out_nbytes);
-    ggml_backend_tensor_get(logs_out, actual_logs.data(), 0, out_nbytes);
+        gpt_sovits::sovits_text_encoder_model model{};
+        ASSERT_TRUE(gpt_sovits::sovits_text_encoder_model_load(path, model, backend));
 
-    for (float v : actual_x) {
-        EXPECT_TRUE(std::isfinite(v));
-    }
-    for (float v : actual_m) {
-        EXPECT_TRUE(std::isfinite(v));
-    }
-    for (float v : actual_logs) {
-        EXPECT_TRUE(std::isfinite(v));
-    }
+        GraphContext gctx(kMaxNodes);
+        ASSERT_NE(gctx.ctx, nullptr);
 
-    const auto err_x = compute_errors(actual_x, expected_x);
-    const auto err_m = compute_errors(actual_m, expected_m);
-    const auto err_logs = compute_errors(actual_logs, expected_logs);
-    printf("[text_encoder parity] Tssl=%lld Ttext=%lld x(max_abs=%.6f rmse=%.6f mean_abs=%.6f) m(max_abs=%.6f rmse=%.6f mean_abs=%.6f) logs(max_abs=%.6f rmse=%.6f mean_abs=%.6f)\n",
-           static_cast<long long>(ssl_time),
-           static_cast<long long>(text_time),
-           err_x.max_abs,
-           err_x.rmse,
-           err_x.mean_abs,
-           err_m.max_abs,
-           err_m.rmse,
-           err_m.mean_abs,
-           err_logs.max_abs,
-           err_logs.rmse,
-           err_logs.mean_abs);
-    EXPECT_LT(err_x.max_abs, kParityMaxAbsTol);
-    EXPECT_LT(err_x.rmse, kParityRmseTol);
-    EXPECT_LT(err_m.max_abs, kParityMaxAbsTol);
-    EXPECT_LT(err_m.rmse, kParityRmseTol);
-    EXPECT_LT(err_logs.max_abs, kParityMaxAbsTol);
-    EXPECT_LT(err_logs.rmse, kParityRmseTol);
+        struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+        ASSERT_NE(gf, nullptr);
 
-    ggml_gallocr_free(alloc);
-    gpt_sovits::sovits_text_encoder_model_free(model);
-    ggml_backend_free(backend);
+        struct ggml_tensor * ssl = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kSslIn, kSslTime);
+        ggml_set_input(ssl);
+        struct ggml_tensor * text = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, kTextTime);
+        ggml_set_input(text);
+        struct ggml_tensor * ge = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeDim, 1);
+        ggml_set_input(ge);
+
+        const gpt_sovits::sovits_text_encoder_result out =
+            gpt_sovits::sovits_text_encoder_block_forward(gctx, ssl, text, ge, model.weights);
+        ASSERT_NE(out.logs, nullptr);
+
+        struct ggml_tensor * logs_out = ggml_cont(gctx, out.logs);
+        ASSERT_NE(logs_out, nullptr);
+        ggml_set_output(logs_out);
+        ggml_build_forward_expand(gf, logs_out);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        ASSERT_NE(alloc, nullptr);
+        ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+        std::vector<float> ssl_input(static_cast<size_t>(kSslIn * kSslTime));
+        std::vector<int32_t> text_input = make_text_tokens();
+        std::vector<float> ge_input(static_cast<size_t>(kGeDim));
+        fill_ssl(ssl_input);
+        fill_ge(ge_input);
+
+        ggml_backend_tensor_set(ssl, ssl_input.data(), 0, ssl_input.size() * sizeof(float));
+        ggml_backend_tensor_set(text, text_input.data(), 0, text_input.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(ge, ge_input.data(), 0, ge_input.size() * sizeof(float));
+
+        ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+
+        const size_t out_nbytes = ggml_nbytes(logs_out);
+        std::vector<float> output(out_nbytes / sizeof(float));
+        ggml_backend_tensor_get(logs_out, output.data(), 0, out_nbytes);
+        for (float value : output) {
+            EXPECT_TRUE(std::isfinite(value));
+        }
+
+        ggml_gallocr_free(alloc);
+        gpt_sovits::sovits_text_encoder_model_free(model);
+        ggml_backend_free(backend);
+    };
+
+    run_quantized(kModelQ5);
+}
+
+TEST(SoVITSTextEncoder, QuantizedQ4RunsInference) {
+    auto run_quantized = [&](const std::string & path) {
+        ASSERT_MODEL_EXISTS(path);
+
+        ggml_backend_t backend = create_test_backend();
+        ASSERT_NE(backend, nullptr);
+
+        gpt_sovits::sovits_text_encoder_model model{};
+        ASSERT_TRUE(gpt_sovits::sovits_text_encoder_model_load(path, model, backend));
+
+        GraphContext gctx(kMaxNodes);
+        ASSERT_NE(gctx.ctx, nullptr);
+
+        struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+        ASSERT_NE(gf, nullptr);
+
+        struct ggml_tensor * ssl = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kSslIn, kSslTime);
+        ggml_set_input(ssl);
+        struct ggml_tensor * text = ggml_new_tensor_1d(gctx, GGML_TYPE_I32, kTextTime);
+        ggml_set_input(text);
+        struct ggml_tensor * ge = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kGeDim, 1);
+        ggml_set_input(ge);
+
+        const gpt_sovits::sovits_text_encoder_result out =
+            gpt_sovits::sovits_text_encoder_block_forward(gctx, ssl, text, ge, model.weights);
+        ASSERT_NE(out.logs, nullptr);
+
+        struct ggml_tensor * logs_out = ggml_cont(gctx, out.logs);
+        ASSERT_NE(logs_out, nullptr);
+        ggml_set_output(logs_out);
+        ggml_build_forward_expand(gf, logs_out);
+
+        ggml_gallocr_t alloc = ggml_gallocr_new(
+            ggml_backend_get_default_buffer_type(backend));
+        ASSERT_NE(alloc, nullptr);
+        ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+        std::vector<float> ssl_input(static_cast<size_t>(kSslIn * kSslTime));
+        std::vector<int32_t> text_input = make_text_tokens();
+        std::vector<float> ge_input(static_cast<size_t>(kGeDim));
+        fill_ssl(ssl_input);
+        fill_ge(ge_input);
+
+        ggml_backend_tensor_set(ssl, ssl_input.data(), 0, ssl_input.size() * sizeof(float));
+        ggml_backend_tensor_set(text, text_input.data(), 0, text_input.size() * sizeof(int32_t));
+        ggml_backend_tensor_set(ge, ge_input.data(), 0, ge_input.size() * sizeof(float));
+
+        ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+
+        const size_t out_nbytes = ggml_nbytes(logs_out);
+        std::vector<float> output(out_nbytes / sizeof(float));
+        ggml_backend_tensor_get(logs_out, output.data(), 0, out_nbytes);
+        for (float value : output) {
+            EXPECT_TRUE(std::isfinite(value));
+        }
+
+        ggml_gallocr_free(alloc);
+        gpt_sovits::sovits_text_encoder_model_free(model);
+        ggml_backend_free(backend);
+    };
+
+    run_quantized(kModelQ4);
 }
