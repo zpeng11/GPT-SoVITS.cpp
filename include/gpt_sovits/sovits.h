@@ -12,6 +12,12 @@ static constexpr int kSovitsTextEncoderSslLayers = 3;
 static constexpr int kSovitsTextEncoderTextLayers = 6;
 static constexpr int kSovitsTextEncoderPostLayers = 3;
 
+static constexpr int kSovitsGeneratorIn = 192;
+static constexpr int kSovitsGeneratorGin = 512;
+static constexpr int kSovitsGeneratorStages = 5;
+static constexpr int kSovitsGeneratorBranches = 3;
+static constexpr int kSovitsGeneratorResLayers = 3;
+
 static constexpr int kSovitsFlowChannels = 192;
 static constexpr int kSovitsFlowHidden = 192;
 static constexpr int kSovitsFlowHalfChannels = 96;
@@ -280,6 +286,56 @@ struct sovits_flow_block_weights {
     std::array<sovits_flow_layer_weights, kSovitsFlowNFlows> layers;
 };
 
+// ---------------------------------------------------------------------------
+// SoVITS v2 Generator inference block.
+//
+// This block implements `SynthesizerTrn.dec` in the shipped SoVITS v2
+// checkpoint, with all architecture choices fixed to the exported inference
+// path in `module/models_onnx.py`:
+//   Conv1d(192, 512, k=7) + global condition Conv1d(512, 512, k=1)
+//   -> 5 x [LeakyReLU -> ConvTranspose1d -> 3-way ResBlock1 average]
+//   -> LeakyReLU -> Conv1d(16, 1, k=7, bias=False) -> tanh
+//
+// Each stage uses the checkpoint-fixed HiFi-GAN style layout:
+//   stages[0]: upsample 512 -> 256, kernel=16, stride=10, padding=3
+//   stages[1]: upsample 256 -> 128, kernel=16, stride=8,  padding=4
+//   stages[2]: upsample 128 -> 64, kernel=8,  stride=2,  padding=3
+//   stages[3]: upsample 64  -> 32, kernel=2,  stride=2,  padding=0
+//   stages[4]: upsample 32  -> 16, kernel=2,  stride=2,  padding=0
+//
+// Each stage then averages 3 parallel ResBlock1 branches with kernel sizes
+// {3, 7, 11}; every ResBlock1 contains 3 residual sublayers with dilations
+// {1, 3, 5} followed by a dilation-1 Conv1d of the same kernel size.
+//
+// Scope:
+//   - single-sample inference only
+//   - fixed SoVITS v2 architecture and channel counts
+//   - weight_norm is fused at GGUF-conversion time for ConvTranspose1d and
+//     ResBlock1 Conv1d weights
+// ---------------------------------------------------------------------------
+
+struct sovits_generator_conv_weights {
+    struct ggml_tensor * w = nullptr;
+    struct ggml_tensor * b = nullptr;
+};
+
+struct sovits_generator_resblock1_weights {
+    std::array<sovits_generator_conv_weights, kSovitsGeneratorResLayers> convs1;
+    std::array<sovits_generator_conv_weights, kSovitsGeneratorResLayers> convs2;
+};
+
+struct sovits_generator_stage_weights {
+    sovits_generator_conv_weights up;
+    std::array<sovits_generator_resblock1_weights, kSovitsGeneratorBranches> resblocks;
+};
+
+struct sovits_generator_block_weights {
+    sovits_generator_conv_weights conv_pre;
+    sovits_generator_conv_weights cond;
+    std::array<sovits_generator_stage_weights, kSovitsGeneratorStages> stages;
+    struct ggml_tensor * conv_post_w = nullptr;
+};
+
 struct sovits_text_encoder_result {
     struct ggml_tensor * x;     // {192, T_ssl}
     struct ggml_tensor * m;     // {192, T_ssl}
@@ -354,6 +410,22 @@ struct ggml_tensor * sovits_flow_block_inverse_forward(
     struct ggml_tensor                         * g,
     const sovits_flow_block_weights            & weights);
 
+// Build the SoVITS v2 Generator graph.
+//
+// Parameters:
+//   ctx      - ggml context for tensor/op allocation
+//   z        - decoder input latent {192, T}
+//   g        - style embedding ge {512, 1}
+//   weights  - Generator weights for the fixed v2 architecture
+//
+// Returns:
+//   waveform {1, T * 640}
+struct ggml_tensor * sovits_generator_block_forward(
+    struct ggml_context                         * ctx,
+    struct ggml_tensor                          * z,
+    struct ggml_tensor                          * g,
+    const sovits_generator_block_weights        & weights);
+
 // ---------------------------------------------------------------------------
 // SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
 // (except backend, which is borrowed from the caller).
@@ -397,6 +469,16 @@ struct sovits_flow_model {
     struct ggml_context     * ctx_w   = nullptr;
 };
 
+// SoVITS generator model: owns the loaded GGUF weights and ggml resources
+// (except backend, which is borrowed from the caller).
+struct sovits_generator_model {
+    sovits_generator_block_weights weights = {};
+
+    ggml_backend_t            backend = nullptr;
+    ggml_backend_buffer_t     buf_w   = nullptr;
+    struct ggml_context     * ctx_w   = nullptr;
+};
+
 // Load a SoVITS ref_enc model from a GGUF file produced by
 // `convert_sovits_ref_enc_to_gguf.py`.
 //
@@ -434,6 +516,13 @@ bool sovits_flow_model_load(
     sovits_flow_model & model,
     ggml_backend_t backend);
 
+// Load a SoVITS generator model from a GGUF file produced by
+// `convert_sovits_generator_to_gguf.py`.
+bool sovits_generator_model_load(
+    const std::string & fname,
+    sovits_generator_model & model,
+    ggml_backend_t backend);
+
 // Free all resources owned by a SoVITS ref_enc model.
 void sovits_ref_enc_model_free(sovits_ref_enc_model & model);
 
@@ -445,5 +534,8 @@ void sovits_text_encoder_model_free(sovits_text_encoder_model & model);
 
 // Free all resources owned by a SoVITS flow model.
 void sovits_flow_model_free(sovits_flow_model & model);
+
+// Free all resources owned by a SoVITS generator model.
+void sovits_generator_model_free(sovits_generator_model & model);
 
 } // namespace gpt_sovits

@@ -507,7 +507,77 @@ bool sovits_flow_model_load(
         sovits_flow_model_free);
 }
 
+bool sovits_generator_model_load(
+    const std::string & fname,
+    sovits_generator_model & model,
+    ggml_backend_t backend)
+{
+    auto populate = [](struct ggml_context * ctx, sovits_generator_block_weights & w) -> bool {
+        w.conv_pre.w = checked_get_tensor(ctx, "generator.conv_pre_w");
+        w.conv_pre.b = checked_get_tensor(ctx, "generator.conv_pre_b");
+        w.cond.w = checked_get_tensor(ctx, "generator.cond_w");
+        w.cond.b = checked_get_tensor(ctx, "generator.cond_b");
+        w.conv_post_w = checked_get_tensor(ctx, "generator.conv_post_w");
+
+        if (!w.conv_pre.w || !w.conv_pre.b || !w.cond.w || !w.cond.b || !w.conv_post_w) {
+            return false;
+        }
+
+        for (int s = 0; s < kSovitsGeneratorStages; ++s) {
+            auto & stage = w.stages[s];
+            char name[96];
+
+            snprintf(name, sizeof(name), "generator.stages.%d.up_w", s);
+            stage.up.w = checked_get_tensor(ctx, name);
+            snprintf(name, sizeof(name), "generator.stages.%d.up_b", s);
+            stage.up.b = checked_get_tensor(ctx, name);
+            if (!stage.up.w || !stage.up.b) {
+                return false;
+            }
+
+            for (int b = 0; b < kSovitsGeneratorBranches; ++b) {
+                auto & block = stage.resblocks[b];
+                for (int i = 0; i < kSovitsGeneratorResLayers; ++i) {
+                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs1.%d.w", s, b, i);
+                    block.convs1[i].w = checked_get_tensor(ctx, name);
+                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs1.%d.b", s, b, i);
+                    block.convs1[i].b = checked_get_tensor(ctx, name);
+                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs2.%d.w", s, b, i);
+                    block.convs2[i].w = checked_get_tensor(ctx, name);
+                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs2.%d.b", s, b, i);
+                    block.convs2[i].b = checked_get_tensor(ctx, name);
+
+                    if (!block.convs1[i].w || !block.convs1[i].b || !block.convs2[i].w || !block.convs2[i].b) {
+                        return false;
+                    }
+                }
+            }
+        }
+
+        return true;
+    };
+
+    return load_model_from_gguf(
+        fname,
+        model,
+        backend,
+        populate,
+        sovits_generator_model_free);
+}
+
 void sovits_flow_model_free(sovits_flow_model & model) {
+    if (model.buf_w) {
+        ggml_backend_buffer_free(model.buf_w);
+        model.buf_w = nullptr;
+    }
+    if (model.ctx_w) {
+        ggml_free(model.ctx_w);
+        model.ctx_w = nullptr;
+    }
+    model.backend = nullptr;
+}
+
+void sovits_generator_model_free(sovits_generator_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
         model.buf_w = nullptr;

@@ -69,6 +69,7 @@ set(SOVITS_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_quantizer.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_text_encoder.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_flow.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_generator.cpp
 )
 
 foreach(test_src ${SOVITS_TEST_SOURCES})

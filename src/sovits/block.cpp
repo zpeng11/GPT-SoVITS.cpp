@@ -36,6 +36,22 @@ static constexpr int64_t kTextEncoderMrteSslFusedDim =
     kTextEncoderMrteQDim + kTextEncoderMrteSkipDim;
 static constexpr int64_t kTextEncoderTextVocabV2 = 732;
 static constexpr float kLayerNormEps = 1.0e-5f;
+static constexpr float kGeneratorLreluSlope = 0.1f;
+static constexpr std::array<int64_t, kSovitsGeneratorStages> kGeneratorStageOutChannels = {
+    256, 128, 64, 32, 16,
+};
+static constexpr std::array<int, kSovitsGeneratorStages> kGeneratorUpsampleStrides = {
+    10, 8, 2, 2, 2,
+};
+static constexpr std::array<int, kSovitsGeneratorStages> kGeneratorUpsamplePaddings = {
+    3, 4, 3, 0, 0,
+};
+static constexpr std::array<int, kSovitsGeneratorBranches> kGeneratorResblockKernels = {
+    3, 7, 11,
+};
+static constexpr std::array<int, kSovitsGeneratorResLayers> kGeneratorResblockDilations = {
+    1, 3, 5,
+};
 
 static ::ggml_tensor * flatten_vector_1d(
     ::ggml_context * ctx,
@@ -63,6 +79,12 @@ static ::ggml_tensor * reshape_bias_2d(
     GGML_ASSERT(bias != nullptr);
     return ggml_reshape_2d(ctx, bias, bias->ne[0], 1);
 }
+
+static ::ggml_tensor * slice_time_range(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    int64_t          start,
+    int64_t          length);
 
 static ::ggml_tensor * layer_norm_2d(
     ::ggml_context * ctx,
@@ -187,7 +209,8 @@ static ::ggml_tensor * conv1d_forward_channels_first(
     ::ggml_tensor  * x,
     ::ggml_tensor  * weight,
     int              stride,
-    int              padding)
+    int              padding,
+    int              dilation = 1)
 {
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(weight != nullptr);
@@ -208,7 +231,7 @@ static ::ggml_tensor * conv1d_forward_channels_first(
         /*s1=*/0,
         padding,
         /*p1=*/0,
-        /*d0=*/1,
+        /*d0=*/dilation,
         /*d1=*/0,
         /*is_2D=*/false,
         im2col_type);
@@ -237,7 +260,8 @@ static ::ggml_tensor * conv1d_with_bias_channels_first(
     ::ggml_tensor  * weight,
     ::ggml_tensor  * bias,
     int              stride,
-    int              padding)
+    int              padding,
+    int              dilation = 1)
 {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
@@ -246,14 +270,208 @@ static ::ggml_tensor * conv1d_with_bias_channels_first(
 
     // Conv1d with kernel=1/stride=1/pad=0 is exactly a per-time-step linear
     // projection on the channel axis, so avoid the im2col path.
-    if (weight->ne[0] == 1 && stride == 1 && padding == 0) {
+    if (weight->ne[0] == 1 && stride == 1 && padding == 0 && dilation == 1) {
         ::ggml_tensor * linear_w = ggml_reshape_2d(ctx, weight, weight->ne[1], weight->ne[2]);
         return linear_2d(ctx, x, linear_w, bias);
     }
 
-    ::ggml_tensor * y = conv1d_forward_channels_first(ctx, x, weight, stride, padding);
+    ::ggml_tensor * y = conv1d_forward_channels_first(ctx, x, weight, stride, padding, dilation);
     y = ensure_f32(ctx, y);
     return ggml_add(ctx, y, reshape_bias_2d(ctx, bias));
+}
+
+static ::ggml_tensor * reshape_bias_2d_time_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * bias)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(bias != nullptr);
+    return ggml_reshape_2d(ctx, bias, 1, bias->ne[0]);
+}
+
+static ::ggml_tensor * slice_time_range_time_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    int64_t          start,
+    int64_t          length)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(start >= 0);
+    GGML_ASSERT(length >= 0);
+    GGML_ASSERT(start + length <= x->ne[0]);
+
+    const size_t offset = (size_t) start * x->nb[0];
+    ::ggml_tensor * view = ggml_view_2d(ctx, x, length, x->ne[1], x->nb[1], offset);
+    return ggml_cont(ctx, view);
+}
+
+static ::ggml_tensor * conv1d_forward_time_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * weight,
+    int              stride,
+    int              padding,
+    int              dilation = 1)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(weight != nullptr);
+    GGML_ASSERT(weight->ne[1] == x->ne[1]);
+
+    const ggml_type im2col_type = x->type == GGML_TYPE_F16 ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    ::ggml_tensor * im2col = ggml_im2col(
+        ctx,
+        weight,
+        x,
+        stride,
+        /*s1=*/0,
+        padding,
+        /*p1=*/0,
+        /*d0=*/dilation,
+        /*d1=*/0,
+        /*is_2D=*/false,
+        im2col_type);
+
+    ::ggml_tensor * patches = ggml_reshape_2d(
+        ctx,
+        im2col,
+        im2col->ne[0],
+        im2col->ne[1] * im2col->ne[2]);
+    if (im2col_type == GGML_TYPE_F32) {
+        patches = ensure_f32(ctx, patches);
+    }
+
+    // Keep weights as src0 so ggml backends can pick native mixed-dtype or
+    // quantized matmul kernels instead of forcing an explicit cast to F32.
+    ::ggml_tensor * kernel = ggml_reshape_2d(
+        ctx,
+        weight,
+        weight->ne[0] * weight->ne[1],
+        weight->ne[2]);
+
+    ::ggml_tensor * y = ggml_mul_mat(ctx, kernel, patches); // {C_out, T_out}
+    y = ggml_cont(ctx, ggml_permute(ctx, y, 1, 0, 2, 3));  // {T_out, C_out}
+    return y;
+}
+
+static ::ggml_tensor * conv1d_with_bias_time_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * weight,
+    ::ggml_tensor  * bias,
+    int              stride,
+    int              padding,
+    int              dilation = 1)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(weight != nullptr);
+    GGML_ASSERT(bias != nullptr);
+
+    ::ggml_tensor * y = conv1d_forward_time_first(ctx, x, weight, stride, padding, dilation);
+    y = ensure_f32(ctx, y);
+    return ggml_add(ctx, y, reshape_bias_2d_time_first(ctx, bias));
+}
+
+static ::ggml_tensor * conv_transpose1d_with_bias_time_first(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * weight,
+    ::ggml_tensor  * bias,
+    int              stride,
+    int              padding)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(weight != nullptr);
+    GGML_ASSERT(bias != nullptr);
+    GGML_ASSERT(weight->ne[2] == x->ne[1]);
+
+    ::ggml_tensor * y = ggml_conv_transpose_1d(ctx, weight, x, stride, 0, 1);
+
+    if (padding != 0) {
+        GGML_ASSERT(y->ne[0] >= 2 * padding);
+        y = slice_time_range_time_first(ctx, y, padding, y->ne[0] - 2 * padding);
+    }
+
+    y = ensure_f32(ctx, y);
+    return ggml_add(ctx, y, reshape_bias_2d_time_first(ctx, bias));
+}
+
+static ::ggml_tensor * generator_resblock1_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    const sovits_generator_resblock1_weights & weights,
+    int              kernel_size)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+
+    for (int i = 0; i < kSovitsGeneratorResLayers; ++i) {
+        const auto & c1 = weights.convs1[i];
+        const auto & c2 = weights.convs2[i];
+        GGML_ASSERT(c1.w != nullptr);
+        GGML_ASSERT(c1.b != nullptr);
+        GGML_ASSERT(c2.w != nullptr);
+        GGML_ASSERT(c2.b != nullptr);
+
+        ::ggml_tensor * xt = ggml_leaky_relu(ctx, x, kGeneratorLreluSlope, false);
+        xt = conv1d_with_bias_time_first(
+            ctx,
+            xt,
+            c1.w,
+            c1.b,
+            /*stride=*/1,
+            /*padding=*/((kernel_size * kGeneratorResblockDilations[i]) - kGeneratorResblockDilations[i]) / 2,
+            /*dilation=*/kGeneratorResblockDilations[i]);
+        xt = ggml_leaky_relu(ctx, xt, kGeneratorLreluSlope, false);
+        xt = conv1d_with_bias_time_first(
+            ctx,
+            xt,
+            c2.w,
+            c2.b,
+            /*stride=*/1,
+            /*padding=*/(kernel_size - 1) / 2,
+            /*dilation=*/1);
+        x = ggml_add(ctx, x, xt);
+    }
+
+    return x;
+}
+
+static ::ggml_tensor * generator_stage_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    const sovits_generator_stage_weights & weights,
+    int              stage_idx)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(stage_idx >= 0 && stage_idx < kSovitsGeneratorStages);
+    GGML_ASSERT(weights.up.w != nullptr);
+    GGML_ASSERT(weights.up.b != nullptr);
+
+    x = ggml_leaky_relu(ctx, x, kGeneratorLreluSlope, false);
+    x = conv_transpose1d_with_bias_time_first(
+        ctx,
+        x,
+        weights.up.w,
+        weights.up.b,
+        kGeneratorUpsampleStrides[stage_idx],
+        kGeneratorUpsamplePaddings[stage_idx]);
+
+    ::ggml_tensor * sum = nullptr;
+    for (int branch = 0; branch < kSovitsGeneratorBranches; ++branch) {
+        ::ggml_tensor * y = generator_resblock1_forward(
+            ctx,
+            x,
+            weights.resblocks[branch],
+            kGeneratorResblockKernels[branch]);
+        sum = sum == nullptr ? y : ggml_add(ctx, sum, y);
+    }
+
+    return ggml_scale(ctx, sum, 1.0f / static_cast<float>(kSovitsGeneratorBranches));
 }
 
 static ::ggml_tensor * slice_time_range(
@@ -1114,6 +1332,56 @@ static ::ggml_tensor * sovits_flow_layer_inverse_forward(
     }
 
     return x;
+}
+
+::ggml_tensor * sovits_generator_block_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * z,
+    ::ggml_tensor  * g,
+    const sovits_generator_block_weights & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(z != nullptr);
+    GGML_ASSERT(g != nullptr);
+    GGML_ASSERT(z->ne[0] == kSovitsGeneratorIn);
+    GGML_ASSERT(g->ne[0] == kSovitsGeneratorGin);
+    GGML_ASSERT(g->ne[1] == 1);
+    GGML_ASSERT(weights.conv_pre.w != nullptr);
+    GGML_ASSERT(weights.conv_pre.b != nullptr);
+    GGML_ASSERT(weights.cond.w != nullptr);
+    GGML_ASSERT(weights.cond.b != nullptr);
+    GGML_ASSERT(weights.conv_post_w != nullptr);
+
+    ::ggml_tensor * z_tf = ggml_cont(ctx, ggml_permute(ctx, z, 1, 0, 2, 3));
+    ::ggml_tensor * g_tf = ggml_cont(ctx, ggml_permute(ctx, g, 1, 0, 2, 3));
+
+    ::ggml_tensor * x = conv1d_with_bias_time_first(
+        ctx,
+        z_tf,
+        weights.conv_pre.w,
+        weights.conv_pre.b,
+        /*stride=*/1,
+        /*padding=*/3);
+
+    ::ggml_tensor * cond = conv1d_with_bias_time_first(
+        ctx,
+        g_tf,
+        weights.cond.w,
+        weights.cond.b,
+        /*stride=*/1,
+        /*padding=*/0);
+    x = ggml_add(ctx, x, cond);
+
+    for (int stage = 0; stage < kSovitsGeneratorStages; ++stage) {
+        GGML_ASSERT(x->ne[1] == (stage == 0 ? 512 : kGeneratorStageOutChannels[stage - 1]));
+        x = generator_stage_forward(ctx, x, weights.stages[stage], stage);
+        GGML_ASSERT(x->ne[1] == kGeneratorStageOutChannels[stage]);
+    }
+
+    x = ggml_leaky_relu(ctx, x, kGeneratorLreluSlope, false);
+    x = conv1d_forward_time_first(ctx, x, weights.conv_post_w, /*stride=*/1, /*padding=*/3);
+    x = ggml_tanh(ctx, ensure_f32(ctx, x));
+    return ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
 }
 
 } // namespace gpt_sovits
