@@ -27,9 +27,29 @@ namespace {
 static const std::string kTestDir = SOVITS_TEST_DIR;
 static const std::string kModelF16 =
     kTestDir + "models/v2-ref-enc-f16.gguf";
+static const std::string kModelQ8 =
+    kTestDir + "models/v2-ref-enc-q8.gguf";
+static const std::string kModelQ5 =
+    kTestDir + "models/v2-ref-enc-q5.gguf";
+static const std::string kModelQ4 =
+    kTestDir + "models/v2-ref-enc-q4.gguf";
 static const std::string kRefDir = kTestDir + "ref/";
 static const std::string kRefInputNpy = kRefDir + "v2_ref_enc_input.npy";
 static const std::string kRefOutputNpy = kRefDir + "v2_ref_enc_ge.npy";
+
+struct ModelVariant {
+    std::string name;
+    std::string path;
+    double      max_abs_tol;
+    double      rmse_tol;
+};
+
+static const std::vector<ModelVariant> kModelVariants = {
+    {"F16", kModelF16, 5e-2, 1e-2},
+    {"Q8",  kModelQ8,  5e-1, 1.5e-1},
+    {"Q5",  kModelQ5,  1.25, 3.8e-1},
+    {"Q4",  kModelQ4,  1.4,  4.2e-1},
+};
 
 static constexpr int64_t kInChannels = 704;
 static constexpr int64_t kOutChannels = 512;
@@ -153,6 +173,8 @@ static std::vector<float> pack_v2_ref_input_ggml(
 
 } // namespace
 
+class SoVITSRefEncVariants : public ::testing::TestWithParam<ModelVariant> {};
+
 TEST(SoVITSRefEnc, LoadsSuccessfully) {
     ASSERT_MODEL_EXISTS(kModelF16);
 
@@ -161,6 +183,24 @@ TEST(SoVITSRefEnc, LoadsSuccessfully) {
 
     gpt_sovits::sovits_ref_enc_model model{};
     ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(kModelF16, model, backend));
+    EXPECT_NE(model.backend, nullptr);
+    EXPECT_NE(model.buf_w, nullptr);
+    EXPECT_NE(model.ctx_w, nullptr);
+
+    gpt_sovits::sovits_ref_enc_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST_P(SoVITSRefEncVariants, LoadsSuccessfully) {
+    const auto & variant = GetParam();
+    ASSERT_MODEL_EXISTS(variant.path);
+
+    ggml_backend_t backend = create_test_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::sovits_ref_enc_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(variant.path, model, backend))
+        << "Failed to load " << variant.path;
     EXPECT_NE(model.backend, nullptr);
     EXPECT_NE(model.buf_w, nullptr);
     EXPECT_NE(model.ctx_w, nullptr);
@@ -224,6 +264,63 @@ TEST(SoVITSRefEnc, BuildsGraphAndRunsInference) {
 
     gpt_sovits::sovits_ref_enc_model model{};
     ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(kModelF16, model, backend));
+
+    GraphContext gctx(kMaxNodes);
+    ASSERT_NE(gctx.ctx, nullptr);
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+    ASSERT_NE(gf, nullptr);
+
+    struct ggml_tensor * inp = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kInChannels, kTime);
+    ggml_set_name(inp, "refer");
+    ggml_set_input(inp);
+
+    struct ggml_tensor * out =
+        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.weights);
+    ASSERT_NE(out, nullptr);
+    ggml_set_name(out, "ge");
+    ggml_set_output(out);
+
+    EXPECT_EQ(out->ne[0], kOutChannels);
+    EXPECT_EQ(out->ne[1], 1);
+
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    ASSERT_NE(alloc, nullptr);
+    ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+    std::vector<float> input(static_cast<size_t>(kInChannels * kTime));
+    fill_reference_input(input);
+    ggml_backend_tensor_set(inp, input.data(), 0, input.size() * sizeof(float));
+
+    ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+
+    const size_t out_nbytes = ggml_nbytes(out);
+    std::vector<float> output(out_nbytes / sizeof(float));
+    ggml_backend_tensor_get(out, output.data(), 0, out_nbytes);
+
+    ASSERT_EQ(output.size(), static_cast<size_t>(kOutChannels));
+    for (float v : output) {
+        EXPECT_TRUE(std::isfinite(v));
+    }
+
+    ggml_gallocr_free(alloc);
+    gpt_sovits::sovits_ref_enc_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST_P(SoVITSRefEncVariants, BuildsGraphAndRunsInference) {
+    const auto & variant = GetParam();
+    ASSERT_MODEL_EXISTS(variant.path);
+
+    ggml_backend_t backend = create_test_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::sovits_ref_enc_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(variant.path, model, backend))
+        << "Failed to load " << variant.path;
 
     GraphContext gctx(kMaxNodes);
     ASSERT_NE(gctx.ctx, nullptr);
@@ -354,6 +451,95 @@ TEST(SoVITSRefEnc, MatchesPythonReference) {
     ggml_backend_free(backend);
 }
 
+TEST_P(SoVITSRefEncVariants, MatchesPythonReference) {
+    const auto & variant = GetParam();
+    ASSERT_MODEL_EXISTS(variant.path);
+    ASSERT_MODEL_EXISTS(kRefInputNpy);
+    ASSERT_MODEL_EXISTS(kRefOutputNpy);
+
+    const auto ref_input = load_npy_with_shape(kRefInputNpy);
+    const auto ref_output = load_npy_with_shape(kRefOutputNpy);
+    ASSERT_FALSE(ref_input.data.empty());
+    ASSERT_FALSE(ref_output.data.empty());
+
+    ASSERT_EQ(ref_input.shape.size(), 3u);
+    ASSERT_EQ(ref_input.shape[0], 1u);
+    ASSERT_EQ(ref_input.shape[1], 1025u);
+
+    ASSERT_EQ(ref_output.shape.size(), 3u);
+    ASSERT_EQ(ref_output.shape[0], 1u);
+    ASSERT_EQ(ref_output.shape[1], static_cast<size_t>(kOutChannels));
+    ASSERT_EQ(ref_output.shape[2], 1u);
+
+    const int64_t time = static_cast<int64_t>(ref_input.shape[2]);
+    ASSERT_GT(time, 0);
+
+    const std::vector<float> packed_input =
+        pack_v2_ref_input_ggml(ref_input.data, ref_input.shape);
+    ASSERT_EQ(packed_input.size(), static_cast<size_t>(kInChannels * time));
+    ASSERT_EQ(ref_output.data.size(), static_cast<size_t>(kOutChannels));
+
+    ggml_backend_t backend = create_test_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::sovits_ref_enc_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(variant.path, model, backend))
+        << "Failed to load " << variant.path;
+
+    GraphContext gctx(kMaxNodes);
+    ASSERT_NE(gctx.ctx, nullptr);
+
+    struct ggml_cgraph * gf = ggml_new_graph_custom(gctx, kMaxNodes, false);
+    ASSERT_NE(gf, nullptr);
+
+    struct ggml_tensor * inp = ggml_new_tensor_2d(gctx, GGML_TYPE_F32, kInChannels, time);
+    ggml_set_name(inp, "refer");
+    ggml_set_input(inp);
+
+    struct ggml_tensor * out =
+        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.weights);
+    ASSERT_NE(out, nullptr);
+    ggml_set_name(out, "ge");
+    ggml_set_output(out);
+
+    ASSERT_EQ(out->ne[0], kOutChannels);
+    ASSERT_EQ(out->ne[1], 1);
+
+    ggml_build_forward_expand(gf, out);
+
+    ggml_gallocr_t alloc = ggml_gallocr_new(
+        ggml_backend_get_default_buffer_type(backend));
+    ASSERT_NE(alloc, nullptr);
+    ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc, gf));
+
+    ggml_backend_tensor_set(inp, packed_input.data(), 0,
+                            packed_input.size() * sizeof(float));
+    ASSERT_EQ(ggml_backend_graph_compute(backend, gf), GGML_STATUS_SUCCESS);
+
+    const size_t out_nbytes = ggml_nbytes(out);
+    std::vector<float> output(out_nbytes / sizeof(float));
+    ggml_backend_tensor_get(out, output.data(), 0, out_nbytes);
+
+    ASSERT_EQ(output.size(), ref_output.data.size());
+    for (float v : output) {
+        EXPECT_TRUE(std::isfinite(v));
+    }
+
+    const auto err = compute_errors(output, ref_output.data);
+    printf("[ref_enc parity/%s] T=%lld max_abs=%.6f rmse=%.6f mean_abs=%.6f\n",
+           variant.name.c_str(),
+           static_cast<long long>(time),
+           err.max_abs,
+           err.rmse,
+           err.mean_abs);
+    EXPECT_LT(err.max_abs, variant.max_abs_tol);
+    EXPECT_LT(err.rmse, variant.rmse_tol);
+
+    ggml_gallocr_free(alloc);
+    gpt_sovits::sovits_ref_enc_model_free(model);
+    ggml_backend_free(backend);
+}
+
 TEST(SoVITSRefEnc, NonExistentFileReturnsFalse) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
@@ -368,3 +554,11 @@ TEST(SoVITSRefEnc, FreeOnDefaultInitializedModelIsSafe) {
     gpt_sovits::sovits_ref_enc_model model{};
     gpt_sovits::sovits_ref_enc_model_free(model);
 }
+
+INSTANTIATE_TEST_SUITE_P(
+    ModelVariants,
+    SoVITSRefEncVariants,
+    ::testing::ValuesIn(kModelVariants),
+    [](const ::testing::TestParamInfo<ModelVariant> & info) {
+        return info.param.name;
+    });
