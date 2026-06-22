@@ -80,13 +80,25 @@ static NpyShapeInfo load_npy_with_shape(const std::string & path) {
 
 static std::vector<int32_t> load_npy_as_i32(const std::string & path) {
     cnpy::NpyArray arr = cnpy::npy_load(path);
-    EXPECT_EQ(arr.word_size, sizeof(int32_t));
-    if (arr.word_size != sizeof(int32_t)) {
-        return {};
+
+    if (arr.word_size == sizeof(int32_t)) {
+        const int32_t * src = arr.data<int32_t>();
+        return std::vector<int32_t>(src, src + arr.num_vals);
+    }
+    if (arr.word_size == sizeof(int64_t)) {
+        // Codes are small codebook indices (< kBins=1024), so int64 -> int32
+        // is lossless. Accept either dtype for parity-test robustness.
+        const int64_t * src = arr.data<int64_t>();
+        std::vector<int32_t> out(arr.num_vals);
+        for (size_t i = 0; i < arr.num_vals; ++i) {
+            out[i] = static_cast<int32_t>(src[i]);
+        }
+        return out;
     }
 
-    const int32_t * src = arr.data<int32_t>();
-    return std::vector<int32_t>(src, src + arr.num_vals);
+    ADD_FAILURE() << "load_npy_as_i32: unsupported word_size=" << arr.word_size
+                  << " in '" << path << "'";
+    return {};
 }
 
 static ErrorStats compute_errors(const std::vector<float> & actual,

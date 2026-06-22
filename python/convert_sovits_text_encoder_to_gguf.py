@@ -146,6 +146,14 @@ def _convert_tensor(
     if target_type == gguf.GGMLQuantizationType.F16:
         return tensor_np.astype(np.float16), target_type
 
+    # Integer quants only from here. The final output projection produces
+    # both `m` and `logs` (split in half along channel axis) — Q4_0 here
+    # blew the m_p parity tolerance (max_abs=0.267 vs tol=0.2). proj_w is
+    # only [384, 192] (~150 KB at F16), so keeping it at F16 costs almost
+    # nothing and removes the dominant source of output error.
+    if gguf_name == "text_encoder_post.proj_w":
+        return tensor_np.astype(np.float16), gguf.GGMLQuantizationType.F16
+
     if tensor_np.ndim == 2:
         block_size = gguf.GGML_QUANT_SIZES[target_type][0]
         if tensor_np.shape[1] % block_size == 0:
