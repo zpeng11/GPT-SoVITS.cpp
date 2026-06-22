@@ -4,6 +4,12 @@
 Usage:
     python convert_sovits_flow_to_gguf.py <sovits_ckpt> [--output <path>] [--type f32|f16|q8|q5|q4]
 
+Reference checkpoint (default local source):
+    tests/t2s/models/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
+
+Default conversion target directory:
+    tests/sovits/models/   (e.g. v2-flow-f16.gguf)
+
 This converter is torch-free. It reads the checkpoint with `torch_ckpt_utils`,
 fuses weight_norm'd Conv1d weights (weight_g * weight_v / ||weight_v||) at
 conversion time, and exports the tensors needed by `sovits_flow_block_weights`.

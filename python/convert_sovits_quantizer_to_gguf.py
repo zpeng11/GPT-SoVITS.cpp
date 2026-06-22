@@ -4,6 +4,12 @@
 Usage:
     python convert_sovits_quantizer_to_gguf.py <sovits_ckpt> [--output <path>] [--type f32|f16]
 
+Reference checkpoint (default local source):
+    tests/t2s/models/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
+
+Default conversion target directory:
+    tests/sovits/models/   (e.g. v2-quantizer-f16.gguf)
+
 This converter is torch-free. It exports only the single-layer codebook needed
 by `sovits_rvq_decode_block_forward`.
 """

@@ -7,6 +7,12 @@ Usage:
 Where:
     <sovits_ckpt> - Path to a SoVITS checkpoint (.pth), e.g. s2G2333k.pth
 
+Reference checkpoint (default local source):
+    tests/t2s/models/pretrained_models/gsv-v2final-pretrained/s2G2333k.pth
+
+Default conversion target directory:
+    tests/sovits/models/   (e.g. v2-ref-enc-f16.gguf)
+
 This converter is torch-free. It reads the checkpoint with `torch_ckpt_utils`
 and exports only the tensors needed by `sovits_mel_style_encoder_block_weights`.
 
