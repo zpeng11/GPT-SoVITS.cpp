@@ -140,9 +140,6 @@ def _convert_tensor(
     if gguf_name.endswith("text_embedding"):
         return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
 
-    if gguf_name.endswith("ffn_up_w") or gguf_name.endswith("ffn_down_w"):
-        return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
-
     if tensor_np.ndim <= 1:
         return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
 
@@ -175,6 +172,23 @@ def _prepare_direct_tensor(gguf_name: str, tensor_np: np.ndarray) -> np.ndarray:
 
     if gguf_name.endswith("_w") and tensor_np.ndim == 3 and tensor_np.shape[2] == 1:
         return tensor_np[:, :, 0].astype(np.float32).copy()
+
+    # FFN Conv1d(k=3) weights: reshape [out_c, in_c, k] -> [out_c, in_c*k].
+    # Runtime (block.cpp:conv1d_weight_kernel_2d) merges the same two axes
+    # (k * in_c) and runs the conv as im2col + mul_mat, so a pre-reshaped
+    # 2D weight is consumed identically and can be quantized like any
+    # other linear weight.
+    if (
+        gguf_name.endswith("_w")
+        and tensor_np.ndim == 3
+        and tensor_np.shape[2] > 1
+    ):
+        out_c, in_c, k = tensor_np.shape
+        return (
+            tensor_np.astype(np.float32)
+            .reshape(out_c, in_c * k)
+            .copy()
+        )
 
     return tensor_np.astype(np.float32)
 
