@@ -1250,8 +1250,7 @@ static ::ggml_tensor * sovits_flow_layer_inverse_forward(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
     ::ggml_tensor  * g,
-    const sovits_flow_layer_weights & w,
-    bool             flip_input)
+    const sovits_flow_layer_weights & w)
 {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
@@ -1264,16 +1263,15 @@ static ::ggml_tensor * sovits_flow_layer_inverse_forward(
 
     const int64_t half = kSovitsFlowHalfChannels;
 
-    // Split: when flip_input=true swap which half is used as conditioning
-    ::ggml_tensor * x0;  // conditioning half (fed into pre → WN → post)
-    ::ggml_tensor * x1;  // transform half (will be x1 = x1 - m)
-    if (flip_input) {
-        x0 = split_channels(ctx, x, half, half);   // second half → conditioning
-        x1 = split_channels(ctx, x, 0,    half);    // first half  → transform
-    } else {
-        x0 = split_channels(ctx, x, 0,    half);    // first half  → conditioning
-        x1 = split_channels(ctx, x, half, half);    // second half → transform
-    }
+    // Standard coupling split: x0 = first half (conditioning), x1 = second
+    // half (transformed). Channel reversal between layers is handled by the
+    // caller via flip_flow_channels() — mathematically equivalent to the
+    // Flip() modules that alternate with ResidualCouplingLayer in PyTorch
+    // (modules.py:371). Folding the reversal into a toggled split is NOT
+    // equivalent, because the m vector itself must be reversed along with
+    // the channels it is applied to.
+    ::ggml_tensor * x0 = split_channels(ctx, x, 0,    half);  // conditioning
+    ::ggml_tensor * x1 = split_channels(ctx, x, half, half);  // transform
 
     // pre: Conv1d(half, H, k=1)
     ::ggml_tensor * pre_w_2d = as_linear_weight_2d(ctx, w.pre_w);
@@ -1288,16 +1286,26 @@ static ::ggml_tensor * sovits_flow_layer_inverse_forward(
     ::ggml_tensor * m = linear_2d(ctx, h, post_w_2d, w.post_b);  // {half, T}
     x1 = ggml_sub(ctx, x1, m);  // output is contiguous (no ggml_cont needed)
 
-    // Merge: cat in original channel order
-    // x0 is a view — must make contiguous before concat
-    if (flip_input) {
-        // x1 (modified first half) goes first, x0 (original second half) goes second
-        x0 = ggml_cont(ctx, x0);
-        return ggml_concat(ctx, x1, x0, 0);
-    } else {
-        x0 = ggml_cont(ctx, x0);
-        return ggml_concat(ctx, x0, x1, 0);
-    }
+    // Merge: x0 (unmodified) first, x1 (transformed) second.
+    x0 = ggml_cont(ctx, x0);
+    return ggml_concat(ctx, x0, x1, 0);
+}
+
+// Reverse the channel axis of a 2D {C, T} tensor. Mirrors modules.Flip which
+// does torch.flip(x, [1]) on a [B, C, T] tensor. Implemented as
+// transpose → gather (get_rows) along the channel axis with reverse indices →
+// transpose back. The reverse index is built on the fly via arange + argsort.
+static ::ggml_tensor * flip_flow_channels(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * rev_idx)
+{
+    // x: {C, T}. transpose to {T, C} so channel becomes the gather axis.
+    ::ggml_tensor * xt = ::ggml_cont(ctx, ::ggml_permute(ctx, x, 1, 0, 2, 3));
+    // Gather rows (channels) in reverse order.
+    ::ggml_tensor * yt = ::ggml_get_rows(ctx, xt, rev_idx);
+    // transpose back to {C_rev, T}
+    return ::ggml_cont(ctx, ::ggml_permute(ctx, yt, 1, 0, 2, 3));
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,12 +1324,21 @@ static ::ggml_tensor * sovits_flow_layer_inverse_forward(
     GGML_ASSERT(x->ne[0] == kSovitsFlowChannels);
     GGML_ASSERT(g->ne[0] == kSovitsFlowGin);
 
-    // Inverse pass in reverse order, flip_input toggles per layer to
-    // alternate which half is conditioned on — replaces explicit channel flips.
-    bool flip_input = true;
+    // Build the reverse-channel index [C-1, ..., 1, 0] once via arange +
+    // argsort(DESC). Reused for every Flip in the loop below.
+    ::ggml_tensor * arange = ::ggml_arange(ctx, 0.0f,
+                                           static_cast<float>(kSovitsFlowChannels),
+                                           1.0f);
+    ::ggml_tensor * rev_idx = ::ggml_argsort(ctx, arange, GGML_SORT_ORDER_DESC);
+
+    // PyTorch self.flows = [RCL_0, Flip, RCL_1, Flip, RCL_2, Flip, RCL_3, Flip]
+    // (modules appended alternately for n_flows=4). The inverse pass iterates
+    // this list in reverse, giving the pattern:
+    //     Flip → RCL_3 → Flip → RCL_2 → Flip → RCL_1 → Flip → RCL_0
+    // i.e. one Flip precedes every RCL.
     for (int i = kSovitsFlowNFlows - 1; i >= 0; --i) {
-        x = sovits_flow_layer_inverse_forward(ctx, x, g, weights.layers[i], flip_input);
-        flip_input = !flip_input;
+        x = flip_flow_channels(ctx, x, rev_idx);
+        x = sovits_flow_layer_inverse_forward(ctx, x, g, weights.layers[i]);
     }
 
     return x;
