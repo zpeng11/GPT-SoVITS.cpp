@@ -27,6 +27,15 @@ static void mask_upload_range(t2s_session & session, int slot_id,
                             offset, size);
 }
 
+// Upload the entire persistent decode mask from mask_host to the device tensor
+// in a single transfer. Used after batching multiple scattered mask_host
+// updates to avoid many small per-slot H2D uploads.
+static void mask_upload_full(t2s_session & session) {
+    const int64_t max_ctx = (int64_t) session.n_batch * session.slot_size;
+    const size_t  nbytes  = (size_t) max_ctx * session.n_batch * sizeof(ggml_fp16_t);
+    ggml_backend_tensor_set(session.mask, session.mask_host.data(), 0, nbytes);
+}
+
 // Precompute sine positional embedding table on CPU.
 // Output layout per position p: [sin0, cos0, sin1, cos1, ...] with d_model elements.
 // This matches the reorder performed in build_sine_positional_embedding (block.cpp).
@@ -210,6 +219,9 @@ void t2s_session_free(t2s_session & session) {
     session.seen_mask = nullptr;
     session.exp_noise = nullptr;
     session.mask_host.clear();
+    session.scratch_mask.clear();
+    session.scratch_kv_pos.clear();
+    session.scratch_decode_pos.clear();
 }
 
 int t2s_session_find_free_slot(const t2s_session & session) {
@@ -254,19 +266,30 @@ void t2s_session_decode_advance(t2s_session & session) {
         GGML_ASSERT(session.slots[i].n_pos > 0);
     }
 
+    // Stage kv_pos / position into scratch buffers so we can bulk-upload once
+    // after the loop instead of issuing 2 * n_batch small H2D transfers.
+    // Buffers grow on demand; size never shrinks, so steady-state decode is
+    // allocation-free.
+    if (session.scratch_kv_pos.size() < session.n_batch) {
+        session.scratch_kv_pos.resize(session.n_batch);
+    }
+    if (session.scratch_decode_pos.size() < session.n_batch) {
+        session.scratch_decode_pos.resize(session.n_batch);
+    }
+    int32_t * kv_pos_host = session.scratch_kv_pos.data();
+    int32_t * pos_host    = session.scratch_decode_pos.data();
+
     for (uint32_t i = 0; i < session.n_batch; i++) {
         GGML_ASSERT(session.slots[i].n_pos < (int) session.slot_size);
 
         const int row = (int)(i * session.slot_size) + session.slots[i].n_pos;
 
-        // Reveal the new KV position in the decode mask.
+        // Reveal the new KV position in the decode mask (host mirror only —
+        // uploaded once after the loop to avoid n_batch small H2D transfers).
         session.mask_host[i * max_ctx + row] = zero;
-        mask_upload_range(session, (int)i, row, 1);
 
-        // Set kv_pos for this slot so the graph scatter-writes at the correct column.
-        const int32_t write_pos = row;
-        ggml_backend_tensor_set(session.kv_pos, &write_pos,
-                                i * sizeof(int32_t), sizeof(int32_t));
+        // kv_pos: graph scatter-writes the new K/V at this column.
+        kv_pos_host[i] = row;
 
         // Auto-fill PE position: pe_pos = n_pos - audio_offset.
         // This mirrors the logic in t2s_session_flex_advance for decode slots.
@@ -276,11 +299,17 @@ void t2s_session_decode_advance(t2s_session & session) {
         const int32_t pe_pos = session.slots[i].n_pos - session.slots[i].audio_offset;
         GGML_ASSERT(pe_pos >= 0 && pe_pos < (int) session.slot_size &&
                     "decode PE position out of pe_table bounds");
-        ggml_backend_tensor_set(session.position, &pe_pos,
-                                i * sizeof(int32_t), sizeof(int32_t));
+        pos_host[i] = pe_pos;
 
         session.slots[i].n_pos++;
     }
+
+    // Single bulk upload for each of the three small input tensors.
+    mask_upload_full(session);
+    ggml_backend_tensor_set(session.kv_pos, kv_pos_host,
+                            0, (size_t) session.n_batch * sizeof(int32_t));
+    ggml_backend_tensor_set(session.position, pos_host,
+                            0, (size_t) session.n_batch * sizeof(int32_t));
 }
 
 t2s_layer_caches t2s_session_get_layer_caches(const t2s_session & session, int layer) {
@@ -741,7 +770,10 @@ void t2s_session_flex_advance(t2s_session       & session,
 
     // --- 1. Fill graph.kv_pos ---
     {
-        std::vector<int32_t> kv_pos_host(N);
+        if ((int) session.scratch_kv_pos.size() < N) {
+            session.scratch_kv_pos.resize(N);
+        }
+        int32_t * kv_pos_host = session.scratch_kv_pos.data();
         int offset = 0;
         for (uint32_t i = 0; i < session.n_batch; i++) {
             const int nq = plan.n_query[i];
@@ -755,13 +787,20 @@ void t2s_session_flex_advance(t2s_session       & session,
             }
             offset += nq;
         }
-        ggml_backend_tensor_set(graph.kv_pos, kv_pos_host.data(),
+        ggml_backend_tensor_set(graph.kv_pos, kv_pos_host,
                                 0, (size_t) N * sizeof(int32_t));
     }
 
     // --- 2. Fill graph.mask ---
     {
-        std::vector<ggml_fp16_t> mask_buf((size_t) n_kv * N, neg_inf);
+        const size_t mask_n = (size_t) n_kv * (size_t) N;
+        if (session.scratch_mask.size() < mask_n) {
+            session.scratch_mask.resize(mask_n);
+        }
+        ggml_fp16_t * mask_buf = session.scratch_mask.data();
+        // Only the active [0, mask_n) region needs to be reset each step;
+        // the rest of the buffer (if any) is left untouched.
+        std::fill(mask_buf, mask_buf + mask_n, neg_inf);
 
         int col = 0;
         for (uint32_t i = 0; i < session.n_batch; i++) {
@@ -792,13 +831,16 @@ void t2s_session_flex_advance(t2s_session       & session,
             col += nq;
         }
 
-        ggml_backend_tensor_set(graph.mask, mask_buf.data(),
+        ggml_backend_tensor_set(graph.mask, mask_buf,
                                 0, (size_t) n_kv * N * sizeof(ggml_fp16_t));
     }
 
     // --- 3. Fill decode_positions and set audio_offset ---
     if (graph.n_decode > 0 && graph.decode_positions) {
-        std::vector<int32_t> pos_host(graph.n_decode);
+        if ((int) session.scratch_decode_pos.size() < graph.n_decode) {
+            session.scratch_decode_pos.resize(graph.n_decode);
+        }
+        int32_t * pos_host = session.scratch_decode_pos.data();
         int decode_idx = 0;
         for (uint32_t i = 0; i < session.n_batch; i++) {
             const int nq = plan.n_query[i];
@@ -823,7 +865,7 @@ void t2s_session_flex_advance(t2s_session       & session,
                 session.slots[i].audio_offset = offset;
             }
         }
-        ggml_backend_tensor_set(graph.decode_positions, pos_host.data(),
+        ggml_backend_tensor_set(graph.decode_positions, pos_host,
                                 0, (size_t) graph.n_decode * sizeof(int32_t));
     } else {
         // No decode slots — only set audio_offset for prefill slots.
@@ -839,6 +881,8 @@ void t2s_session_flex_advance(t2s_session       & session,
     }
 
     // --- 4. Update persistent decode mask ---
+    // Write all revealed positions to mask_host first, then bulk-upload once
+    // to avoid per-slot H2D transfers.
     for (uint32_t i = 0; i < session.n_batch; i++) {
         const int nq = plan.n_query[i];
         if (nq <= 0) continue;
@@ -847,8 +891,8 @@ void t2s_session_flex_advance(t2s_session       & session,
         for (int k = 0; k < nq; k++) {
             session.mask_host[i * max_ctx + slot_start + old_n_pos + k] = zero;
         }
-        mask_upload_range(session, (int)i, slot_start + old_n_pos, nq);
     }
+    mask_upload_full(session);
 
     // --- 5. Advance n_pos ---
     for (uint32_t i = 0; i < session.n_batch; i++) {

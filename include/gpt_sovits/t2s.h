@@ -322,6 +322,12 @@ struct t2s_session {
     // Linear indexing: mask_host[col * max_ctx + row] corresponds to mask(row, col).
     std::vector<ggml_fp16_t> mask_host;
 
+    // Scratch buffers reused across flex_advance calls to avoid per-step
+    // heap allocations. Grown on demand to fit the largest plan seen so far.
+    std::vector<ggml_fp16_t> scratch_mask;     // n_kv * N
+    std::vector<int32_t>     scratch_kv_pos;   // N
+    std::vector<int32_t>     scratch_decode_pos;  // n_decode
+
     // KV cache element type (default F32; can be set to Q8_0 etc. for memory savings)
     enum ggml_type kv_cache_type = GGML_TYPE_F32;
 
