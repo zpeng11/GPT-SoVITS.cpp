@@ -1113,8 +1113,11 @@ static ::ggml_tensor * sovits_text_encoder_mrte_block_forward(
 
     ::ggml_tensor * attn = mrte_cross_attention_from_qkv(ctx, q, k, v);
     ::ggml_tensor * attn_out = linear_2d(ctx, attn, weights.attn_out_w, weights.attn_out_b);
+    // ge_out stays at {hidden, 1}; the final ggml_add broadcasts it across the
+    // full time dimension (ggml_can_repeat passes when src1->ne[1] == 1), which
+    // is equivalent to the prior explicit ggml_repeat but avoids the T_ssl-sized
+    // materialised copy.
     ::ggml_tensor * ge_out = linear_2d(ctx, ge, weights.ge_out_w, weights.ge_out_b);
-    ge_out = ggml_repeat(ctx, ge_out, skip);
 
     return ggml_add(ctx, ggml_add(ctx, attn_out, skip), ge_out);
 }
@@ -1201,12 +1204,12 @@ static ::ggml_tensor * sovits_wn_forward(
     const int64_t H = kSovitsFlowHidden;
     const int64_t T = x->ne[1];
 
-    // cond_layer: Conv1d(gin, 2*H*N, k=1)
+    // cond_layer: Conv1d(gin, 2*H*N, k=1). Kept at {2*H*N, 1}; each WN layer
+    // takes a {2*H, 1} slice and fused_add_tanh_sigmoid_multiply broadcasts it
+    // across time inside ggml_add. Equivalent to the prior explicit
+    // ggml_repeat_4d but avoids the {2*H*N, T} materialised copy.
     ::ggml_tensor * cond_w_2d = as_linear_weight_2d(ctx, w.cond_w);
     ::ggml_tensor * cond = linear_2d(ctx, g, cond_w_2d, w.cond_b);  // {2*H*N, 1}
-
-    // Broadcast condition to full time dimension once (shared across all WN layers)
-    cond = ggml_repeat_4d(ctx, cond, cond->ne[0], T, 1, 1);  // {2*H*N, T}
 
     ::ggml_tensor * output = zeros_2d(ctx, H, T);
 
@@ -1220,8 +1223,9 @@ static ::ggml_tensor * sovits_wn_forward(
         ::ggml_tensor * x_in = conv1d_with_bias_channels_first(
             ctx, x, w.layers[i].in_w, w.layers[i].in_b, 1, 2);  // {2H, T}
 
-        // Condition slice — already broadcasted to full time
-        ::ggml_tensor * g_l = split_channels(ctx, cond, i * 2 * H, 2 * H);  // {2H, T}
+        // Condition slice — stays at {2H, 1} and is broadcast across time by
+        // ggml_add inside fused_add_tanh_sigmoid_multiply below.
+        ::ggml_tensor * g_l = split_channels(ctx, cond, i * 2 * H, 2 * H);  // {2H, 1}
 
         // Gated activation: tanh(a) * sigmoid(b)
         ::ggml_tensor * acts = fused_add_tanh_sigmoid_multiply(ctx, x_in, g_l, H);  // {H, T}
