@@ -371,8 +371,7 @@ static ::ggml_tensor * conv1d_forward_core(
         patches = ensure_f32(ctx, patches);
     }
 
-    // Keep weights as src0 so ggml backends can pick native mixed-dtype or
-    // quantized matmul kernels instead of forcing an explicit cast to F32.
+    // Keep weights as src0 so backends can pick native mixed-dtype matmul kernels.
     GGML_ASSERT(patches->ne[0] == in_channels * kernel_size);
     ::ggml_tensor * kernel = conv1d_weight_kernel_2d(ctx, weight, in_channels);
     ::ggml_tensor * y = ggml_mul_mat(ctx, kernel, patches);
@@ -401,8 +400,7 @@ static ::ggml_tensor * conv1d_with_bias_core(
 
     const int64_t in_channels = conv1d_input_channels(x, layout);
 
-    // Conv1d with kernel=1/stride=1/pad=0 is exactly a per-time-step linear
-    // projection on the channel axis, so avoid the im2col path.
+    // kernel=1/stride=1/pad=0 is a per-time-step linear projection — skip im2col.
     if (conv1d_weight_kernel_size(weight, in_channels) == 1
         && stride == 1 && padding == 0 && dilation == 1) {
         ::ggml_tensor * linear_w = as_linear_weight_2d(ctx, weight);
@@ -867,7 +865,6 @@ static ::ggml_tensor * relpos_encoder_stack_forward(
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(x->ne[0] == kTextEncoderSslHidden);
 
-    // Shared by the ssl, text, and post encoder branches.
     for (const sovits_relpos_encoder_layer_weights & layer : layers) {
         x = relpos_encoder_layer_forward(ctx, x, layer);
     }
@@ -926,8 +923,7 @@ static ::ggml_tensor * attention_block_forward(
     GGML_ASSERT(weights.out_w != nullptr);
     GGML_ASSERT(weights.out_b != nullptr);
 
-    // One fused Q/K/V matmul, then three O(1) channel views for q/k/v. The
-    // output channel layout is [Q, K, V], each kStyleHidden wide.
+    // qkv output channels: [Q, K, V], each kStyleHidden wide.
     ::ggml_tensor * qkv = linear_2d(ctx, x, weights.qkv_w, weights.qkv_b);
     ::ggml_tensor * q = split_channels(ctx, qkv, 0,                       kStyleHidden);
     ::ggml_tensor * k = split_channels(ctx, qkv, kStyleHidden,            kStyleHidden);
@@ -1112,10 +1108,6 @@ static ::ggml_tensor * sovits_text_encoder_mrte_block_forward(
 
     ::ggml_tensor * attn = mrte_cross_attention_from_qkv(ctx, q, k, v);
     ::ggml_tensor * attn_out = linear_2d(ctx, attn, weights.attn_out_w, weights.attn_out_b);
-    // ge_out stays at {hidden, 1}; the final ggml_add broadcasts it across the
-    // full time dimension (ggml_can_repeat passes when src1->ne[1] == 1), which
-    // is equivalent to the prior explicit ggml_repeat but avoids the T_ssl-sized
-    // materialised copy.
     ::ggml_tensor * ge_out = linear_2d(ctx, ge, weights.ge_out_w, weights.ge_out_b);
 
     return ggml_add(ctx, ggml_add(ctx, attn_out, skip), ge_out);
@@ -1164,10 +1156,6 @@ sovits_text_encoder_result sovits_text_encoder_block_forward(
     return result;
 }
 
-// ---------------------------------------------------------------------------
-// Flow block helpers
-// ---------------------------------------------------------------------------
-
 static ::ggml_tensor * fused_add_tanh_sigmoid_multiply(
     ::ggml_context * ctx,
     ::ggml_tensor  * input_a,
@@ -1203,12 +1191,10 @@ static ::ggml_tensor * sovits_wn_forward(
     const int64_t H = kSovitsFlowHidden;
     const int64_t T = x->ne[1];
 
-    // cond_layer: Conv1d(gin, 2*H*N, k=1). Kept at {2*H*N, 1}; each WN layer
-    // takes a {2*H, 1} slice and fused_add_tanh_sigmoid_multiply broadcasts it
-    // across time inside ggml_add. Equivalent to the prior explicit
-    // ggml_repeat_4d but avoids the {2*H*N, T} materialised copy.
+    // cond_layer: Conv1d(gin, 2*H*N, k=1). Stays at {2*H*N, 1}; ggml_add in
+    // fused_add_tanh_sigmoid_multiply broadcasts each {2*H, 1} slice over time.
     ::ggml_tensor * cond_w_2d = as_linear_weight_2d(ctx, w.cond_w);
-    ::ggml_tensor * cond = linear_2d(ctx, g, cond_w_2d, w.cond_b);  // {2*H*N, 1}
+    ::ggml_tensor * cond = linear_2d(ctx, g, cond_w_2d, w.cond_b);
 
     ::ggml_tensor * output = zeros_2d(ctx, H, T);
 
@@ -1218,22 +1204,17 @@ static ::ggml_tensor * sovits_wn_forward(
         GGML_ASSERT(w.layers[i].rs_w != nullptr);
         GGML_ASSERT(w.layers[i].rs_b != nullptr);
 
-        // in_layer: dilated Conv1d(H, 2*H, K=5, dil=1, pad=2)
         ::ggml_tensor * x_in = conv1d_with_bias_channels_first(
-            ctx, x, w.layers[i].in_w, w.layers[i].in_b, 1, 2);  // {2H, T}
+            ctx, x, w.layers[i].in_w, w.layers[i].in_b, 1, 2);
 
-        // Condition slice — stays at {2H, 1} and is broadcast across time by
-        // ggml_add inside fused_add_tanh_sigmoid_multiply below.
-        ::ggml_tensor * g_l = split_channels(ctx, cond, i * 2 * H, 2 * H);  // {2H, 1}
+        ::ggml_tensor * g_l = split_channels(ctx, cond, i * 2 * H, 2 * H);
 
-        // Gated activation: tanh(a) * sigmoid(b)
-        ::ggml_tensor * acts = fused_add_tanh_sigmoid_multiply(ctx, x_in, g_l, H);  // {H, T}
+        ::ggml_tensor * acts = fused_add_tanh_sigmoid_multiply(ctx, x_in, g_l, H);
 
-        // res_skip_layer: Conv1d(H, out_ch, K=1)
         ::ggml_tensor * res_skip = conv1d_with_bias_channels_first(
-            ctx, acts, w.layers[i].rs_w, w.layers[i].rs_b, 1, 0);  // {2H, T} or {H, T}
+            ctx, acts, w.layers[i].rs_w, w.layers[i].rs_b, 1, 0);
 
-        const int64_t out_ch = res_skip->ne[0];  // 2*H for layers 0..2, H for layer 3
+        const int64_t out_ch = res_skip->ne[0];  // 2*H except last layer (H)
 
         if (i < kSovitsFlowWNLayers - 1) {
             GGML_ASSERT(out_ch == 2 * H);
@@ -1266,54 +1247,38 @@ static ::ggml_tensor * sovits_flow_layer_inverse_forward(
 
     const int64_t half = kSovitsFlowHalfChannels;
 
-    // Standard coupling split: x0 = first half (conditioning), x1 = second
-    // half (transformed). Channel reversal between layers is handled by the
-    // caller via flip_flow_channels() — mathematically equivalent to the
-    // Flip() modules that alternate with ResidualCouplingLayer in PyTorch
-    // (modules.py:371). Folding the reversal into a toggled split is NOT
-    // equivalent, because the m vector itself must be reversed along with
-    // the channels it is applied to.
-    ::ggml_tensor * x0 = split_channels(ctx, x, 0,    half);  // conditioning
-    ::ggml_tensor * x1 = split_channels(ctx, x, half, half);  // transform
+    // Coupling split: x0 conditions, x1 is transformed. Channel reversal
+    // between layers is handled by the caller's flip_flow_channels() —
+    // folding it into a toggled split here is NOT equivalent because the
+    // predicted m vector itself is channel-ordered.
+    ::ggml_tensor * x0 = split_channels(ctx, x, 0,    half);
+    ::ggml_tensor * x1 = split_channels(ctx, x, half, half);
 
-    // pre: Conv1d(half, H, k=1)
     ::ggml_tensor * pre_w_2d = as_linear_weight_2d(ctx, w.pre_w);
-    ::ggml_tensor * h = linear_2d(ctx, x0, pre_w_2d, w.pre_b);  // {H, T}
+    ::ggml_tensor * h = linear_2d(ctx, x0, pre_w_2d, w.pre_b);
 
-    // WaveNet
-    h = sovits_wn_forward(ctx, h, g, w.enc);  // {H, T}
+    h = sovits_wn_forward(ctx, h, g, w.enc);
 
-    // post: Conv1d(H, half, k=1) → mean_only → only m, no logs
-    // Inverse step: x1 = (x1 - m) * exp(-logs), with logs=0 → x1 = x1 - m
+    // mean_only inverse: logs=0, so x1 = (x1 - m) * exp(-logs) collapses to x1 - m.
     ::ggml_tensor * post_w_2d = as_linear_weight_2d(ctx, w.post_w);
-    ::ggml_tensor * m = linear_2d(ctx, h, post_w_2d, w.post_b);  // {half, T}
-    x1 = ggml_sub(ctx, x1, m);  // output is contiguous (no ggml_cont needed)
+    ::ggml_tensor * m = linear_2d(ctx, h, post_w_2d, w.post_b);
+    x1 = ggml_sub(ctx, x1, m);
 
-    // Merge: x0 (unmodified) first, x1 (transformed) second.
     x0 = ggml_cont(ctx, x0);
     return ggml_concat(ctx, x0, x1, 0);
 }
 
-// Reverse the channel axis of a 2D {C, T} tensor. Mirrors modules.Flip which
-// does torch.flip(x, [1]) on a [B, C, T] tensor. Implemented as
-// transpose → gather (get_rows) along the channel axis with reverse indices →
-// transpose back. The reverse index is built on the fly via arange + argsort.
+// torch.flip(x, [1]) on a {C, T} tensor: transpose to {T, C}, gather rows in
+// reverse channel order, transpose back. rev_idx is built once by the caller.
 static ::ggml_tensor * flip_flow_channels(
     ::ggml_context * ctx,
     ::ggml_tensor  * x,
     ::ggml_tensor  * rev_idx)
 {
-    // x: {C, T}. transpose to {T, C} so channel becomes the gather axis.
     ::ggml_tensor * xt = ::ggml_cont(ctx, ::ggml_permute(ctx, x, 1, 0, 2, 3));
-    // Gather rows (channels) in reverse order.
     ::ggml_tensor * yt = ::ggml_get_rows(ctx, xt, rev_idx);
-    // transpose back to {C_rev, T}
     return ::ggml_cont(ctx, ::ggml_permute(ctx, yt, 1, 0, 2, 3));
 }
-
-// ---------------------------------------------------------------------------
-// Flow block public interface (inference-only, inverse pass)
-// ---------------------------------------------------------------------------
 
 ::ggml_tensor * sovits_flow_block_inverse_forward(
     ::ggml_context * ctx,
@@ -1327,18 +1292,14 @@ static ::ggml_tensor * flip_flow_channels(
     GGML_ASSERT(x->ne[0] == kSovitsFlowChannels);
     GGML_ASSERT(g->ne[0] == kSovitsFlowGin);
 
-    // Build the reverse-channel index [C-1, ..., 1, 0] once via arange +
-    // argsort(DESC). Reused for every Flip in the loop below.
+    // Reverse-channel index [C-1, ..., 0] built once, reused for every Flip.
     ::ggml_tensor * arange = ::ggml_arange(ctx, 0.0f,
                                            static_cast<float>(kSovitsFlowChannels),
                                            1.0f);
     ::ggml_tensor * rev_idx = ::ggml_argsort(ctx, arange, GGML_SORT_ORDER_DESC);
 
-    // PyTorch self.flows = [RCL_0, Flip, RCL_1, Flip, RCL_2, Flip, RCL_3, Flip]
-    // (modules appended alternately for n_flows=4). The inverse pass iterates
-    // this list in reverse, giving the pattern:
-    //     Flip → RCL_3 → Flip → RCL_2 → Flip → RCL_1 → Flip → RCL_0
-    // i.e. one Flip precedes every RCL.
+    // PyTorch flows list is [RCL, Flip] * n_flows; inverse iterates it in
+    // reverse, so each RCL is preceded by a Flip.
     for (int i = kSovitsFlowNFlows - 1; i >= 0; --i) {
         x = flip_flow_channels(ctx, x, rev_idx);
         x = sovits_flow_layer_inverse_forward(ctx, x, g, weights.layers[i]);
