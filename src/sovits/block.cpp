@@ -904,8 +904,8 @@ static ::ggml_tensor * conv_glu_block_forward(
     GGML_ASSERT(weights.conv_w->ne[2] == 2 * kStyleHidden);
     GGML_ASSERT(weights.conv_b->ne[0] == 2 * kStyleHidden);
 
-    ::ggml_tensor * conv = conv1d_forward_channels_first(ctx, x, weights.conv_w, /*stride=*/1, /*padding=*/2);
-    conv = ggml_add(ctx, conv, reshape_bias_channels_first(ctx, weights.conv_b));
+    ::ggml_tensor * conv = conv1d_with_bias_channels_first(
+        ctx, x, weights.conv_w, weights.conv_b, /*stride=*/1, /*padding=*/2);
 
     ::ggml_tensor * a = split_channels(ctx, conv, 0, kStyleHidden);
     ::ggml_tensor * b = split_channels(ctx, conv, kStyleHidden, kStyleHidden);
@@ -921,18 +921,17 @@ static ::ggml_tensor * attention_block_forward(
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(x->ne[0] == kStyleHidden);
-    GGML_ASSERT(weights.q_w != nullptr);
-    GGML_ASSERT(weights.q_b != nullptr);
-    GGML_ASSERT(weights.k_w != nullptr);
-    GGML_ASSERT(weights.k_b != nullptr);
-    GGML_ASSERT(weights.v_w != nullptr);
-    GGML_ASSERT(weights.v_b != nullptr);
+    GGML_ASSERT(weights.qkv_w != nullptr);
+    GGML_ASSERT(weights.qkv_b != nullptr);
     GGML_ASSERT(weights.out_w != nullptr);
     GGML_ASSERT(weights.out_b != nullptr);
 
-    ::ggml_tensor * q = linear_2d(ctx, x, weights.q_w, weights.q_b);
-    ::ggml_tensor * k = linear_2d(ctx, x, weights.k_w, weights.k_b);
-    ::ggml_tensor * v = linear_2d(ctx, x, weights.v_w, weights.v_b);
+    // One fused Q/K/V matmul, then three O(1) channel views for q/k/v. The
+    // output channel layout is [Q, K, V], each kStyleHidden wide.
+    ::ggml_tensor * qkv = linear_2d(ctx, x, weights.qkv_w, weights.qkv_b);
+    ::ggml_tensor * q = split_channels(ctx, qkv, 0,                       kStyleHidden);
+    ::ggml_tensor * k = split_channels(ctx, qkv, kStyleHidden,            kStyleHidden);
+    ::ggml_tensor * v = split_channels(ctx, qkv, 2 * kStyleHidden,        kStyleHidden);
 
     const float scale = 1.0f / sqrtf(static_cast<float>(kStyleHidden));
     ::ggml_tensor * attn = flash_attention_from_qkv_2d(

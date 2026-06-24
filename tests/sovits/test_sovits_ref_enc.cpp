@@ -227,12 +227,8 @@ TEST(SoVITSRefEnc, WeightPointersAndShapesLookCorrect) {
     ASSERT_NE(w.temporal[0].conv_b, nullptr);
     ASSERT_NE(w.temporal[1].conv_w, nullptr);
     ASSERT_NE(w.temporal[1].conv_b, nullptr);
-    ASSERT_NE(w.attention.q_w, nullptr);
-    ASSERT_NE(w.attention.q_b, nullptr);
-    ASSERT_NE(w.attention.k_w, nullptr);
-    ASSERT_NE(w.attention.k_b, nullptr);
-    ASSERT_NE(w.attention.v_w, nullptr);
-    ASSERT_NE(w.attention.v_b, nullptr);
+    ASSERT_NE(w.attention.qkv_w, nullptr);
+    ASSERT_NE(w.attention.qkv_b, nullptr);
     ASSERT_NE(w.attention.out_w, nullptr);
     ASSERT_NE(w.attention.out_b, nullptr);
     ASSERT_NE(w.fc_w, nullptr);
@@ -246,8 +242,9 @@ TEST(SoVITSRefEnc, WeightPointersAndShapesLookCorrect) {
     EXPECT_EQ(w.temporal[0].conv_w->ne[0], 5);
     EXPECT_EQ(w.temporal[0].conv_w->ne[1], 128);
     EXPECT_EQ(w.temporal[0].conv_w->ne[2], 256);
-    EXPECT_EQ(w.attention.q_w->ne[0], 128);
-    EXPECT_EQ(w.attention.q_w->ne[1], 128);
+    EXPECT_EQ(w.attention.qkv_w->ne[0], 128);
+    EXPECT_EQ(w.attention.qkv_w->ne[1], 384);
+    EXPECT_EQ(w.attention.qkv_b->ne[0], 384);
     EXPECT_EQ(w.fc_w->ne[0], 128);
     EXPECT_EQ(w.fc_w->ne[1], 512);
     EXPECT_EQ(w.fc_b->ne[0], 512);

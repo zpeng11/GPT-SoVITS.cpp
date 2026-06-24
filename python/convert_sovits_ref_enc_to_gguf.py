@@ -27,12 +27,12 @@ Tensor mapping (checkpoint name -> GGUF name):
   ref_enc.temporal.1.conv1.conv.weight -> ref_enc.temporal.1.conv_w
   ref_enc.temporal.1.conv1.conv.bias   -> ref_enc.temporal.1.conv_b
 
-  ref_enc.slf_attn.w_qs.weight        -> ref_enc.attention.q_w
-  ref_enc.slf_attn.w_qs.bias          -> ref_enc.attention.q_b
-  ref_enc.slf_attn.w_ks.weight        -> ref_enc.attention.k_w
-  ref_enc.slf_attn.w_ks.bias          -> ref_enc.attention.k_b
-  ref_enc.slf_attn.w_vs.weight        -> ref_enc.attention.v_w
-  ref_enc.slf_attn.w_vs.bias          -> ref_enc.attention.v_b
+  ref_enc.slf_attn.w_qs.weight \
+  ref_enc.slf_attn.w_ks.weight \
+  ref_enc.slf_attn.w_vs.weight        -> ref_enc.attention.qkv_w   (concat on axis=0)
+  ref_enc.slf_attn.w_qs.bias \
+  ref_enc.slf_attn.w_ks.bias \
+  ref_enc.slf_attn.w_vs.bias          -> ref_enc.attention.qkv_b   (concat on axis=0)
   ref_enc.slf_attn.fc.weight          -> ref_enc.attention.out_w
   ref_enc.slf_attn.fc.bias            -> ref_enc.attention.out_b
 
@@ -78,17 +78,31 @@ REF_ENC_MAP = [
     ("ref_enc.temporal.0.conv_b", "ref_enc.temporal.0.conv1.conv.bias"),
     ("ref_enc.temporal.1.conv_w", "ref_enc.temporal.1.conv1.conv.weight"),
     ("ref_enc.temporal.1.conv_b", "ref_enc.temporal.1.conv1.conv.bias"),
-    ("ref_enc.attention.q_w", "ref_enc.slf_attn.w_qs.weight"),
-    ("ref_enc.attention.q_b", "ref_enc.slf_attn.w_qs.bias"),
-    ("ref_enc.attention.k_w", "ref_enc.slf_attn.w_ks.weight"),
-    ("ref_enc.attention.k_b", "ref_enc.slf_attn.w_ks.bias"),
-    ("ref_enc.attention.v_w", "ref_enc.slf_attn.w_vs.weight"),
-    ("ref_enc.attention.v_b", "ref_enc.slf_attn.w_vs.bias"),
     ("ref_enc.attention.out_w", "ref_enc.slf_attn.fc.weight"),
     ("ref_enc.attention.out_b", "ref_enc.slf_attn.fc.bias"),
     ("ref_enc.fc_w", "ref_enc.fc.fc.weight"),
     ("ref_enc.fc_b", "ref_enc.fc.fc.bias"),
 ]
+
+
+def _fused_qkv(weights: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
+    """Concatenate the slf_attn Q/K/V Linears into one fused projection.
+
+    PyTorch Linear weight is (out_features, in_features); concatenating along
+    axis=0 yields (3*out_features, in_features). After GGUF's dim reversal
+    this becomes (in_features, 3*out_features) in ggml layout, matching the
+    text-encoder qkv_w convention. Biases concatenate the same way.
+    """
+    q_w = weights["ref_enc.slf_attn.w_qs.weight"].astype(np.float32)
+    k_w = weights["ref_enc.slf_attn.w_ks.weight"].astype(np.float32)
+    v_w = weights["ref_enc.slf_attn.w_vs.weight"].astype(np.float32)
+    q_b = weights["ref_enc.slf_attn.w_qs.bias"].astype(np.float32)
+    k_b = weights["ref_enc.slf_attn.w_ks.bias"].astype(np.float32)
+    v_b = weights["ref_enc.slf_attn.w_vs.bias"].astype(np.float32)
+    return (
+        np.concatenate([q_w, k_w, v_w], axis=0),
+        np.concatenate([q_b, k_b, v_b], axis=0),
+    )
 
 
 def should_quantize(gguf_name: str, tensor: np.ndarray, block_size: int) -> bool:
@@ -129,14 +143,9 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     n_converted = 0
     n_quantized = 0
 
-    for gguf_name, ckpt_name in REF_ENC_MAP:
-        if ckpt_name not in weights:
-            raise KeyError(
-                f"Tensor '{ckpt_name}' not found in checkpoint "
-                f"(needed for GGUF tensor '{gguf_name}')"
-            )
-
-        tensor_np = weights[ckpt_name]
+    def emit_tensor(gguf_name: str, tensor_np: np.ndarray) -> None:
+        """Apply the same dtype/quantization policy as REF_ENC_MAP entries."""
+        nonlocal n_converted, n_quantized
 
         if is_quantized and should_quantize(gguf_name, tensor_np, block_size):
             quantized = gguf.quantize(tensor_np, target_type)
@@ -155,9 +164,33 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
 
         n_converted += 1
         print(
-            f"  [{n_converted:2d}] {gguf_name:28s} <- {ckpt_name:36s} "
+            f"  [{n_converted:2d}] {gguf_name:28s} "
             f"{list(tensor_np.shape)!s:18s} {data_type.name}"
         )
+
+    for gguf_name, ckpt_name in REF_ENC_MAP:
+        if ckpt_name not in weights:
+            raise KeyError(
+                f"Tensor '{ckpt_name}' not found in checkpoint "
+                f"(needed for GGUF tensor '{gguf_name}')"
+            )
+        emit_tensor(gguf_name, weights[ckpt_name])
+
+    # Fused QKV projection: concatenate slf_attn w_qs / w_ks / w_vs into a
+    # single {in, 3*hidden} weight so inference can issue one matmul.
+    qkv_w_np, qkv_b_np = _fused_qkv(weights)
+    emit_tensor("ref_enc.attention.qkv_w", qkv_w_np)
+    # Bias stays F32 to match the other 1D biases.
+    writer.add_tensor(
+        "ref_enc.attention.qkv_b",
+        qkv_b_np.astype(np.float32),
+        raw_dtype=gguf.GGMLQuantizationType.F32,
+    )
+    n_converted += 1
+    print(
+        f"  [{n_converted:2d}] {'ref_enc.attention.qkv_b':28s} "
+        f"{list(qkv_b_np.shape)!s:18s} F32"
+    )
 
     if n_quantized > 0:
         print(f"\nConverted {n_converted} tensors (quantized {n_quantized})")

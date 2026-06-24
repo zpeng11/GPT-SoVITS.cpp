@@ -44,16 +44,12 @@ static bool populate_weights(
         }
     }
 
-    w.attention.q_w = checked_get_tensor(ctx, "ref_enc.attention.q_w");
-    w.attention.q_b = checked_get_tensor(ctx, "ref_enc.attention.q_b");
-    w.attention.k_w = checked_get_tensor(ctx, "ref_enc.attention.k_w");
-    w.attention.k_b = checked_get_tensor(ctx, "ref_enc.attention.k_b");
-    w.attention.v_w = checked_get_tensor(ctx, "ref_enc.attention.v_w");
-    w.attention.v_b = checked_get_tensor(ctx, "ref_enc.attention.v_b");
+    w.attention.qkv_w = checked_get_tensor(ctx, "ref_enc.attention.qkv_w");
+    w.attention.qkv_b = checked_get_tensor(ctx, "ref_enc.attention.qkv_b");
     w.attention.out_w = checked_get_tensor(ctx, "ref_enc.attention.out_w");
     w.attention.out_b = checked_get_tensor(ctx, "ref_enc.attention.out_b");
-    if (!w.attention.q_w || !w.attention.q_b || !w.attention.k_w || !w.attention.k_b ||
-        !w.attention.v_w || !w.attention.v_b || !w.attention.out_w || !w.attention.out_b) {
+    if (!w.attention.qkv_w || !w.attention.qkv_b ||
+        !w.attention.out_w || !w.attention.out_b) {
         return false;
     }
 

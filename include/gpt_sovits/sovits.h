@@ -33,6 +33,12 @@ static constexpr int kSovitsFlowGin = 512;
 //   refer {704, T} -> spectral MLP -> 2x Conv1dGLU -> self-attention
 //   -> projection -> temporal average pool -> style embedding {512, 1}
 //
+// The self-attention's Q/K/V projections are exported from the GGUF as a
+// single fused linear weight (ref_enc.attention.qkv_w / qkv_b), produced by
+// concatenating the PyTorch w_qs/w_ks/w_vs weights along the output axis at
+// conversion time. This matches the layout used by the text-encoder relpos
+// layers and lets inference issue one matmul instead of three.
+//
 // Scope:
 //   - single-sample inference only
 //   - public activations use {channels, time}
@@ -50,13 +56,12 @@ struct sovits_mel_style_encoder_conv_glu_block_weights {
 };
 
 struct sovits_mel_style_encoder_attention_block_weights {
-    // Linear(128, 128) projections.
-    struct ggml_tensor * q_w;      // {128, 128}
-    struct ggml_tensor * q_b;      // {128}
-    struct ggml_tensor * k_w;      // {128, 128}
-    struct ggml_tensor * k_b;      // {128}
-    struct ggml_tensor * v_w;      // {128, 128}
-    struct ggml_tensor * v_b;      // {128}
+    // Fused Q/K/V projection exported as a single linear weight, matching
+    // the layout used by the text-encoder relpos layers. The 3*hidden output
+    // channels are laid out as [Q, K, V] so attention_block_forward can split
+    // the linear output into q/k/v with three O(1) channel views.
+    struct ggml_tensor * qkv_w;    // {128, 384}
+    struct ggml_tensor * qkv_b;    // {384}
     struct ggml_tensor * out_w;    // {128, 128}
     struct ggml_tensor * out_b;    // {128}
 };
