@@ -1358,4 +1358,49 @@ static ::ggml_tensor * flip_flow_channels(
     return ggml_cont(ctx, ggml_permute(ctx, x, 1, 0, 2, 3));
 }
 
+::ggml_tensor * sovits_quantized_double_25hz_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * quantized,
+    ::ggml_tensor  * indices)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(quantized != nullptr);
+    GGML_ASSERT(indices != nullptr);
+    GGML_ASSERT(quantized->ne[0] == kRVQDim);
+    GGML_ASSERT(indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(indices->ne[0] == 2 * quantized->ne[1]);
+
+    // quantized: {768, T}, indices: {2T} I32 with values [0,0,1,1,...,T-1,T-1].
+    // ggml_get_rows(a, b) returns {ne0[a], ne0[b]} = {768, 2T} where output
+    // column i is input column indices[i]. This is exactly repeat_interleave(2)
+    // along the time axis, matching the python cat-permute-view idiom:
+    //   dquantized = torch.cat([q, q]).permute(1, 2, 0).view(1, ssl_dim, -1)
+    return ggml_get_rows(ctx, quantized, indices);
+}
+
+::ggml_tensor * sovits_sample_z_p_forward(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * m,
+    ::ggml_tensor  * logs,
+    ::ggml_tensor  * randn)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(m != nullptr);
+    GGML_ASSERT(logs != nullptr);
+    GGML_ASSERT(randn != nullptr);
+    GGML_ASSERT(m->ne[0] == kSovitsFlowChannels);
+    GGML_ASSERT(logs->ne[0] == kSovitsFlowChannels);
+    GGML_ASSERT(randn->ne[0] == kSovitsFlowChannels);
+    GGML_ASSERT(m->ne[1] == logs->ne[1]);
+    GGML_ASSERT(m->ne[1] == randn->ne[1]);
+
+    // z_p = m + randn * exp(logs)
+    // noise_scale is folded into the host-side RNG that fills `randn`, so
+    // no in-graph ggml_scale is needed and the graph topology is fixed
+    // regardless of the runtime noise_scale value.
+    ::ggml_tensor * sigma = ggml_exp(ctx, logs);
+    ::ggml_tensor * scaled_noise = ggml_mul(ctx, randn, sigma);
+    return ggml_add(ctx, m, scaled_noise);
+}
+
 } // namespace gpt_sovits

@@ -4,9 +4,27 @@
 #include "ggml-backend.h"
 
 #include <array>
+#include <random>
 #include <string>
+#include <vector>
 
 namespace gpt_sovits {
+
+// ---------------------------------------------------------------------------
+// SoVITS v2 model hyperparameters
+//
+// Read from GGUF KV metadata at load time. Currently only carries the
+// semantic_frame_rate flag; the rest of v2 architecture is fixed in block.cpp.
+// ---------------------------------------------------------------------------
+
+struct sovits_hparams {
+    // True when the source checkpoint's semantic_frame_rate is "25hz".
+    // Requires time-doubling of quantized SSL features before enc_p, to
+    // match the 50hz expectation of the text encoder / flow / decoder.
+    // Read from quantizer GGUF KV "sovits.semantic_frame_rate"; defaults
+    // to true (matches the shipped v2 pretrained checkpoint).
+    bool semantic_frame_rate_25hz = true;
+};
 
 static constexpr int kSovitsTextEncoderSslLayers = 3;
 static constexpr int kSovitsTextEncoderTextLayers = 6;
@@ -433,6 +451,55 @@ struct ggml_tensor * sovits_generator_block_forward(
     const sovits_generator_block_weights        & weights);
 
 // ---------------------------------------------------------------------------
+// SoVITS v2 pipeline helpers (stateless graph builders)
+// ---------------------------------------------------------------------------
+
+// Double the time dimension of quantized SSL features (25hz -> 50hz upsample).
+//
+// Mirrors the python path in SynthesizerTrn.forward when
+// semantic_frame_rate == "25hz":
+//   dquantized = torch.cat([quantized, quantized]).permute(1, 2, 0)
+//   quantized  = dquantized.contiguous().view(1, self.ssl_dim, -1)
+// which is equivalent to torch.repeat_interleave(quantized, 2, dim=time).
+//
+// Parameters:
+//   ctx       - ggml context for tensor/op allocation
+//   quantized - input features {768, T}
+//   indices   - caller-built index tensor {2T} (I32) with values
+//               [0, 0, 1, 1, ..., T-1, T-1]; the caller is responsible for
+//               filling it before graph compute.
+//
+// Returns:
+//   upsampled features {768, 2T} where output[:, 2t] == output[:, 2t+1] == input[:, t].
+struct ggml_tensor * sovits_quantized_double_25hz_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * quantized,
+    struct ggml_tensor  * indices);
+
+// Sample z_p from text-encoder outputs (m, logs) and caller-provided noise.
+//
+// Mirrors the python:
+//   z_p = m_p + torch.randn_like(m_p) * torch.exp(logs_p) * noise_scale
+//
+// noise_scale is folded into the caller-provided randn input (host-side RNG
+// uses std=noise_scale), so the graph op is just z_p = m + randn * exp(logs).
+// This keeps the graph topology independent of noise_scale.
+//
+// Parameters:
+//   ctx   - ggml context
+//   m     - mean {192, T} from text encoder
+//   logs  - log-std {192, T} from text encoder
+//   randn - caller-filled N(0, noise_scale²) samples {192, T} (graph input)
+//
+// Returns:
+//   z_p {192, T}
+struct ggml_tensor * sovits_sample_z_p_forward(
+    struct ggml_context * ctx,
+    struct ggml_tensor  * m,
+    struct ggml_tensor  * logs,
+    struct ggml_tensor  * randn);
+
+// ---------------------------------------------------------------------------
 // SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
 // (except backend, which is borrowed from the caller).
 // ---------------------------------------------------------------------------
@@ -543,5 +610,177 @@ void sovits_flow_model_free(sovits_flow_model & model);
 
 // Free all resources owned by a SoVITS generator model.
 void sovits_generator_model_free(sovits_generator_model & model);
+
+// ---------------------------------------------------------------------------
+// SoVITS v2 aggregate: bundles all 5 sub-models + hparams
+//
+// Each sub-model retains independent ownership of its GGUF weights and
+// ggml resources; the aggregate only groups references so callers don't
+// have to manage 5 separate structs.
+// ---------------------------------------------------------------------------
+
+struct sovits_models {
+    sovits_ref_enc_model      ref_enc;
+    sovits_quantizer_model    quantizer;
+    sovits_text_encoder_model text_encoder;
+    sovits_flow_model         flow;
+    sovits_generator_model    generator;
+
+    sovits_hparams hparams = {};
+};
+
+// Load all 5 SoVITS sub-models from their respective GGUF files.
+//
+// Reads sovits.semantic_frame_rate from the quantizer GGUF KV to populate
+// models.hparams. If the key is missing, defaults to "25hz" (the shipped
+// v2 pretrained checkpoint value).
+//
+// On failure, any sub-models loaded before the failure are freed before
+// returning; the caller does not need to clean up.
+//
+// Parameters:
+//   ref_enc_path      - path to ref_enc GGUF (MelStyleEncoder weights)
+//   quantizer_path    - path to quantizer GGUF (RVQ codebook + hparams KV)
+//   text_encoder_path - path to text_encoder GGUF (enc_p weights)
+//   flow_path         - path to flow GGUF (ResidualCouplingBlock weights)
+//   generator_path    - path to generator GGUF (HiFi-GAN Generator weights)
+//   models            - output aggregate struct (will be populated)
+//   backend           - ggml backend (borrowed; not freed by sovits_models_free)
+//
+// Returns true on success, false on failure (errors printed to stderr).
+bool sovits_models_load(
+    const std::string & ref_enc_path,
+    const std::string & quantizer_path,
+    const std::string & text_encoder_path,
+    const std::string & flow_path,
+    const std::string & generator_path,
+    sovits_models & models,
+    ggml_backend_t backend);
+
+// Free all sub-models owned by sovits_models.
+void sovits_models_free(sovits_models & models);
+
+// ---------------------------------------------------------------------------
+// SoVITS v2 session: cached style embedding + host-side RNG
+//
+// Manages the cross-call state needed by SynthesizerTrn.forward:
+//   - cached ge {512, 1} style embedding (one reference per session)
+//   - host-side RNG for z_p sampling noise (bundled so the caller does not
+//     need to manage noise generation externally)
+//   - scratch buffers reused across forward calls (grown on demand)
+//
+// Each forward call builds a fresh graph (T varies per call); there is no
+// persistent decode graph like t2s_session has, since sovits forward is a
+// single-shot pipeline rather than an iterative AR decode.
+// ---------------------------------------------------------------------------
+
+struct sovits_session {
+    // Configuration (set at init, immutable across forward calls)
+    float    noise_scale = 0.5f;   // folded into host-side RNG std
+    uint64_t rng_seed    = 0;      // stored for diagnostics
+
+    // Borrowed backend (not freed by sovits_session_free)
+    ggml_backend_t backend = nullptr;
+
+    // Host-side RNG state (bundled so caller doesn't manage noise)
+    std::mt19937 rng;
+
+    // Cached style embedding ge {512, 1} F32, computed once per reference.
+    // Owned: ctx_ge holds the tensor metadata, buf_ge holds its data.
+    struct ggml_context  * ctx_ge = nullptr;
+    ggml_backend_buffer_t  buf_ge = nullptr;
+    struct ggml_tensor   * ge     = nullptr;
+
+    // Scratch buffers reused across forward calls (grown on demand,
+    // never shrunk; steady-state forward is allocation-free).
+    std::vector<int32_t> scratch_double_idx;  // 25hz index, [0,0,1,1,...]
+    std::vector<float>   scratch_randn;       // N(0, noise_scale²) samples
+};
+
+// Initialize a SoVITS session.
+//
+// The session does not own a backend; the caller must keep the backend alive
+// for the lifetime of the session.
+//
+// Parameters:
+//   session     - output session struct (will be populated)
+//   backend     - ggml backend (borrowed)
+//   noise_scale - noise scale for z_p sampling, folded into host-side RNG
+//                 (default 0.5 matches python SynthesizerTrn.forward default)
+//   rng_seed    - RNG seed for reproducible noise (use std::random_device{}
+//                 externally for true randomness)
+//
+// Returns true on success, false on failure.
+bool sovits_session_init(
+    sovits_session & session,
+    ggml_backend_t   backend,
+    float            noise_scale = 0.5f,
+    uint64_t         rng_seed    = 0xdeadbeefULL);
+
+// Free all resources owned by a SoVITS session (ge cache + scratch buffers).
+// Does not free the borrowed backend.
+void sovits_session_free(sovits_session & session);
+
+// Compute and cache the style embedding ge from reference audio.
+//
+// Builds a temporary graph that runs MelStyleEncoder on the reference
+// features and copies the result into a session-owned persistent tensor
+// (session.ge). Subsequent sovits_session_forward calls reuse this ge.
+//
+// Switching references requires re-calling this; the previously cached ge
+// is freed first. The input `refer_data` must already be sliced to the v2
+// 704-channel slice (i.e. caller does refer[:, :704]).
+//
+// Parameters:
+//   session    - initialized SoVITS session
+//   models     - loaded SoVITS models (ref_enc weights are read)
+//   refer_data - reference spectrogram features {704, T_refer}, host pointer
+//                (F32, row-major C*T layout matching ggml {704, T})
+//   T_refer    - number of reference time frames
+//
+// Returns true on success, false on failure.
+bool sovits_session_compute_ge(
+    sovits_session       & session,
+    const sovits_models  & models,
+    const float          * refer_data,
+    int64_t                T_refer);
+
+// Get the cached style embedding tensor, or nullptr if not computed.
+struct ggml_tensor * sovits_session_get_ge(const sovits_session & session);
+
+// Run the full SoVITS v2 forward pipeline end-to-end.
+//
+// Mirrors SynthesizerTrn.forward (v2 path, speed=1):
+//   1. codes -> quantizer.decode         -> quantized {768, T_codes}
+//   2. (if 25hz) double time dim         -> quantized {768, 2*T_codes}
+//   3. enc_p(quantized, text, ge)        -> m, logs   {192, T_ssl} each
+//   4. host: randn ~ N(0, noise_scale²)  -> randn     {192, T_ssl}
+//   5. z_p = m + randn * exp(logs)       -> z_p       {192, T_ssl}
+//   6. z = flow(z_p, ge, reverse=True)   -> z         {192, T_ssl}
+//   7. wav = dec(z, ge)                  -> wav       {1, T_ssl*640}
+//   8. copy wav to wav_out
+// where T_ssl = (semantic_frame_rate_25hz ? 2 : 1) * T_codes.
+//
+// Parameters:
+//   session - initialized session with ge cached
+//   models  - loaded SoVITS models
+//   codes   - semantic token ids {T_codes} (i32), host pointer
+//   T_codes - number of semantic tokens
+//   text    - phoneme token ids {T_text} (i32), host pointer
+//   T_text  - number of phoneme tokens
+//   wav_out - caller-allocated output buffer (F32)
+//   wav_cap - capacity of wav_out in floats; must be >= T_ssl * 640
+//
+// Returns true on success. On success, exactly T_ssl * 640 samples are
+// written to wav_out.
+bool sovits_session_forward(
+    sovits_session       & session,
+    const sovits_models  & models,
+    const int32_t        * codes,
+    int64_t                T_codes,
+    const int32_t        * text,
+    int64_t                T_text,
+    float                * wav_out,
+    int64_t                wav_cap);
 
 } // namespace gpt_sovits

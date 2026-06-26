@@ -43,3 +43,6 @@ tests/hubert/ref_*.bin
 tests/hubert/*.json
 tests/t2s/ref/sampled_tokens_*.npy
 tests/t2s/ref/sampled_tokens.npy
+
+# Test output artifacts (smoke-test wav dumps, etc.)
+tests/*/out/

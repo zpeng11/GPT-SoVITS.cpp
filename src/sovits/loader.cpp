@@ -6,6 +6,7 @@
 #include "ggml-backend.h"
 
 #include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -583,6 +584,88 @@ void sovits_generator_model_free(sovits_generator_model & model) {
         model.ctx_w = nullptr;
     }
     model.backend = nullptr;
+}
+
+// ---------------------------------------------------------------------------
+// sovits_models: aggregate loader + reader for shared GGUF KV metadata
+// ---------------------------------------------------------------------------
+
+// Read sovits.semantic_frame_rate from the quantizer GGUF. Returns true if
+// the value is "25hz" (or missing — defaults to the shipped v2 checkpoint
+// value). Re-opens the file but only to read KV metadata; tensor data is
+// not touched, so this is cheap.
+static bool read_semantic_frame_rate_25hz(const std::string & quantizer_path) {
+    struct gguf_init_params params = {
+        /*.no_alloc =*/ true,
+        /*.ctx      =*/ nullptr,
+    };
+    struct gguf_context * ctx_gguf = gguf_init_from_file(quantizer_path.c_str(), params);
+    if (!ctx_gguf) {
+        fprintf(stderr, "%s: gguf_init_from_file('%s') failed; defaulting to 25hz\n",
+                __func__, quantizer_path.c_str());
+        return true;
+    }
+
+    bool is_25hz = true;  // default: shipped v2 checkpoint
+    const int64_t key_id = gguf_find_key(ctx_gguf, "sovits.semantic_frame_rate");
+    if (key_id >= 0) {
+        const char * val = gguf_get_val_str(ctx_gguf, key_id);
+        if (val != nullptr && std::strcmp(val, "50hz") == 0) {
+            is_25hz = false;
+        }
+    }
+    gguf_free(ctx_gguf);
+    return is_25hz;
+}
+
+bool sovits_models_load(
+    const std::string & ref_enc_path,
+    const std::string & quantizer_path,
+    const std::string & text_encoder_path,
+    const std::string & flow_path,
+    const std::string & generator_path,
+    sovits_models & models,
+    ggml_backend_t backend)
+{
+    if (!sovits_ref_enc_model_load(ref_enc_path, models.ref_enc, backend)) {
+        return false;
+    }
+    if (!sovits_quantizer_model_load(quantizer_path, models.quantizer, backend)) {
+        sovits_ref_enc_model_free(models.ref_enc);
+        return false;
+    }
+    if (!sovits_text_encoder_model_load(text_encoder_path, models.text_encoder, backend)) {
+        sovits_ref_enc_model_free(models.ref_enc);
+        sovits_quantizer_model_free(models.quantizer);
+        return false;
+    }
+    if (!sovits_flow_model_load(flow_path, models.flow, backend)) {
+        sovits_ref_enc_model_free(models.ref_enc);
+        sovits_quantizer_model_free(models.quantizer);
+        sovits_text_encoder_model_free(models.text_encoder);
+        return false;
+    }
+    if (!sovits_generator_model_load(generator_path, models.generator, backend)) {
+        sovits_ref_enc_model_free(models.ref_enc);
+        sovits_quantizer_model_free(models.quantizer);
+        sovits_text_encoder_model_free(models.text_encoder);
+        sovits_flow_model_free(models.flow);
+        return false;
+    }
+
+    models.hparams.semantic_frame_rate_25hz = read_semantic_frame_rate_25hz(quantizer_path);
+
+    fprintf(stderr, "%s: all 5 sub-models loaded; semantic_frame_rate_25hz=%d\n",
+            __func__, (int) models.hparams.semantic_frame_rate_25hz);
+    return true;
+}
+
+void sovits_models_free(sovits_models & models) {
+    sovits_ref_enc_model_free(models.ref_enc);
+    sovits_quantizer_model_free(models.quantizer);
+    sovits_text_encoder_model_free(models.text_encoder);
+    sovits_flow_model_free(models.flow);
+    sovits_generator_model_free(models.generator);
 }
 
 } // namespace gpt_sovits
