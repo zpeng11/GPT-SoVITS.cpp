@@ -62,27 +62,16 @@ void sovits_session_free(sovits_session & session) {
     session.scratch_randn.clear();
 }
 
-bool sovits_session_compute_ge(
-    sovits_session       & session,
-    const sovits_models  & models,
-    const float          * refer_data,
-    int64_t                T_refer)
+// Run MelStyleEncoder on a single refer slice and return the ge {512} vector
+// in `out` (must have room for kStyleOut floats). Graph is built, allocated,
+// executed, and torn down per call so different slices can have different T.
+static bool compute_ge_single(
+    ggml_backend_t                       backend,
+    const sovits_mel_style_encoder_block_weights & weights,
+    const float                        * refer_data,
+    int64_t                              T_refer,
+    std::vector<float>                 & out)
 {
-    GGML_ASSERT(session.backend != nullptr);
-    GGML_ASSERT(refer_data != nullptr);
-    GGML_ASSERT(T_refer > 0);
-
-    // Release any previously cached ge first.
-    if (session.buf_ge) {
-        ggml_backend_buffer_free(session.buf_ge);
-        session.buf_ge = nullptr;
-    }
-    if (session.ctx_ge) {
-        ggml_free(session.ctx_ge);
-        session.ctx_ge = nullptr;
-    }
-    session.ge = nullptr;
-
     // --- Temp graph context for the MelStyleEncoder forward ---
     const size_t n_intermediates = 64;
     const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
@@ -109,14 +98,14 @@ bool sovits_session_compute_ge(
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx_tmp, graph_size, false);
 
     struct ggml_tensor * result = sovits_mel_style_encoder_block_forward(
-        ctx_tmp, refer, models.ref_enc.weights);
+        ctx_tmp, refer, weights);
 
     ggml_set_name(result, "ge_out");
     ggml_set_output(result);
     ggml_build_forward_expand(gf, result);
 
     // --- Allocate and execute ---
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
+    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(backend);
     ggml_gallocr_t alloc = ggml_gallocr_new(buft);
     if (!alloc) {
         fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
@@ -133,11 +122,65 @@ bool sovits_session_compute_ge(
     ggml_backend_tensor_set(refer, refer_data,
                             0, (size_t) kMelChannels * (size_t) T_refer * sizeof(float));
 
-    if (ggml_backend_graph_compute(session.backend, gf) != GGML_STATUS_SUCCESS) {
+    if (ggml_backend_graph_compute(backend, gf) != GGML_STATUS_SUCCESS) {
         fprintf(stderr, "%s: ggml_backend_graph_compute() failed\n", __func__);
         ggml_gallocr_free(alloc);
         ggml_free(ctx_tmp);
         return false;
+    }
+
+    // --- Read back ge {512} into `out` ---
+    const size_t nbytes = (size_t) kStyleOut * sizeof(float);
+    ggml_backend_tensor_get(result, out.data(), 0, nbytes);
+
+    ggml_gallocr_free(alloc);
+    ggml_free(ctx_tmp);
+    return true;
+}
+
+bool sovits_session_compute_ge(
+    sovits_session       & session,
+    const sovits_models  & models,
+    const std::vector<std::pair<const float *, int64_t>> & refers)
+{
+    GGML_ASSERT(session.backend != nullptr);
+    GGML_ASSERT(!refers.empty());
+
+    // Release any previously cached ge first.
+    if (session.buf_ge) {
+        ggml_backend_buffer_free(session.buf_ge);
+        session.buf_ge = nullptr;
+    }
+    if (session.ctx_ge) {
+        ggml_free(session.ctx_ge);
+        session.ctx_ge = nullptr;
+    }
+    session.ge = nullptr;
+
+    // --- Run MelStyleEncoder per refer slice, accumulate element-wise mean ---
+    std::vector<double>  acc(kStyleOut, 0.0);
+    std::vector<float>   tmp(kStyleOut);
+    for (size_t i = 0; i < refers.size(); ++i) {
+        const float  * refer_data = refers[i].first;
+        const int64_t  T_refer    = refers[i].second;
+        GGML_ASSERT(refer_data != nullptr);
+        GGML_ASSERT(T_refer > 0);
+
+        if (!compute_ge_single(session.backend, models.ref_enc.weights,
+                               refer_data, T_refer, tmp)) {
+            fprintf(stderr, "%s: compute_ge_single failed on refer %zu/%zu\n",
+                    __func__, i + 1, refers.size());
+            return false;
+        }
+        for (size_t j = 0; j < kStyleOut; ++j) {
+            acc[j] += static_cast<double>(tmp[j]);
+        }
+    }
+
+    const double inv = 1.0 / static_cast<double>(refers.size());
+    std::vector<float> mean(kStyleOut);
+    for (size_t j = 0; j < kStyleOut; ++j) {
+        mean[j] = static_cast<float>(acc[j] * inv);
     }
 
     // --- Allocate persistent ge {512, 1} tensor owned by the session ---
@@ -149,8 +192,6 @@ bool sovits_session_compute_ge(
     session.ctx_ge = ggml_init(ge_params);
     if (!session.ctx_ge) {
         fprintf(stderr, "%s: ggml_init() for ge context failed\n", __func__);
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx_tmp);
         return false;
     }
 
@@ -162,25 +203,18 @@ bool sovits_session_compute_ge(
         fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() for ge failed\n", __func__);
         session.ctx_ge = nullptr;
         session.ge     = nullptr;
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx_tmp);
         return false;
     }
 
-    // --- Copy result into session.ge ---
+    // --- Copy averaged ge into session.ge ---
     {
         const size_t nbytes = (size_t) kStyleOut * sizeof(float);
-        std::vector<uint8_t> tmp_buf(nbytes);
-        ggml_backend_tensor_get(result, tmp_buf.data(), 0, nbytes);
-        ggml_backend_tensor_set(session.ge, tmp_buf.data(), 0, nbytes);
+        ggml_backend_tensor_set(session.ge, mean.data(), 0, nbytes);
     }
 
-    // --- Free temporaries ---
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx_tmp);
-
-    fprintf(stderr, "%s: cached ge {%lld, 1} from refer T=%lld\n",
-            __func__, (long long) kStyleOut, (long long) T_refer);
+    fprintf(stderr, "%s: cached ge {%lld, 1} from %zu refer slice%s (mean)\n",
+            __func__, (long long) kStyleOut, refers.size(),
+            refers.size() == 1 ? "" : "s");
     return true;
 }
 

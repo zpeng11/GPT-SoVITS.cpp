@@ -329,9 +329,9 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
     gpt_sovits::sovits_session session{};
     ASSERT_TRUE(gpt_sovits::sovits_session_init(session, backend, 0.5f, 42u));
 
-    // Compute ge from refer.
+    // Compute ge from refer (single-slice list mirrors the previous path).
     ASSERT_TRUE(gpt_sovits::sovits_session_compute_ge(
-        session, models, refer_ggml.data(), T_refer));
+        session, models, {{refer_ggml.data(), T_refer}}));
     struct ggml_tensor * ge = gpt_sovits::sovits_session_get_ge(session);
     ASSERT_NE(ge, nullptr);
     EXPECT_EQ(ge->ne[0], kExpectedGEChans);

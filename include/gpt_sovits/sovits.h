@@ -6,6 +6,7 @@
 #include <array>
 #include <random>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace gpt_sovits {
@@ -723,27 +724,29 @@ void sovits_session_free(sovits_session & session);
 
 // Compute and cache the style embedding ge from reference audio.
 //
-// Builds a temporary graph that runs MelStyleEncoder on the reference
-// features and copies the result into a session-owned persistent tensor
-// (session.ge). Subsequent sovits_session_forward calls reuse this ge.
+// For each refer slice, builds a temporary graph that runs MelStyleEncoder
+// on the reference features; the per-slice results are averaged element-wise
+// (mirrors SynthesizerTrn.decode's `torch.stack(ges, 0).mean(0)` for list
+// refer input), and the mean is copied into a session-owned persistent
+// tensor (session.ge). Subsequent sovits_session_forward calls reuse it.
 //
 // Switching references requires re-calling this; the previously cached ge
-// is freed first. The input `refer_data` must already be sliced to the v2
-// 704-channel slice (i.e. caller does refer[:, :704]).
+// is freed first. Each refer slice's `data` must already be sliced to the
+// v2 704-channel slice (i.e. caller does refer[:, :704]).
 //
 // Parameters:
-//   session    - initialized SoVITS session
-//   models     - loaded SoVITS models (ref_enc weights are read)
-//   refer_data - reference spectrogram features {704, T_refer}, host pointer
-//                (F32, row-major C*T layout matching ggml {704, T})
-//   T_refer    - number of reference time frames
+//   session - initialized SoVITS session
+//   models  - loaded SoVITS models (ref_enc weights are read)
+//   refers  - list of {ptr to reference spectrogram features {704, T},
+//             T frames}. Must be non-empty. Each entry's data is F32,
+//             row-major C*T layout matching ggml {704, T}. Different
+//             entries may have different T.
 //
 // Returns true on success, false on failure.
 bool sovits_session_compute_ge(
     sovits_session       & session,
     const sovits_models  & models,
-    const float          * refer_data,
-    int64_t                T_refer);
+    const std::vector<std::pair<const float *, int64_t>> & refers);
 
 // Get the cached style embedding tensor, or nullptr if not computed.
 struct ggml_tensor * sovits_session_get_ge(const sovits_session & session);
