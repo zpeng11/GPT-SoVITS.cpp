@@ -1,7 +1,7 @@
 // tests/sovits/test_sovits_session.cpp
 //
 // End-to-end smoke test for the SoVITS v2 session pipeline:
-//   - loads all 5 sub-models via sovits_models_load
+//   - loads the unified sovits GGUF (all 5 blocks) via sovits_model_load
 //   - verifies hparams.semantic_frame_rate_25hz is read correctly
 //   - runs sovits_session_compute_ge + sovits_session_forward
 //   - checks output shape (T_ssl * 640), finiteness, and non-trivial range
@@ -36,11 +36,8 @@ namespace {
 static const std::string kTestDir = SOVITS_TEST_DIR;
 static const std::string kModelDir = kTestDir + "models/";
 
-static const std::string kRefEncPath      = kModelDir + "v2-ref-enc-f16.gguf";
-static const std::string kQuantizerPath   = kModelDir + "v2-quantizer-f16.gguf";
-static const std::string kTextEncoderPath = kModelDir + "v2-text-encoder-f16.gguf";
-static const std::string kFlowPath        = kModelDir + "v2-flow-f16.gguf";
-static const std::string kGeneratorPath   = kModelDir + "v2-generator-f16.gguf";
+// Unified GGUF (all 5 blocks in one file, disjoint tensor-name prefixes).
+static const std::string kModelPath = kModelDir + "v2-sovits-f16.gguf";
 
 static const std::string kRefDir       = kTestDir + "ref/";
 static const std::string kReferNpy     = kRefDir + "v2_ref_enc_input.npy";      // BCT, may be >704 channels
@@ -200,49 +197,39 @@ static std::vector<float> repack_bct_to_ggml_ct_sliced(
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Aggregate loader
+// Unified loader
 // ---------------------------------------------------------------------------
 
-TEST(SoVITSModels, LoadsAllFiveSubModels) {
-    ASSERT_MODEL_EXISTS(kRefEncPath);
-    ASSERT_MODEL_EXISTS(kQuantizerPath);
-    ASSERT_MODEL_EXISTS(kTextEncoderPath);
-    ASSERT_MODEL_EXISTS(kFlowPath);
-    ASSERT_MODEL_EXISTS(kGeneratorPath);
+TEST(SoVITSModel, LoadsUnifiedModel) {
+    ASSERT_MODEL_EXISTS(kModelPath);
 
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_models models{};
-    ASSERT_TRUE(gpt_sovits::sovits_models_load(
-        kRefEncPath, kQuantizerPath, kTextEncoderPath,
-        kFlowPath, kGeneratorPath, models, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelPath, model, backend));
 
     // V2 pretrained checkpoint is 25hz.
-    EXPECT_TRUE(models.hparams.semantic_frame_rate_25hz);
+    EXPECT_TRUE(model.hparams.semantic_frame_rate_25hz);
 
-    EXPECT_NE(models.ref_enc.weights.spectral_1_w, nullptr);
-    EXPECT_NE(models.quantizer.weights.codebook, nullptr);
-    EXPECT_NE(models.text_encoder.weights.post.proj_w, nullptr);
-    EXPECT_NE(models.flow.weights.layers[0].pre_w, nullptr);
-    EXPECT_NE(models.generator.weights.conv_pre.w, nullptr);
+    EXPECT_NE(model.ref_enc.spectral_1_w, nullptr);
+    EXPECT_NE(model.quantizer.codebook, nullptr);
+    EXPECT_NE(model.text_encoder.post.proj_w, nullptr);
+    EXPECT_NE(model.flow.layers[0].pre_w, nullptr);
+    EXPECT_NE(model.generator.conv_pre.w, nullptr);
 
-    gpt_sovits::sovits_models_free(models);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
-TEST(SoVITSModels, NonExistentFileReturnsFalse) {
-    ASSERT_MODEL_EXISTS(kQuantizerPath);
-
+TEST(SoVITSModel, NonExistentFileReturnsFalse) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_models models{};
-    EXPECT_FALSE(gpt_sovits::sovits_models_load(
-        "/nonexistent/ref-enc.gguf", kQuantizerPath, kTextEncoderPath,
-        kFlowPath, kGeneratorPath, models, backend));
+    gpt_sovits::sovits_model model{};
+    EXPECT_FALSE(gpt_sovits::sovits_model_load("/nonexistent/sovits.gguf", model, backend));
 
-    gpt_sovits::sovits_models_free(models);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -283,11 +270,7 @@ TEST(SoVITSSession, RejectsInvalidNoiseScale) {
 // ---------------------------------------------------------------------------
 
 TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
-    ASSERT_MODEL_EXISTS(kRefEncPath);
-    ASSERT_MODEL_EXISTS(kQuantizerPath);
-    ASSERT_MODEL_EXISTS(kTextEncoderPath);
-    ASSERT_MODEL_EXISTS(kFlowPath);
-    ASSERT_MODEL_EXISTS(kGeneratorPath);
+    ASSERT_MODEL_EXISTS(kModelPath);
     ASSERT_NPY_EXISTS(kReferNpy);
     ASSERT_NPY_EXISTS(kCodesNpy);
     ASSERT_NPY_EXISTS(kTextNpy);
@@ -296,12 +279,10 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
     ggml_backend_t backend = create_smoke_backend();
     ASSERT_NE(backend, nullptr);
 
-    // Load all 5 models.
-    gpt_sovits::sovits_models models{};
-    ASSERT_TRUE(gpt_sovits::sovits_models_load(
-        kRefEncPath, kQuantizerPath, kTextEncoderPath,
-        kFlowPath, kGeneratorPath, models, backend));
-    ASSERT_TRUE(models.hparams.semantic_frame_rate_25hz);
+    // Load the unified model (all 5 blocks).
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelPath, model, backend));
+    ASSERT_TRUE(model.hparams.semantic_frame_rate_25hz);
 
     // Load refer fixture and repack to ggml {704, T_refer} (slice to [:704]).
     const NpyShapeInfo refer_bct = load_npy_with_shape(kReferNpy);
@@ -331,7 +312,7 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
 
     // Compute ge from refer (single-slice list mirrors the previous path).
     ASSERT_TRUE(gpt_sovits::sovits_session_compute_ge(
-        session, models, {{refer_ggml.data(), T_refer}}));
+        session, model, {{refer_ggml.data(), T_refer}}));
     struct ggml_tensor * ge = gpt_sovits::sovits_session_get_ge(session);
     ASSERT_NE(ge, nullptr);
     EXPECT_EQ(ge->ne[0], kExpectedGEChans);
@@ -342,7 +323,7 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
     const int64_t wav_len = T_ssl * kGeneratorFrameMul;
     std::vector<float> wav(static_cast<size_t>(wav_len), 0.0f);
     ASSERT_TRUE(gpt_sovits::sovits_session_forward(
-        session, models,
+        session, model,
         codes.data(), T_codes,
         text.data(),  T_text,
         wav.data(),   wav_len));
@@ -380,6 +361,6 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
            static_cast<double>(vmin), static_cast<double>(vmax));
 
     gpt_sovits::sovits_session_free(session);
-    gpt_sovits::sovits_models_free(models);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }

@@ -140,7 +140,7 @@ static bool compute_ge_single(
 
 bool sovits_session_compute_ge(
     sovits_session       & session,
-    const sovits_models  & models,
+    const sovits_model   & model,
     const std::vector<std::pair<const float *, int64_t>> & refers)
 {
     GGML_ASSERT(session.backend != nullptr);
@@ -166,7 +166,7 @@ bool sovits_session_compute_ge(
         GGML_ASSERT(refer_data != nullptr);
         GGML_ASSERT(T_refer > 0);
 
-        if (!compute_ge_single(session.backend, models.ref_enc.weights,
+        if (!compute_ge_single(session.backend, model.ref_enc,
                                refer_data, T_refer, tmp)) {
             fprintf(stderr, "%s: compute_ge_single failed on refer %zu/%zu\n",
                     __func__, i + 1, refers.size());
@@ -224,7 +224,7 @@ struct ggml_tensor * sovits_session_get_ge(const sovits_session & session) {
 
 bool sovits_session_forward(
     sovits_session       & session,
-    const sovits_models  & models,
+    const sovits_model   & model,
     const int32_t        * codes,
     int64_t                T_codes,
     const int32_t        * text,
@@ -244,7 +244,7 @@ bool sovits_session_forward(
         return false;
     }
 
-    const bool is_25hz = models.hparams.semantic_frame_rate_25hz;
+    const bool is_25hz = model.hparams.semantic_frame_rate_25hz;
     const int64_t T_ssl = is_25hz ? 2 * T_codes : T_codes;
     const int64_t wav_len = T_ssl * kGeneratorFrameMul;
     if (wav_cap < wav_len) {
@@ -316,7 +316,7 @@ bool sovits_session_forward(
     struct ggml_cgraph * gf = ggml_new_graph_custom(ctx, graph_size, false);
 
     struct ggml_tensor * quantized = sovits_rvq_decode_block_forward(
-        ctx, codes_t, models.quantizer.weights);   // {768, T_codes}
+        ctx, codes_t, model.quantizer);   // {768, T_codes}
 
     if (is_25hz) {
         quantized = sovits_quantized_double_25hz_forward(
@@ -324,16 +324,16 @@ bool sovits_session_forward(
     }
 
     sovits_text_encoder_result enc = sovits_text_encoder_block_forward(
-        ctx, quantized, text_t, session.ge, models.text_encoder.weights);
+        ctx, quantized, text_t, session.ge, model.text_encoder);
 
     struct ggml_tensor * z_p = sovits_sample_z_p_forward(
         ctx, enc.m, enc.logs, randn_t);            // {192, T_ssl}
 
     struct ggml_tensor * z = sovits_flow_block_inverse_forward(
-        ctx, z_p, session.ge, models.flow.weights);   // {192, T_ssl}
+        ctx, z_p, session.ge, model.flow);   // {192, T_ssl}
 
     struct ggml_tensor * wav = sovits_generator_block_forward(
-        ctx, z, session.ge, models.generator.weights);   // {1, T_ssl*640}
+        ctx, z, session.ge, model.generator);   // {1, T_ssl*640}
 
     ggml_set_name(wav, "wav");
     ggml_set_output(wav);

@@ -23,7 +23,7 @@ namespace {
 
 static const std::string kTestDir = SOVITS_TEST_DIR;
 static const std::string kModelF16 =
-    kTestDir + "models/v2-quantizer-f16.gguf";
+    kTestDir + "models/v2-sovits-f16.gguf";
 static const std::string kRefDir = kTestDir + "ref/";
 static const std::string kRefCodesNpy = kRefDir + "v2_quantizer_codes.npy";
 static const std::string kRefDecodedNpy = kRefDir + "v2_quantizer_decoded.npy";
@@ -165,14 +165,14 @@ TEST(SoVITSQuantizer, LoadsSuccessfully) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_quantizer_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_quantizer_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
     EXPECT_NE(model.backend, nullptr);
     EXPECT_NE(model.buf_w, nullptr);
     EXPECT_NE(model.ctx_w, nullptr);
-    EXPECT_NE(model.weights.codebook, nullptr);
+    EXPECT_NE(model.quantizer.codebook, nullptr);
 
-    gpt_sovits::sovits_quantizer_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -182,14 +182,14 @@ TEST(SoVITSQuantizer, WeightPointersAndShapesLookCorrect) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_quantizer_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_quantizer_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
 
-    ASSERT_NE(model.weights.codebook, nullptr);
-    EXPECT_EQ(model.weights.codebook->ne[0], kDim);
-    EXPECT_EQ(model.weights.codebook->ne[1], kBins);
+    ASSERT_NE(model.quantizer.codebook, nullptr);
+    EXPECT_EQ(model.quantizer.codebook->ne[0], kDim);
+    EXPECT_EQ(model.quantizer.codebook->ne[1], kBins);
 
-    gpt_sovits::sovits_quantizer_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -221,8 +221,8 @@ TEST(SoVITSQuantizer, MatchesPythonReference) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_quantizer_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_quantizer_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
 
     GraphContext gctx(kMaxNodes);
     ASSERT_NE(gctx.ctx, nullptr);
@@ -235,7 +235,7 @@ TEST(SoVITSQuantizer, MatchesPythonReference) {
     ggml_set_input(inp);
 
     struct ggml_tensor * out =
-        gpt_sovits::sovits_rvq_decode_block_forward(gctx, inp, model.weights);
+        gpt_sovits::sovits_rvq_decode_block_forward(gctx, inp, model.quantizer);
     ASSERT_NE(out, nullptr);
     ggml_set_name(out, "decoded");
     ggml_set_output(out);
@@ -269,7 +269,7 @@ TEST(SoVITSQuantizer, MatchesPythonReference) {
     EXPECT_LT(err.rmse, kParityRmseTol);
 
     ggml_gallocr_free(alloc);
-    gpt_sovits::sovits_quantizer_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -277,13 +277,13 @@ TEST(SoVITSQuantizer, NonExistentFileReturnsFalse) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_quantizer_model model{};
-    EXPECT_FALSE(gpt_sovits::sovits_quantizer_model_load("/nonexistent/path.gguf", model, backend));
+    gpt_sovits::sovits_model model{};
+    EXPECT_FALSE(gpt_sovits::sovits_model_load("/nonexistent/path.gguf", model, backend));
 
     ggml_backend_free(backend);
 }
 
 TEST(SoVITSQuantizer, FreeOnDefaultInitializedModelIsSafe) {
-    gpt_sovits::sovits_quantizer_model model{};
-    gpt_sovits::sovits_quantizer_model_free(model);
+    gpt_sovits::sovits_model model{};
+    gpt_sovits::sovits_model_free(model);
 }

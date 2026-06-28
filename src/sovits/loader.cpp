@@ -22,6 +22,12 @@ static struct ggml_tensor * checked_get_tensor(struct ggml_context * ctx, const 
     return t;
 }
 
+// ---------------------------------------------------------------------------
+// Per-block populate helpers: each looks up one block's tensors (by disjoint
+// GGUF name prefix) from a single shared ggml context. Used by the unified
+// sovits_model_load to fill all 5 weight sub-structs from one GGUF file.
+// ---------------------------------------------------------------------------
+
 static bool populate_weights(
     struct ggml_context * ctx,
     sovits_mel_style_encoder_block_weights & w)
@@ -268,8 +274,11 @@ static bool populate_text_encoder_post_weights(
         }
     }
 
-    w.proj_w = ggml_get_tensor(ctx, "text_encoder_post.proj_w");
-    w.proj_b = ggml_get_tensor(ctx, "text_encoder_post.proj_b");
+    w.proj_w = checked_get_tensor(ctx, "text_encoder_post.proj_w");
+    w.proj_b = checked_get_tensor(ctx, "text_encoder_post.proj_b");
+    if (!w.proj_w || !w.proj_b) {
+        return false;
+    }
 
     return true;
 }
@@ -278,28 +287,152 @@ static bool populate_text_encoder_weights(
     struct ggml_context * ctx,
     sovits_text_encoder_block_weights & w)
 {
-    if (!populate_text_encoder_ssl_weights(ctx, w.ssl)
-        || !populate_text_encoder_text_weights(ctx, w.text)
-        || !populate_text_encoder_mrte_weights(ctx, w.mrte)
-        || !populate_text_encoder_post_weights(ctx, w.post)) {
+    return populate_text_encoder_ssl_weights(ctx, w.ssl)
+        && populate_text_encoder_text_weights(ctx, w.text)
+        && populate_text_encoder_mrte_weights(ctx, w.mrte)
+        && populate_text_encoder_post_weights(ctx, w.post);
+}
+
+static bool populate_flow_weights(
+    struct ggml_context * ctx,
+    sovits_flow_block_weights & w)
+{
+    for (int L = 0; L < kSovitsFlowNFlows; ++L) {
+        auto & layer = w.layers[L];
+        char name[64];
+
+        snprintf(name, sizeof(name), "flow.layers.%d.pre_w", L);
+        layer.pre_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "flow.layers.%d.pre_b", L);
+        layer.pre_b = checked_get_tensor(ctx, name);
+
+        snprintf(name, sizeof(name), "flow.layers.%d.post_w", L);
+        layer.post_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "flow.layers.%d.post_b", L);
+        layer.post_b = checked_get_tensor(ctx, name);
+
+        if (!layer.pre_w || !layer.pre_b || !layer.post_w || !layer.post_b) {
+            return false;
+        }
+
+        auto & enc = layer.enc;
+        snprintf(name, sizeof(name), "flow.layers.%d.enc.cond_w", L);
+        enc.cond_w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "flow.layers.%d.enc.cond_b", L);
+        enc.cond_b = checked_get_tensor(ctx, name);
+
+        if (!enc.cond_w || !enc.cond_b) {
+            return false;
+        }
+
+        for (int j = 0; j < kSovitsFlowWNLayers; ++j) {
+            snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.in_w", L, j);
+            enc.layers[j].in_w = checked_get_tensor(ctx, name);
+            snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.in_b", L, j);
+            enc.layers[j].in_b = checked_get_tensor(ctx, name);
+
+            snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.rs_w", L, j);
+            enc.layers[j].rs_w = checked_get_tensor(ctx, name);
+            snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.rs_b", L, j);
+            enc.layers[j].rs_b = checked_get_tensor(ctx, name);
+
+            if (!enc.layers[j].in_w || !enc.layers[j].in_b
+                || !enc.layers[j].rs_w || !enc.layers[j].rs_b) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+static bool populate_generator_weights(
+    struct ggml_context * ctx,
+    sovits_generator_block_weights & w)
+{
+    w.conv_pre.w = checked_get_tensor(ctx, "generator.conv_pre_w");
+    w.conv_pre.b = checked_get_tensor(ctx, "generator.conv_pre_b");
+    w.cond.w = checked_get_tensor(ctx, "generator.cond_w");
+    w.cond.b = checked_get_tensor(ctx, "generator.cond_b");
+    w.conv_post_w = checked_get_tensor(ctx, "generator.conv_post_w");
+
+    if (!w.conv_pre.w || !w.conv_pre.b || !w.cond.w || !w.cond.b || !w.conv_post_w) {
         return false;
     }
 
-    if (!w.post.proj_w || !w.post.proj_b) {
-        fprintf(stderr, "%s: tensor 'text_encoder_post.proj_w' or 'text_encoder_post.proj_b' not found in GGUF\n", __func__);
-        return false;
+    for (int s = 0; s < kSovitsGeneratorStages; ++s) {
+        auto & stage = w.stages[s];
+        char name[96];
+
+        snprintf(name, sizeof(name), "generator.stages.%d.up_w", s);
+        stage.up.w = checked_get_tensor(ctx, name);
+        snprintf(name, sizeof(name), "generator.stages.%d.up_b", s);
+        stage.up.b = checked_get_tensor(ctx, name);
+        if (!stage.up.w || !stage.up.b) {
+            return false;
+        }
+
+        for (int b = 0; b < kSovitsGeneratorBranches; ++b) {
+            auto & block = stage.resblocks[b];
+            for (int i = 0; i < kSovitsGeneratorResLayers; ++i) {
+                snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs1.%d.w", s, b, i);
+                block.convs1[i].w = checked_get_tensor(ctx, name);
+                snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs1.%d.b", s, b, i);
+                block.convs1[i].b = checked_get_tensor(ctx, name);
+                snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs2.%d.w", s, b, i);
+                block.convs2[i].w = checked_get_tensor(ctx, name);
+                snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs2.%d.b", s, b, i);
+                block.convs2[i].b = checked_get_tensor(ctx, name);
+
+                if (!block.convs1[i].w || !block.convs1[i].b || !block.convs2[i].w || !block.convs2[i].b) {
+                    return false;
+                }
+            }
+        }
     }
 
     return true;
 }
 
-template <typename ModelT, typename PopulateFn>
-static bool load_model_from_gguf(
+// Populate all 5 weight sub-structs from one shared ggml context.
+static bool populate_all_weights(
+    struct ggml_context * ctx,
+    sovits_model & m)
+{
+    return populate_weights(ctx, m.ref_enc)
+        && populate_quantizer_weights(ctx, m.quantizer)
+        && populate_text_encoder_weights(ctx, m.text_encoder)
+        && populate_flow_weights(ctx, m.flow)
+        && populate_generator_weights(ctx, m.generator);
+}
+
+// Read sovits.semantic_frame_rate from the unified GGUF KV. Returns true if
+// the value is "25hz" (or missing — defaults to the shipped v2 checkpoint).
+static bool read_semantic_frame_rate_25hz(struct gguf_context * ctx_gguf) {
+    bool is_25hz = true;  // default: shipped v2 checkpoint
+    const int64_t key_id = gguf_find_key(ctx_gguf, "sovits.semantic_frame_rate");
+    if (key_id >= 0) {
+        const char * val = gguf_get_val_str(ctx_gguf, key_id);
+        if (val != nullptr && std::strcmp(val, "50hz") == 0) {
+            is_25hz = false;
+        }
+    }
+    return is_25hz;
+}
+
+} // namespace
+
+// ---------------------------------------------------------------------------
+// sovits_model_load: load one unified GGUF into all 5 weight sub-structs.
+//
+// Mirrors t2s_model_load: a single gguf_init_from_file allocates every
+// tensor in one backend buffer, populate_all_weights wires them into the
+// weight sub-structs, and one pass streams tensor data from disk.
+// ---------------------------------------------------------------------------
+
+bool sovits_model_load(
     const std::string & fname,
-    ModelT & model,
-    ggml_backend_t backend,
-    PopulateFn populate,
-    void (*free_model)(ModelT &))
+    sovits_model & model,
+    ggml_backend_t backend)
 {
     GGML_ASSERT(backend != nullptr);
     model.backend = backend;
@@ -315,18 +448,20 @@ static bool load_model_from_gguf(
         return false;
     }
 
+    model.hparams.semantic_frame_rate_25hz = read_semantic_frame_rate_25hz(ctx_gguf);
+
     model.buf_w = ggml_backend_alloc_ctx_tensors(model.ctx_w, model.backend);
     if (!model.buf_w) {
         fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() failed\n", __func__);
         gguf_free(ctx_gguf);
-        free_model(model);
+        sovits_model_free(model);
         return false;
     }
 
-    if (!populate(model.ctx_w, model.weights)) {
-        fprintf(stderr, "%s: populate_weights() failed -- missing tensors\n", __func__);
+    if (!populate_all_weights(model.ctx_w, model)) {
+        fprintf(stderr, "%s: populate_all_weights() failed -- missing tensors\n", __func__);
         gguf_free(ctx_gguf);
-        free_model(model);
+        sovits_model_free(model);
         return false;
     }
 
@@ -334,7 +469,7 @@ static bool load_model_from_gguf(
     if (!f) {
         fprintf(stderr, "%s: fopen('%s') failed\n", __func__, fname.c_str());
         gguf_free(ctx_gguf);
-        free_model(model);
+        sovits_model_free(model);
         return false;
     }
 
@@ -354,14 +489,14 @@ static bool load_model_from_gguf(
             fprintf(stderr, "%s: fseek() failed for tensor '%s'\n", __func__, name);
             fclose(f);
             gguf_free(ctx_gguf);
-            free_model(model);
+            sovits_model_free(model);
             return false;
         }
         if (fread(buf.data(), 1, nbytes, f) != nbytes) {
             fprintf(stderr, "%s: fread() failed for tensor '%s' (%zu bytes)\n", __func__, name, nbytes);
             fclose(f);
             gguf_free(ctx_gguf);
-            free_model(model);
+            sovits_model_free(model);
             return false;
         }
 
@@ -371,42 +506,13 @@ static bool load_model_from_gguf(
     fclose(f);
     gguf_free(ctx_gguf);
 
-    fprintf(stderr, "%s: loaded %lld tensors from '%s'\n", __func__, (long long) n_tensors, fname.c_str());
+    fprintf(stderr, "%s: loaded %lld tensors from '%s' (semantic_frame_rate_25hz=%d)\n",
+            __func__, (long long) n_tensors, fname.c_str(),
+            (int) model.hparams.semantic_frame_rate_25hz);
     return true;
 }
 
-} // namespace
-
-bool sovits_ref_enc_model_load(
-    const std::string & fname,
-    sovits_ref_enc_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(fname, model, backend, populate_weights, sovits_ref_enc_model_free);
-}
-
-bool sovits_quantizer_model_load(
-    const std::string & fname,
-    sovits_quantizer_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(fname, model, backend, populate_quantizer_weights, sovits_quantizer_model_free);
-}
-
-bool sovits_text_encoder_model_load(
-    const std::string & fname,
-    sovits_text_encoder_model & model,
-    ggml_backend_t backend)
-{
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate_text_encoder_weights,
-        sovits_text_encoder_model_free);
-}
-
-void sovits_ref_enc_model_free(sovits_ref_enc_model & model) {
+void sovits_model_free(sovits_model & model) {
     if (model.buf_w) {
         ggml_backend_buffer_free(model.buf_w);
         model.buf_w = nullptr;
@@ -416,256 +522,6 @@ void sovits_ref_enc_model_free(sovits_ref_enc_model & model) {
         model.ctx_w = nullptr;
     }
     model.backend = nullptr;
-}
-
-void sovits_quantizer_model_free(sovits_quantizer_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-void sovits_text_encoder_model_free(sovits_text_encoder_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-bool sovits_flow_model_load(
-    const std::string & fname,
-    sovits_flow_model & model,
-    ggml_backend_t backend)
-{
-    auto populate = [](struct ggml_context * ctx, sovits_flow_block_weights & w) -> bool {
-        for (int L = 0; L < kSovitsFlowNFlows; ++L) {
-            auto & layer = w.layers[L];
-            char name[64];
-
-            snprintf(name, sizeof(name), "flow.layers.%d.pre_w", L);
-            layer.pre_w = checked_get_tensor(ctx, name);
-            snprintf(name, sizeof(name), "flow.layers.%d.pre_b", L);
-            layer.pre_b = checked_get_tensor(ctx, name);
-
-            snprintf(name, sizeof(name), "flow.layers.%d.post_w", L);
-            layer.post_w = checked_get_tensor(ctx, name);
-            snprintf(name, sizeof(name), "flow.layers.%d.post_b", L);
-            layer.post_b = checked_get_tensor(ctx, name);
-
-            if (!layer.pre_w || !layer.pre_b || !layer.post_w || !layer.post_b) {
-                return false;
-            }
-
-            auto & enc = layer.enc;
-            snprintf(name, sizeof(name), "flow.layers.%d.enc.cond_w", L);
-            enc.cond_w = checked_get_tensor(ctx, name);
-            snprintf(name, sizeof(name), "flow.layers.%d.enc.cond_b", L);
-            enc.cond_b = checked_get_tensor(ctx, name);
-
-            if (!enc.cond_w || !enc.cond_b) {
-                return false;
-            }
-
-            for (int j = 0; j < kSovitsFlowWNLayers; ++j) {
-                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.in_w", L, j);
-                enc.layers[j].in_w = checked_get_tensor(ctx, name);
-                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.in_b", L, j);
-                enc.layers[j].in_b = checked_get_tensor(ctx, name);
-
-                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.rs_w", L, j);
-                enc.layers[j].rs_w = checked_get_tensor(ctx, name);
-                snprintf(name, sizeof(name), "flow.layers.%d.enc.%d.rs_b", L, j);
-                enc.layers[j].rs_b = checked_get_tensor(ctx, name);
-
-                if (!enc.layers[j].in_w || !enc.layers[j].in_b
-                    || !enc.layers[j].rs_w || !enc.layers[j].rs_b) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    };
-
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate,
-        sovits_flow_model_free);
-}
-
-bool sovits_generator_model_load(
-    const std::string & fname,
-    sovits_generator_model & model,
-    ggml_backend_t backend)
-{
-    auto populate = [](struct ggml_context * ctx, sovits_generator_block_weights & w) -> bool {
-        w.conv_pre.w = checked_get_tensor(ctx, "generator.conv_pre_w");
-        w.conv_pre.b = checked_get_tensor(ctx, "generator.conv_pre_b");
-        w.cond.w = checked_get_tensor(ctx, "generator.cond_w");
-        w.cond.b = checked_get_tensor(ctx, "generator.cond_b");
-        w.conv_post_w = checked_get_tensor(ctx, "generator.conv_post_w");
-
-        if (!w.conv_pre.w || !w.conv_pre.b || !w.cond.w || !w.cond.b || !w.conv_post_w) {
-            return false;
-        }
-
-        for (int s = 0; s < kSovitsGeneratorStages; ++s) {
-            auto & stage = w.stages[s];
-            char name[96];
-
-            snprintf(name, sizeof(name), "generator.stages.%d.up_w", s);
-            stage.up.w = checked_get_tensor(ctx, name);
-            snprintf(name, sizeof(name), "generator.stages.%d.up_b", s);
-            stage.up.b = checked_get_tensor(ctx, name);
-            if (!stage.up.w || !stage.up.b) {
-                return false;
-            }
-
-            for (int b = 0; b < kSovitsGeneratorBranches; ++b) {
-                auto & block = stage.resblocks[b];
-                for (int i = 0; i < kSovitsGeneratorResLayers; ++i) {
-                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs1.%d.w", s, b, i);
-                    block.convs1[i].w = checked_get_tensor(ctx, name);
-                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs1.%d.b", s, b, i);
-                    block.convs1[i].b = checked_get_tensor(ctx, name);
-                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs2.%d.w", s, b, i);
-                    block.convs2[i].w = checked_get_tensor(ctx, name);
-                    snprintf(name, sizeof(name), "generator.stages.%d.resblocks.%d.convs2.%d.b", s, b, i);
-                    block.convs2[i].b = checked_get_tensor(ctx, name);
-
-                    if (!block.convs1[i].w || !block.convs1[i].b || !block.convs2[i].w || !block.convs2[i].b) {
-                        return false;
-                    }
-                }
-            }
-        }
-
-        return true;
-    };
-
-    return load_model_from_gguf(
-        fname,
-        model,
-        backend,
-        populate,
-        sovits_generator_model_free);
-}
-
-void sovits_flow_model_free(sovits_flow_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-void sovits_generator_model_free(sovits_generator_model & model) {
-    if (model.buf_w) {
-        ggml_backend_buffer_free(model.buf_w);
-        model.buf_w = nullptr;
-    }
-    if (model.ctx_w) {
-        ggml_free(model.ctx_w);
-        model.ctx_w = nullptr;
-    }
-    model.backend = nullptr;
-}
-
-// ---------------------------------------------------------------------------
-// sovits_models: aggregate loader + reader for shared GGUF KV metadata
-// ---------------------------------------------------------------------------
-
-// Read sovits.semantic_frame_rate from the quantizer GGUF. Returns true if
-// the value is "25hz" (or missing — defaults to the shipped v2 checkpoint
-// value). Re-opens the file but only to read KV metadata; tensor data is
-// not touched, so this is cheap.
-static bool read_semantic_frame_rate_25hz(const std::string & quantizer_path) {
-    struct gguf_init_params params = {
-        /*.no_alloc =*/ true,
-        /*.ctx      =*/ nullptr,
-    };
-    struct gguf_context * ctx_gguf = gguf_init_from_file(quantizer_path.c_str(), params);
-    if (!ctx_gguf) {
-        fprintf(stderr, "%s: gguf_init_from_file('%s') failed; defaulting to 25hz\n",
-                __func__, quantizer_path.c_str());
-        return true;
-    }
-
-    bool is_25hz = true;  // default: shipped v2 checkpoint
-    const int64_t key_id = gguf_find_key(ctx_gguf, "sovits.semantic_frame_rate");
-    if (key_id >= 0) {
-        const char * val = gguf_get_val_str(ctx_gguf, key_id);
-        if (val != nullptr && std::strcmp(val, "50hz") == 0) {
-            is_25hz = false;
-        }
-    }
-    gguf_free(ctx_gguf);
-    return is_25hz;
-}
-
-bool sovits_models_load(
-    const std::string & ref_enc_path,
-    const std::string & quantizer_path,
-    const std::string & text_encoder_path,
-    const std::string & flow_path,
-    const std::string & generator_path,
-    sovits_models & models,
-    ggml_backend_t backend)
-{
-    if (!sovits_ref_enc_model_load(ref_enc_path, models.ref_enc, backend)) {
-        return false;
-    }
-    if (!sovits_quantizer_model_load(quantizer_path, models.quantizer, backend)) {
-        sovits_ref_enc_model_free(models.ref_enc);
-        return false;
-    }
-    if (!sovits_text_encoder_model_load(text_encoder_path, models.text_encoder, backend)) {
-        sovits_ref_enc_model_free(models.ref_enc);
-        sovits_quantizer_model_free(models.quantizer);
-        return false;
-    }
-    if (!sovits_flow_model_load(flow_path, models.flow, backend)) {
-        sovits_ref_enc_model_free(models.ref_enc);
-        sovits_quantizer_model_free(models.quantizer);
-        sovits_text_encoder_model_free(models.text_encoder);
-        return false;
-    }
-    if (!sovits_generator_model_load(generator_path, models.generator, backend)) {
-        sovits_ref_enc_model_free(models.ref_enc);
-        sovits_quantizer_model_free(models.quantizer);
-        sovits_text_encoder_model_free(models.text_encoder);
-        sovits_flow_model_free(models.flow);
-        return false;
-    }
-
-    models.hparams.semantic_frame_rate_25hz = read_semantic_frame_rate_25hz(quantizer_path);
-
-    fprintf(stderr, "%s: all 5 sub-models loaded; semantic_frame_rate_25hz=%d\n",
-            __func__, (int) models.hparams.semantic_frame_rate_25hz);
-    return true;
-}
-
-void sovits_models_free(sovits_models & models) {
-    sovits_ref_enc_model_free(models.ref_enc);
-    sovits_quantizer_model_free(models.quantizer);
-    sovits_text_encoder_model_free(models.text_encoder);
-    sovits_flow_model_free(models.flow);
-    sovits_generator_model_free(models.generator);
 }
 
 } // namespace gpt_sovits

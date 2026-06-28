@@ -26,13 +26,13 @@ namespace {
 
 static const std::string kTestDir = SOVITS_TEST_DIR;
 static const std::string kModelF16 =
-    kTestDir + "models/v2-ref-enc-f16.gguf";
+    kTestDir + "models/v2-sovits-f16.gguf";
 static const std::string kModelQ8 =
-    kTestDir + "models/v2-ref-enc-q8.gguf";
+    kTestDir + "models/v2-sovits-q8.gguf";
 static const std::string kModelQ5 =
-    kTestDir + "models/v2-ref-enc-q5.gguf";
+    kTestDir + "models/v2-sovits-q5.gguf";
 static const std::string kModelQ4 =
-    kTestDir + "models/v2-ref-enc-q4.gguf";
+    kTestDir + "models/v2-sovits-q4.gguf";
 static const std::string kRefDir = kTestDir + "ref/";
 static const std::string kRefInputNpy = kRefDir + "v2_ref_enc_input.npy";
 static const std::string kRefOutputNpy = kRefDir + "v2_ref_enc_ge.npy";
@@ -181,13 +181,13 @@ TEST(SoVITSRefEnc, LoadsSuccessfully) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
     EXPECT_NE(model.backend, nullptr);
     EXPECT_NE(model.buf_w, nullptr);
     EXPECT_NE(model.ctx_w, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -198,14 +198,14 @@ TEST_P(SoVITSRefEncVariants, LoadsSuccessfully) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(variant.path, model, backend))
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(variant.path, model, backend))
         << "Failed to load " << variant.path;
     EXPECT_NE(model.backend, nullptr);
     EXPECT_NE(model.buf_w, nullptr);
     EXPECT_NE(model.ctx_w, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -215,10 +215,10 @@ TEST(SoVITSRefEnc, WeightPointersAndShapesLookCorrect) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
 
-    const auto & w = model.weights;
+    const auto & w = model.ref_enc;
     ASSERT_NE(w.spectral_1_w, nullptr);
     ASSERT_NE(w.spectral_1_b, nullptr);
     ASSERT_NE(w.spectral_2_w, nullptr);
@@ -249,7 +249,7 @@ TEST(SoVITSRefEnc, WeightPointersAndShapesLookCorrect) {
     EXPECT_EQ(w.fc_w->ne[1], 512);
     EXPECT_EQ(w.fc_b->ne[0], 512);
 
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -259,8 +259,8 @@ TEST(SoVITSRefEnc, BuildsGraphAndRunsInference) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
 
     GraphContext gctx(kMaxNodes);
     ASSERT_NE(gctx.ctx, nullptr);
@@ -273,7 +273,7 @@ TEST(SoVITSRefEnc, BuildsGraphAndRunsInference) {
     ggml_set_input(inp);
 
     struct ggml_tensor * out =
-        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.weights);
+        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.ref_enc);
     ASSERT_NE(out, nullptr);
     ggml_set_name(out, "ge");
     ggml_set_output(out);
@@ -304,7 +304,7 @@ TEST(SoVITSRefEnc, BuildsGraphAndRunsInference) {
     }
 
     ggml_gallocr_free(alloc);
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -315,8 +315,8 @@ TEST_P(SoVITSRefEncVariants, BuildsGraphAndRunsInference) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(variant.path, model, backend))
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(variant.path, model, backend))
         << "Failed to load " << variant.path;
 
     GraphContext gctx(kMaxNodes);
@@ -330,7 +330,7 @@ TEST_P(SoVITSRefEncVariants, BuildsGraphAndRunsInference) {
     ggml_set_input(inp);
 
     struct ggml_tensor * out =
-        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.weights);
+        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.ref_enc);
     ASSERT_NE(out, nullptr);
     ggml_set_name(out, "ge");
     ggml_set_output(out);
@@ -361,7 +361,7 @@ TEST_P(SoVITSRefEncVariants, BuildsGraphAndRunsInference) {
     }
 
     ggml_gallocr_free(alloc);
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -395,8 +395,8 @@ TEST(SoVITSRefEnc, MatchesPythonReference) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(kModelF16, model, backend));
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelF16, model, backend));
 
     GraphContext gctx(kMaxNodes);
     ASSERT_NE(gctx.ctx, nullptr);
@@ -409,7 +409,7 @@ TEST(SoVITSRefEnc, MatchesPythonReference) {
     ggml_set_input(inp);
 
     struct ggml_tensor * out =
-        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.weights);
+        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.ref_enc);
     ASSERT_NE(out, nullptr);
     ggml_set_name(out, "ge");
     ggml_set_output(out);
@@ -444,7 +444,7 @@ TEST(SoVITSRefEnc, MatchesPythonReference) {
     EXPECT_LT(err.rmse, kParityRmseTol);
 
     ggml_gallocr_free(alloc);
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -479,8 +479,8 @@ TEST_P(SoVITSRefEncVariants, MatchesPythonReference) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    ASSERT_TRUE(gpt_sovits::sovits_ref_enc_model_load(variant.path, model, backend))
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(variant.path, model, backend))
         << "Failed to load " << variant.path;
 
     GraphContext gctx(kMaxNodes);
@@ -494,7 +494,7 @@ TEST_P(SoVITSRefEncVariants, MatchesPythonReference) {
     ggml_set_input(inp);
 
     struct ggml_tensor * out =
-        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.weights);
+        gpt_sovits::sovits_mel_style_encoder_block_forward(gctx, inp, model.ref_enc);
     ASSERT_NE(out, nullptr);
     ggml_set_name(out, "ge");
     ggml_set_output(out);
@@ -533,7 +533,7 @@ TEST_P(SoVITSRefEncVariants, MatchesPythonReference) {
     EXPECT_LT(err.rmse, variant.rmse_tol);
 
     ggml_gallocr_free(alloc);
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }
 
@@ -541,15 +541,15 @@ TEST(SoVITSRefEnc, NonExistentFileReturnsFalse) {
     ggml_backend_t backend = create_test_backend();
     ASSERT_NE(backend, nullptr);
 
-    gpt_sovits::sovits_ref_enc_model model{};
-    EXPECT_FALSE(gpt_sovits::sovits_ref_enc_model_load("/nonexistent/path.gguf", model, backend));
+    gpt_sovits::sovits_model model{};
+    EXPECT_FALSE(gpt_sovits::sovits_model_load("/nonexistent/path.gguf", model, backend));
 
     ggml_backend_free(backend);
 }
 
 TEST(SoVITSRefEnc, FreeOnDefaultInitializedModelIsSafe) {
-    gpt_sovits::sovits_ref_enc_model model{};
-    gpt_sovits::sovits_ref_enc_model_free(model);
+    gpt_sovits::sovits_model model{};
+    gpt_sovits::sovits_model_free(model);
 }
 
 INSTANTIATE_TEST_SUITE_P(

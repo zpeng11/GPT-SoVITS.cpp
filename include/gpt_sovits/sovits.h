@@ -501,165 +501,53 @@ struct ggml_tensor * sovits_sample_z_p_forward(
     struct ggml_tensor  * randn);
 
 // ---------------------------------------------------------------------------
-// SoVITS ref_enc model: owns the loaded GGUF weights and ggml resources
-// (except backend, which is borrowed from the caller).
+// SoVITS v2 unified model: owns the loaded GGUF weights and ggml resources
+// for all 5 inference blocks (except backend, which is borrowed from the
+// caller).
+//
+// A single unified GGUF (produced by `convert_sovits_to_gguf.py`) holds every
+// block under disjoint tensor-name prefixes (ref_enc.*, quantizer.*,
+// text_encoder_*.*, flow.*, generator.*), so one file + one load replaces the
+// previous 5-file pipeline. Each member below is the weight sub-struct used
+// directly by the matching *_block_forward graph builder in block.cpp.
 // ---------------------------------------------------------------------------
 
-struct sovits_ref_enc_model {
-    sovits_mel_style_encoder_block_weights weights = {};
+struct sovits_model {
+    sovits_mel_style_encoder_block_weights  ref_enc;       // MelStyleEncoder
+    sovits_rvq_decode_block_weights        quantizer;      // RVQ codebook
+    sovits_text_encoder_block_weights      text_encoder;   // enc_p (ssl/text/mrte/post)
+    sovits_flow_block_weights              flow;           // ResidualCouplingBlock
+    sovits_generator_block_weights         generator;      // HiFi-GAN
+
+    sovits_hparams hparams = {};
 
     ggml_backend_t            backend = nullptr;
     ggml_backend_buffer_t     buf_w   = nullptr;
     struct ggml_context     * ctx_w   = nullptr;
 };
 
-// SoVITS quantizer model: owns the loaded GGUF weights and ggml resources
-// (except backend, which is borrowed from the caller).
-struct sovits_quantizer_model {
-    sovits_rvq_decode_block_weights weights = {};
-
-    ggml_backend_t            backend = nullptr;
-    ggml_backend_buffer_t     buf_w   = nullptr;
-    struct ggml_context     * ctx_w   = nullptr;
-};
-
-// SoVITS full text-encoder model: owns the loaded GGUF weights and ggml
-// resources (except backend, which is borrowed from the caller).
-struct sovits_text_encoder_model {
-    sovits_text_encoder_block_weights weights = {};
-
-    ggml_backend_t            backend = nullptr;
-    ggml_backend_buffer_t     buf_w   = nullptr;
-    struct ggml_context     * ctx_w   = nullptr;
-};
-
-// SoVITS flow model: owns the loaded GGUF weights and ggml resources
-// (except backend, which is borrowed from the caller).
-struct sovits_flow_model {
-    sovits_flow_block_weights weights = {};
-
-    ggml_backend_t            backend = nullptr;
-    ggml_backend_buffer_t     buf_w   = nullptr;
-    struct ggml_context     * ctx_w   = nullptr;
-};
-
-// SoVITS generator model: owns the loaded GGUF weights and ggml resources
-// (except backend, which is borrowed from the caller).
-struct sovits_generator_model {
-    sovits_generator_block_weights weights = {};
-
-    ggml_backend_t            backend = nullptr;
-    ggml_backend_buffer_t     buf_w   = nullptr;
-    struct ggml_context     * ctx_w   = nullptr;
-};
-
-// Load a SoVITS ref_enc model from a GGUF file produced by
-// `convert_sovits_ref_enc_to_gguf.py`.
+// Load a unified SoVITS model from a single GGUF file produced by
+// `convert_sovits_to_gguf.py`.
+//
+// Reads sovits.semantic_frame_rate from the GGUF KV to populate
+// model.hparams. If the key is missing, defaults to "25hz" (the shipped
+// v2 pretrained checkpoint value).
 //
 // Parameters:
-//   fname   - path to the .gguf file
+//   fname   - path to the unified .gguf file
 //   model   - output model struct (will be populated)
 //   backend - ggml backend for tensor allocation (caller-owned; not freed by
-//             sovits_ref_enc_model_free)
+//             sovits_model_free)
 //
 // Returns:
 //   true on success, false on failure.
-bool sovits_ref_enc_model_load(
+bool sovits_model_load(
     const std::string & fname,
-    sovits_ref_enc_model & model,
+    sovits_model & model,
     ggml_backend_t backend);
 
-// Load a SoVITS quantizer model from a GGUF file produced by
-// `convert_sovits_quantizer_to_gguf.py`.
-bool sovits_quantizer_model_load(
-    const std::string & fname,
-    sovits_quantizer_model & model,
-    ggml_backend_t backend);
-
-// Load a SoVITS full text_encoder model from a GGUF file produced by
-// `convert_sovits_text_encoder_to_gguf.py`.
-bool sovits_text_encoder_model_load(
-    const std::string & fname,
-    sovits_text_encoder_model & model,
-    ggml_backend_t backend);
-
-// Load a SoVITS flow model from a GGUF file produced by
-// `convert_sovits_flow_to_gguf.py`.
-bool sovits_flow_model_load(
-    const std::string & fname,
-    sovits_flow_model & model,
-    ggml_backend_t backend);
-
-// Load a SoVITS generator model from a GGUF file produced by
-// `convert_sovits_generator_to_gguf.py`.
-bool sovits_generator_model_load(
-    const std::string & fname,
-    sovits_generator_model & model,
-    ggml_backend_t backend);
-
-// Free all resources owned by a SoVITS ref_enc model.
-void sovits_ref_enc_model_free(sovits_ref_enc_model & model);
-
-// Free all resources owned by a SoVITS quantizer model.
-void sovits_quantizer_model_free(sovits_quantizer_model & model);
-
-// Free all resources owned by a SoVITS text_encoder model.
-void sovits_text_encoder_model_free(sovits_text_encoder_model & model);
-
-// Free all resources owned by a SoVITS flow model.
-void sovits_flow_model_free(sovits_flow_model & model);
-
-// Free all resources owned by a SoVITS generator model.
-void sovits_generator_model_free(sovits_generator_model & model);
-
-// ---------------------------------------------------------------------------
-// SoVITS v2 aggregate: bundles all 5 sub-models + hparams
-//
-// Each sub-model retains independent ownership of its GGUF weights and
-// ggml resources; the aggregate only groups references so callers don't
-// have to manage 5 separate structs.
-// ---------------------------------------------------------------------------
-
-struct sovits_models {
-    sovits_ref_enc_model      ref_enc;
-    sovits_quantizer_model    quantizer;
-    sovits_text_encoder_model text_encoder;
-    sovits_flow_model         flow;
-    sovits_generator_model    generator;
-
-    sovits_hparams hparams = {};
-};
-
-// Load all 5 SoVITS sub-models from their respective GGUF files.
-//
-// Reads sovits.semantic_frame_rate from the quantizer GGUF KV to populate
-// models.hparams. If the key is missing, defaults to "25hz" (the shipped
-// v2 pretrained checkpoint value).
-//
-// On failure, any sub-models loaded before the failure are freed before
-// returning; the caller does not need to clean up.
-//
-// Parameters:
-//   ref_enc_path      - path to ref_enc GGUF (MelStyleEncoder weights)
-//   quantizer_path    - path to quantizer GGUF (RVQ codebook + hparams KV)
-//   text_encoder_path - path to text_encoder GGUF (enc_p weights)
-//   flow_path         - path to flow GGUF (ResidualCouplingBlock weights)
-//   generator_path    - path to generator GGUF (HiFi-GAN Generator weights)
-//   models            - output aggregate struct (will be populated)
-//   backend           - ggml backend (borrowed; not freed by sovits_models_free)
-//
-// Returns true on success, false on failure (errors printed to stderr).
-bool sovits_models_load(
-    const std::string & ref_enc_path,
-    const std::string & quantizer_path,
-    const std::string & text_encoder_path,
-    const std::string & flow_path,
-    const std::string & generator_path,
-    sovits_models & models,
-    ggml_backend_t backend);
-
-// Free all sub-models owned by sovits_models.
-void sovits_models_free(sovits_models & models);
+// Free all resources owned by a unified SoVITS model.
+void sovits_model_free(sovits_model & model);
 
 // ---------------------------------------------------------------------------
 // SoVITS v2 session: cached style embedding + host-side RNG
@@ -736,7 +624,7 @@ void sovits_session_free(sovits_session & session);
 //
 // Parameters:
 //   session - initialized SoVITS session
-//   models  - loaded SoVITS models (ref_enc weights are read)
+//   model   - loaded unified SoVITS model (ref_enc weights are read)
 //   refers  - list of {ptr to reference spectrogram features {704, T},
 //             T frames}. Must be non-empty. Each entry's data is F32,
 //             row-major C*T layout matching ggml {704, T}. Different
@@ -745,7 +633,7 @@ void sovits_session_free(sovits_session & session);
 // Returns true on success, false on failure.
 bool sovits_session_compute_ge(
     sovits_session       & session,
-    const sovits_models  & models,
+    const sovits_model   & model,
     const std::vector<std::pair<const float *, int64_t>> & refers);
 
 // Get the cached style embedding tensor, or nullptr if not computed.
@@ -766,7 +654,7 @@ struct ggml_tensor * sovits_session_get_ge(const sovits_session & session);
 //
 // Parameters:
 //   session - initialized session with ge cached
-//   models  - loaded SoVITS models
+//   model   - loaded unified SoVITS model
 //   codes   - semantic token ids {T_codes} (i32), host pointer
 //   T_codes - number of semantic tokens
 //   text    - phoneme token ids {T_text} (i32), host pointer
@@ -778,7 +666,7 @@ struct ggml_tensor * sovits_session_get_ge(const sovits_session & session);
 // written to wav_out.
 bool sovits_session_forward(
     sovits_session       & session,
-    const sovits_models  & models,
+    const sovits_model   & model,
     const int32_t        * codes,
     int64_t                T_codes,
     const int32_t        * text,
