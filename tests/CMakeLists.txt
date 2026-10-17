@@ -72,6 +72,8 @@ set(SOVITS_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_generator.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_helpers.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sovits_session.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sv_parity.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/sovits/test_sv_loader.cpp
 )
 
 foreach(test_src ${SOVITS_TEST_SOURCES})
