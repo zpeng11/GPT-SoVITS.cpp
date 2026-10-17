@@ -19,8 +19,9 @@ import struct
 import sys
 
 import numpy as np
-import torch
 import gguf
+
+from torch_ckpt_utils import load_checkpoint
 
 
 # ggml dtype constants
@@ -63,7 +64,10 @@ def load_state_dict(model_dir: str) -> dict:
     bin_path = os.path.join(model_dir, "pytorch_model.bin")
     if not os.path.isfile(bin_path):
         raise FileNotFoundError(f"pytorch_model.bin not found in {model_dir}")
-    return torch.load(bin_path, map_location="cpu", weights_only=True)
+    # torch-free load (stdlib + numpy). pytorch_model.bin is a bare state_dict
+    # (torch zip-format); load_checkpoint handles it directly.
+    weights, _meta = load_checkpoint(bin_path)
+    return weights
 
 
 def transpose_for_ggml(name: str, tensor: np.ndarray) -> np.ndarray:
@@ -131,7 +135,7 @@ def convert(model_dir: str, output_path: str, dtype_str: str) -> None:
     n_quantized = 0
 
     for name, param in sorted(state_dict.items()):
-        tensor_np = param.numpy()
+        tensor_np = np.ascontiguousarray(param)
 
         # Skip masked_spec_embed -- not needed for inference
         if name == "masked_spec_embed":

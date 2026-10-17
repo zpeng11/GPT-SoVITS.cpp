@@ -7,11 +7,17 @@ Usage:
 
     weights, meta = load_checkpoint("s1v3.ckpt")
     # weights: dict[str, np.ndarray]  — all tensors, name → numpy array
-    # meta:    dict  — extra keys like "config", "info", etc.
+    # meta:    dict  — extra keys like "config", "info", etc. (empty for bare
+    #          state_dict checkpoints)
 
 The checkpoint must use PyTorch's standard zip+ pickle serialization format:
     <prefix>/data.pkl       — pickle with persistent_id references
     <prefix>/data/<key>     — raw tensor binary blobs
+
+Both common layouts are supported:
+    wrapped  {'weight': {name: ...}, 'config': ...}   (training checkpoints)
+    bare     {name: ...}                              (plain state_dicts, e.g.
+                                                         the ERes2NetV2 SV ckpt)
 """
 
 from __future__ import annotations
@@ -173,33 +179,51 @@ def load_checkpoint(
         # 1. Parse pickle to get tensor metadata
         raw = _TorchlessUnpickler(io.BytesIO(pkl_bytes)).load()
 
-        if not isinstance(raw, dict) or "weight" not in raw:
+        if not isinstance(raw, dict):
             raise ValueError(
-                "torch_ckpt_utils: checkpoint has no 'weight' key "
-                f"(found: {list(raw.keys()) if isinstance(raw, dict) else type(raw)})"
+                "torch_ckpt_utils: checkpoint top level is not a dict "
+                f"(got {type(raw)})"
             )
 
-        weight_meta: dict[str, dict] = raw["weight"]
-        meta = {k: v for k, v in raw.items() if k != "weight"}
+        # Two layouts occur in practice:
+        #   (a) wrapped:  {'weight': {name: tensor_info, ...}, 'config': ...}
+        #   (b) bare:     {name: tensor_info, ...}   (a plain state_dict)
+        def is_state_dict(value: object) -> bool:
+            return isinstance(value, dict) and all(
+                isinstance(item, dict) and "storage_key" in item
+                for item in value.values()
+            )
+
+        if "weight" in raw and is_state_dict(raw["weight"]):
+            weight_meta: dict[str, dict] = raw["weight"]
+            meta = {k: v for k, v in raw.items() if k != "weight"}
+        elif is_state_dict(raw):
+            weight_meta = raw
+            meta = {}
+        else:
+            raise ValueError(
+                "torch_ckpt_utils: checkpoint has no 'weight' key and is not "
+                f"a bare state_dict (found: {list(raw.keys())[:6]})"
+            )
 
         # 2. Read each tensor's raw bytes from the ZIP and build numpy arrays
         weights: dict[str, np.ndarray] = {}
         for name, info in weight_meta.items():
             dtype: np.dtype = info["dtype"]
-            shape = info["shape"]
-            offset = info["storage_offset"]
-            numel = 1
-            for s in shape:
-                numel *= s
-
+            shape = tuple(info["shape"])
+            stride = tuple(info["stride"])
+            offset = info["storage_offset"] * dtype.itemsize
             blob = zf.read(f"{prefix}/data/{info['storage_key']}")
-            arr = np.frombuffer(blob, dtype=dtype)
 
-            # Slice to the correct offset+range, then reshape
-            arr = arr[offset : offset + numel].copy()
-            if shape:
-                arr = arr.reshape(shape)
-
+            # Preserve PyTorch views such as transposed tensors. Copying detaches
+            # the result from the ZIP buffer and makes it C-contiguous.
+            arr = np.ndarray(
+                shape=shape,
+                dtype=dtype,
+                buffer=blob,
+                offset=offset,
+                strides=tuple(step * dtype.itemsize for step in stride),
+            ).copy(order="C")
             weights[name] = arr
 
         return weights, meta
