@@ -29,6 +29,7 @@
 #include <cstring>
 #include <filesystem>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -155,13 +156,16 @@ static std::vector<int32_t> load_npy_as_i32(const std::string & path) {
 
 // Build a backend for the smoke test.
 //
-// The combined SoVITS pipeline triggers a Metal shader-compile hang on
-// Apple M4 (the conv-transpose + conv1d + flash-attn op mix in a single
-// graph deadlocks the Metal pipeline compiler). Tests cover correctness
-// via the block-level parity tests; this smoke test only needs to verify
-// the session glue, so we run it on the CPU backend to sidestep the
-// Metal issue. Production callers using Metal will see the same hang
-// until ggml-metal is fixed upstream.
+// Session forward includes the HiFi-GAN generator, whose upsample stages
+// are GGML_OP_CONV_TRANSPOSE_1D. The Metal kernel in this ggml pin still
+// scans the full input length per output sample (no i_min/i_max). At TTS
+// shapes that is enough wasted GPU work to wedge the AGX driver — the
+// same hang reported for other ggml TTS ports on Apple Silicon
+// (ggml-org/ggml#1477, #1529). It is a kernel/runtime hang, not a Metal
+// pipeline-compiler deadlock. Block-level tests cover numerical
+// correctness; this smoke test only checks session glue, so it stays on
+// CPU. Production Metal callers hit the same kernel until ggml is bumped
+// or CONV_TRANSPOSE_1D is kept off GPU.
 static ggml_backend_t create_smoke_backend() {
     return ggml_backend_cpu_init();
 }
@@ -311,6 +315,8 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
     ASSERT_TRUE(gpt_sovits::sovits_session_init(session, backend, 0.5f, 42u));
 
     // Compute ge from refer (single-slice list mirrors the previous path).
+    // The old v2 two-field braced form still works: it aggregate-initializes a
+    // sovits_refer_view with sv defaulting to nullptr.
     ASSERT_TRUE(gpt_sovits::sovits_session_compute_ge(
         session, model, {{refer_ggml.data(), T_refer}}));
     struct ggml_tensor * ge = gpt_sovits::sovits_session_get_ge(session);
@@ -361,6 +367,87 @@ TEST(SoVITSSession, ForwardProducesWaveformOfCorrectShape) {
            static_cast<double>(vmin), static_cast<double>(vmax));
 
     gpt_sovits::sovits_session_free(session);
+    gpt_sovits::sovits_model_free(model);
+    ggml_backend_free(backend);
+}
+
+// v2 compat + alias semantics:
+//   - the legacy (spec, T) pair entry sovits_session_compute_ge_specs and the
+//     main entry (fed the same braced aggregate form) must agree;
+//   - for v2, ge_enc aliases ge, and a cache replacement / failed update must
+//     not double-free or corrupt that alias.
+TEST(SoVITSSession, CompatSpecsEntryAndGeEncAlias) {
+    ASSERT_MODEL_EXISTS(kModelPath);
+    ASSERT_NPY_EXISTS(kReferNpy);
+
+    ggml_backend_t backend = create_smoke_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::sovits_model model{};
+    ASSERT_TRUE(gpt_sovits::sovits_model_load(kModelPath, model, backend));
+
+    const NpyShapeInfo refer_bct = load_npy_with_shape(kReferNpy);
+    ASSERT_EQ(refer_bct.shape.size(), 3u);
+    ASSERT_EQ(refer_bct.shape[0], 1u);
+    const int64_t T_refer = static_cast<int64_t>(refer_bct.shape[2]);
+    const std::vector<float> refer_ggml =
+        repack_bct_to_ggml_ct_sliced(refer_bct.data, refer_bct.shape);
+    ASSERT_EQ(refer_ggml.size(), static_cast<size_t>(kMelChannels * T_refer));
+
+    auto read_ge = [](struct ggml_tensor * t) {
+        std::vector<float> v(static_cast<size_t>(ggml_nelements(t)));
+        ggml_backend_tensor_get(t, v.data(), 0, v.size() * sizeof(float));
+        return v;
+    };
+
+    // Main entry via the old braced two-field form.
+    gpt_sovits::sovits_session s_main{};
+    ASSERT_TRUE(gpt_sovits::sovits_session_init(s_main, backend, 0.5f, 1u));
+    ASSERT_TRUE(gpt_sovits::sovits_session_compute_ge(
+        s_main, model, {{refer_ggml.data(), T_refer}}));
+    ASSERT_NE(s_main.ge, nullptr);
+    ASSERT_NE(s_main.ge_enc, nullptr);
+    EXPECT_EQ(s_main.ge_enc, s_main.ge) << "v2 ge_enc must alias ge";
+    EXPECT_EQ(s_main.ge->ne[0], kExpectedGEChans);
+    const auto ge_main = read_ge(s_main.ge);
+
+    // Named compat entry with an actual std::vector<std::pair<...>>.
+    const std::vector<std::pair<const float *, int64_t>> pairs = {
+        {refer_ggml.data(), T_refer}};
+    gpt_sovits::sovits_session s_compat{};
+    ASSERT_TRUE(gpt_sovits::sovits_session_init(s_compat, backend, 0.5f, 1u));
+    ASSERT_TRUE(gpt_sovits::sovits_session_compute_ge_specs(s_compat, model, pairs));
+    ASSERT_NE(s_compat.ge, nullptr);
+    EXPECT_EQ(s_compat.ge_enc, s_compat.ge);
+    const auto ge_compat = read_ge(s_compat.ge);
+    ASSERT_EQ(ge_main.size(), ge_compat.size());
+    for (size_t i = 0; i < ge_main.size(); ++i) {
+        ASSERT_EQ(ge_main[i], ge_compat[i]) << "at " << i;
+    }
+
+    // Replace the v2 alias cache (frees the old ge / alias) and confirm the
+    // result is identical.
+    ASSERT_TRUE(gpt_sovits::sovits_session_compute_ge(
+        s_main, model, {{refer_ggml.data(), T_refer}}));
+    EXPECT_EQ(s_main.ge_enc, s_main.ge);
+    const auto ge_replaced = read_ge(s_main.ge);
+    for (size_t i = 0; i < ge_main.size(); ++i) {
+        ASSERT_EQ(ge_main[i], ge_replaced[i]) << "at " << i;
+    }
+
+    // A failed update (empty refer list) leaves the cache pointer and values
+    // untouched, alias included.
+    struct ggml_tensor * ge_ptr = s_main.ge;
+    EXPECT_FALSE(gpt_sovits::sovits_session_compute_ge(s_main, model, {}));
+    EXPECT_EQ(s_main.ge, ge_ptr);
+    EXPECT_EQ(s_main.ge_enc, ge_ptr);
+    const auto ge_after_fail = read_ge(s_main.ge);
+    for (size_t i = 0; i < ge_main.size(); ++i) {
+        ASSERT_EQ(ge_main[i], ge_after_fail[i]) << "at " << i;
+    }
+
+    gpt_sovits::sovits_session_free(s_compat);
+    gpt_sovits::sovits_session_free(s_main);
     gpt_sovits::sovits_model_free(model);
     ggml_backend_free(backend);
 }

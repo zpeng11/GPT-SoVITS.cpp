@@ -18,6 +18,8 @@ file without collisions:
     text_encoder_post.*  enc_p post branch (3 relpos layers + proj)
     flow.*               ResidualCouplingBlock inverse flow
     generator.*          HiFi-GAN Generator (decoder)
+    v2pro.*              v2Pro/v2ProPlus extras (sv_emb / ge_to512 / prelu;
+                         emitted only when the checkpoint carries the full set)
 
 Each block keeps its exact original conversion + quantization policy (copied
 verbatim from the per-block scripts), so the unified output is byte-for-byte
@@ -66,6 +68,221 @@ N_WN = 4             # WN dilated layers per coupling layer
 N_STAGES = 5         # generator upsample stages
 N_BRANCHES = 3       # generator ResBlock1 branches per stage
 N_RES_LAYERS = 3     # generator residual sublayers per ResBlock1
+
+# SynthesizerTrn adds this module set when `version in {v2Pro, v2ProPlus}`.
+# Detection is driven by the weights themselves (all-or-none), not the config,
+# because the pretrained configs omit `version`.
+V2PRO_TENSORS = (
+    "sv_emb.weight", "sv_emb.bias",
+    "ge_to512.weight", "ge_to512.bias",
+    "prelu.weight",
+)
+
+# gin_channels is 512 for v2, 1024 for v2Pro/v2ProPlus; the enc_p ge input is
+# always 512 (v2Pro projects ge -> 512 through ge_to512).
+GIN_V2 = 512
+GIN_V2PRO = 1024
+ENC_P_GE_DIM = 512
+
+
+# flow coupling layers live at checkpoint indices 0,2,4,6 (every other entry).
+FLOW_CKPT_INDICES = (0, 2, 4, 6)
+# flow.enc.cond_layer = Conv1d(gin, 2*H*N, 1): 2*192*4 = 1536.
+FLOW_COND_DIM = 1536
+
+# generator HiFi-GAN plan (strides fixed; first up kernel tracks gen_init).
+GENERATOR_STRIDES = (10, 8, 2, 2, 2)
+GENERATOR_RESBLOCK_KERNELS = (3, 7, 11)
+GENERATOR_UP_K512 = (16, 16, 8, 2, 2)
+GENERATOR_UP_K768 = (20, 16, 8, 2, 2)
+
+
+def v2pro_present(weights: dict[str, np.ndarray]) -> bool:
+    """True iff the full v2Pro module set is present.
+
+    A partial set (some but not all of V2PRO_TENSORS) is a corrupt checkpoint
+    and is rejected rather than silently converted into a broken GGUF.
+    """
+    present = [n for n in V2PRO_TENSORS if n in weights]
+    if present and len(present) != len(V2PRO_TENSORS):
+        missing = [n for n in V2PRO_TENSORS if n not in weights]
+        raise ValueError(
+            "checkpoint has a partial v2Pro module set: present=%s missing=%s"
+            % (present, missing)
+        )
+    return len(present) == len(V2PRO_TENSORS)
+
+
+def derive_gin_channels(weights: dict[str, np.ndarray],
+                        cfg: dict) -> int:
+    """Derive gin_channels from the weights and reject a contradictory config.
+
+    Every gin-bearing tensor -- all four flow coupling layers, the generator
+    cond projection, the MelStyleEncoder fc output and (v2Pro) sv_emb -- must
+    agree; `cfg["gin_channels"]` (when present) must match them. v2 is 512,
+    v2Pro/v2ProPlus are 1024.
+    """
+    sources: dict[str, int] = {}
+    if "ref_enc.fc.fc.weight" in weights:            # MelStyleEncoder out
+        sources["ref_enc.fc"] = int(weights["ref_enc.fc.fc.weight"].shape[0])
+    if "dec.cond.weight" in weights:
+        sources["generator.cond"] = int(weights["dec.cond.weight"].shape[1])
+    if "sv_emb.weight" in weights:                   # v2Pro fuse projection
+        sources["sv_emb"] = int(weights["sv_emb.weight"].shape[0])
+
+    for i in FLOW_CKPT_INDICES:
+        p = "flow.flows.%d.enc.cond_layer" % i
+        n_v, n_g, n_b = p + ".weight_v", p + ".weight_g", p + ".bias"
+        for n in (n_v, n_g, n_b):
+            if n not in weights:
+                raise KeyError("checkpoint is missing flow coupling tensor: %s" % n)
+        # Full Conv1d(gin, 2*H*N, 1) weight_norm shape: weight_v=(1536,gin,1),
+        # weight_g=(1536,1,1), bias=(1536,). A wrong kernel, group or bias is
+        # rejected here rather than emitted.
+        sv = tuple(int(d) for d in weights[n_v].shape)
+        sg = tuple(int(d) for d in weights[n_g].shape)
+        sb = tuple(int(d) for d in weights[n_b].shape)
+        if len(sv) != 3 or sv[0] != FLOW_COND_DIM or sv[2] != 1:
+            raise ValueError(
+                "flow layer %d cond weight_v shape %s, expected (%d, gin, 1)"
+                % (i, sv, FLOW_COND_DIM)
+            )
+        if sg != (FLOW_COND_DIM, 1, 1):
+            raise ValueError(
+                "flow layer %d cond weight_g shape %s, expected (%d, 1, 1)"
+                % (i, sg, FLOW_COND_DIM)
+            )
+        if sb != (FLOW_COND_DIM,):
+            raise ValueError(
+                "flow layer %d cond bias shape %s, expected (%d,)"
+                % (i, sb, FLOW_COND_DIM)
+            )
+        sources[n_v] = sv[1]
+
+    if not sources:
+        raise KeyError(
+            "checkpoint has no gin_channels-bearing tensor "
+            "(ref_enc.fc / flow cond / dec.cond / sv_emb)"
+        )
+
+    values = set(sources.values())
+    if len(values) != 1:
+        raise ValueError(
+            "checkpoint weights disagree on gin_channels: %s"
+            % ", ".join("%s=%d" % kv for kv in sorted(sources.items()))
+        )
+    derived = values.pop()
+    if derived <= 0:
+        raise ValueError("derived gin_channels must be positive, got %d" % derived)
+
+    cfg_gin = cfg.get("gin_channels")
+    if cfg_gin is not None and int(cfg_gin) != derived:
+        raise ValueError(
+            "config gin_channels=%d contradicts checkpoint weights (gin_channels=%d)"
+            % (int(cfg_gin), derived)
+        )
+    return derived
+
+
+def derive_generator_initial_channels(weights: dict[str, np.ndarray],
+                                      cfg: dict) -> int:
+    """Derive the generator's initial channel count from dec.conv_pre and
+    reject a contradictory `upsample_initial_channel` (512 for v2/v2Pro,
+    768 for v2ProPlus)."""
+    if "dec.conv_pre.weight" not in weights:
+        raise KeyError("Tensor 'dec.conv_pre.weight' not found in checkpoint")
+    init = int(weights["dec.conv_pre.weight"].shape[0])
+    cfg_init = cfg.get("upsample_initial_channel")
+    if cfg_init is not None and int(cfg_init) != init:
+        raise ValueError(
+            "config upsample_initial_channel=%d contradicts checkpoint weights (%d)"
+            % (int(cfg_init), init)
+        )
+    return init
+
+
+def _shape(weights: dict[str, np.ndarray], name: str) -> tuple:
+    if name not in weights:
+        raise KeyError("Tensor '%s' not found in checkpoint" % name)
+    return tuple(int(d) for d in weights[name].shape)
+
+
+def validate_generator_structure(weights: dict[str, np.ndarray],
+                                 gin_channels: int, gen_init: int) -> None:
+    """Validate the whole generator (dec) channel/kernel plan against the fixed
+    HiFi-GAN architecture, rejecting any single-shape deviation.
+
+    Checkpoint tensors are PyTorch layout: Conv1d weight (out, in, k),
+    ConvTranspose1d weight (in, out, k), weight_norm weight_g (rows, 1, 1)."""
+    if gen_init not in (512, 768):
+        raise ValueError("generator initial channels must be 512 or 768, got %d" % gen_init)
+
+    def want(name, expected):
+        got = _shape(weights, name)
+        if got != tuple(expected):
+            raise ValueError("generator tensor '%s' has shape %s, expected %s"
+                             % (name, got, tuple(expected)))
+
+    want("dec.conv_pre.weight", (gen_init, 192, 7))
+    want("dec.conv_pre.bias", (gen_init,))
+    want("dec.cond.weight", (gen_init, gin_channels, 1))
+    want("dec.cond.bias", (gen_init,))
+    want("dec.conv_post.weight", (1, gen_init // 32, 7))
+
+    up_kernels = GENERATOR_UP_K768 if gen_init == 768 else GENERATOR_UP_K512
+    for s in range(len(GENERATOR_STRIDES)):
+        in_ch, out_ch = gen_init >> s, gen_init >> (s + 1)
+        up = "dec.ups.%d" % s
+        want(up + ".weight_v", (in_ch, out_ch, up_kernels[s]))
+        want(up + ".weight_g", (in_ch, 1, 1))
+        want(up + ".bias", (out_ch,))
+        stride = GENERATOR_STRIDES[s]
+        if up_kernels[s] < stride or (up_kernels[s] - stride) % 2 != 0:
+            raise ValueError("upsample %d kernel=%d/stride=%d gives invalid padding"
+                             % (s, up_kernels[s], stride))
+
+        ch = out_ch
+        for br in range(len(GENERATOR_RESBLOCK_KERNELS)):
+            rk = GENERATOR_RESBLOCK_KERNELS[br]
+            for conv in ("convs1", "convs2"):
+                for l in range(3):
+                    base = "dec.resblocks.%d.%s.%d" % (s * 3 + br, conv, l)
+                    want(base + ".weight_v", (ch, ch, rk))
+                    want(base + ".weight_g", (ch, 1, 1))
+                    want(base + ".bias", (ch,))
+
+
+def _derive_version(cfg: dict, is_v2pro: bool, generator_init_channels: int) -> str:
+    """Version string for the GGUF: v2 / v2Pro / v2ProPlus.
+
+    The pretrained configs omit `version`, so it is derived from the weights
+    (the generator's initial channel count distinguishes v2Pro=512 from
+    v2ProPlus=768). A config `version` contradicting the weights is rejected,
+    including an explicit v2Pro/v2ProPlus tag whose generator initial channels
+    do not match.
+    """
+    cfg_ver = cfg.get("version")
+    if is_v2pro:
+        if cfg_ver is not None and str(cfg_ver) not in ("v2Pro", "v2ProPlus"):
+            raise ValueError(
+                "config version=%r contradicts v2Pro/v2ProPlus weights" % (cfg_ver,)
+            )
+        if str(cfg_ver) == "v2Pro" and generator_init_channels != 512:
+            raise ValueError(
+                "config version='v2Pro' requires generator initial channels 512, "
+                "weights have %d" % generator_init_channels
+            )
+        if str(cfg_ver) == "v2ProPlus" and generator_init_channels != 768:
+            raise ValueError(
+                "config version='v2ProPlus' requires generator initial channels 768, "
+                "weights have %d" % generator_init_channels
+            )
+        if cfg_ver in ("v2Pro", "v2ProPlus"):
+            return str(cfg_ver)
+        return "v2ProPlus" if generator_init_channels == 768 else "v2Pro"
+    if cfg_ver is not None and str(cfg_ver) in ("v2Pro", "v2ProPlus"):
+        raise ValueError("config version=%r contradicts non-v2Pro weights" % (cfg_ver,))
+    return str(cfg_ver) if cfg_ver else "v2"
 
 
 # ---------------------------------------------------------------------------
@@ -148,7 +365,7 @@ def _ref_enc_should_quantize(gguf_name: str, tensor: np.ndarray, block_size: int
     return False
 
 
-def emit_ref_enc(writer, weights, cfg, target_type, state):
+def emit_ref_enc(writer, weights, cfg, target_type, state, gin_channels):
     is_quantized = target_type not in (
         gguf.GGMLQuantizationType.F32,
         gguf.GGMLQuantizationType.F16,
@@ -195,11 +412,90 @@ def emit_ref_enc(writer, weights, cfg, target_type, state):
     writer.add_string("sovits.block", "full")
     writer.add_uint32("sovits.ref_enc.in_dim", 704)
     writer.add_uint32("sovits.ref_enc.hidden_dim", 128)
-    writer.add_uint32("sovits.ref_enc.out_dim", int(cfg.get("gin_channels", 512)))
+    writer.add_uint32("sovits.ref_enc.out_dim", int(gin_channels))
     writer.add_uint32("sovits.ref_enc.kernel_size", 5)
     writer.add_uint32("sovits.ref_enc.n_head", 2)
     writer.add_uint32("sovits.ref_enc.temporal_layers", 2)
     writer.add_bool("sovits.ref_enc.full_context", True)
+
+
+# ===========================================================================
+# Block: v2pro extras (sv_emb / ge_to512 / prelu) -- v2Pro / v2ProPlus only
+# ===========================================================================
+#
+# SynthesizerTrn adds three modules when `version in {"v2Pro", "v2ProPlus"}`:
+#   self.sv_emb   = nn.Linear(20480, gin_channels)   # fuse SV embedding
+#   self.ge_to512 = nn.Linear(gin_channels, 512)     # project ge -> enc_p input
+#   self.prelu    = nn.PReLU(num_parameters=gin_channels)
+#
+# Linear weights are stored in PyTorch [out, in] layout; GGUF reverses dims
+# on load, yielding ggml {in, out} which matches the linear_2d convention
+# (weight ne[0]=in, ne[1]=out) used by the v2pro forward in block.cpp.
+# Tensors are emitted only when the checkpoint actually carries the full module
+# set; for a plain v2 checkpoint this block is skipped entirely, and a partial
+# set is rejected (see v2pro_present).
+
+V2PRO_LINEAR_MAP = [
+    ("v2pro.sv_emb_w",   "sv_emb.weight"),
+    ("v2pro.sv_emb_b",   "sv_emb.bias"),
+    ("v2pro.ge_to512_w", "ge_to512.weight"),
+    ("v2pro.ge_to512_b", "ge_to512.bias"),
+]
+
+
+def is_v2pro_checkpoint(weights: dict[str, np.ndarray]) -> bool:
+    """Backwards-compatible alias for :func:`v2pro_present`."""
+    return v2pro_present(weights)
+
+
+def _check_v2pro_shapes(weights: dict[str, np.ndarray], gin_channels: int) -> None:
+    """Reject v2Pro tensors whose shapes disagree with the derived gin_channels."""
+    checks = {
+        "sv_emb.weight":   (gin_channels, 20480),
+        "sv_emb.bias":     (gin_channels,),
+        "ge_to512.weight": (ENC_P_GE_DIM, gin_channels),
+        "ge_to512.bias":   (ENC_P_GE_DIM,),
+        "prelu.weight":    (gin_channels,),
+    }
+    for name, want in checks.items():
+        if name not in weights:
+            raise KeyError("Tensor '%s' not found in checkpoint" % name)
+        got = tuple(int(d) for d in weights[name].shape)
+        if got != want:
+            raise ValueError(
+                "v2Pro tensor '%s' has shape %s, expected %s (gin_channels=%d)"
+                % (name, got, want, gin_channels)
+            )
+
+
+def emit_v2pro(writer, weights, cfg, target_type, state, gin_channels):
+    if not v2pro_present(weights):
+        return False
+
+    _check_v2pro_shapes(weights, gin_channels)
+
+    for gguf_name, ckpt_name in V2PRO_LINEAR_MAP:
+        if ckpt_name not in weights:
+            raise KeyError(
+                f"Tensor '{ckpt_name}' not found in checkpoint "
+                f"(needed for GGUF tensor '{gguf_name}')"
+            )
+        tensor_np = weights[ckpt_name].astype(np.float32)
+        data, dtype = _conv_convert_tensor(gguf_name, tensor_np, target_type)
+        writer.add_tensor(gguf_name, data, raw_dtype=dtype)
+        state["n"] += 1
+        print(f"  [v2pro  {state['n']:3d}] {gguf_name:30s} "
+              f"{list(data.shape)!s:18s} {dtype.name}")
+
+    # PReLU per-channel negative slope: 1-D [gin_channels].
+    prelu_np = weights["prelu.weight"].astype(np.float32)
+    writer.add_tensor("v2pro.prelu_w", prelu_np,
+                      raw_dtype=gguf.GGMLQuantizationType.F32)
+    state["n"] += 1
+    print(f"  [v2pro  {state['n']:3d}] {'v2pro.prelu_w':30s} "
+          f"{list(prelu_np.shape)!s:18s} F32")
+
+    return True
 
 
 # ===========================================================================
@@ -453,7 +749,7 @@ def _conv_convert_tensor(gguf_name, tensor_np, target_type):
     return tensor_np.astype(np.float32), gguf.GGMLQuantizationType.F32
 
 
-def emit_flow(writer, weights, cfg, target_type, state):
+def emit_flow(writer, weights, cfg, target_type, state, gin_channels):
     n = state["n"]
     for L in range(N_FLOWS):
         ckpt_idx = L * 2  # checkpoint uses even indices 0,2,4,6
@@ -517,7 +813,7 @@ def emit_flow(writer, weights, cfg, target_type, state):
     state["n"] = n
     writer.add_uint32("sovits.flow.channels", 192)
     writer.add_uint32("sovits.flow.hidden", 192)
-    writer.add_uint32("sovits.flow.gin", 512)
+    writer.add_uint32("sovits.flow.gin", int(gin_channels))
     writer.add_uint32("sovits.flow.n_flows", N_FLOWS)
     writer.add_uint32("sovits.flow.wn_layers", N_WN)
     writer.add_uint32("sovits.flow.kernel", 5)
@@ -544,7 +840,7 @@ def _gen_add_tensor(writer, gguf_name, tensor_np, target_type, note, state):
           f"{list(tensor_data.shape)!s:18s} {tensor_type.name}")
 
 
-def emit_generator(writer, weights, cfg, target_type, state):
+def emit_generator(writer, weights, cfg, target_type, state, gin_channels):
     for gguf_name, ckpt_name in GENERATOR_DIRECT_MAP:
         if ckpt_name not in weights:
             raise KeyError(f"Tensor '{ckpt_name}' not found in checkpoint")
@@ -586,7 +882,7 @@ def emit_generator(writer, weights, cfg, target_type, state):
                 _gen_add_tensor(writer, f"{base}.convs2.{layer}.b", c2_b, target_type, f"bias {c2_prefix}", state)
 
     writer.add_uint32("sovits.generator.in_dim", 192)
-    writer.add_uint32("sovits.generator.gin_dim", int(cfg.get("gin_channels", 512)))
+    writer.add_uint32("sovits.generator.gin_dim", int(gin_channels))
     writer.add_uint32("sovits.generator.n_stages", N_STAGES)
     writer.add_uint32("sovits.generator.n_branches", N_BRANCHES)
     writer.add_uint32("sovits.generator.res_layers", N_RES_LAYERS)
@@ -596,16 +892,40 @@ def emit_generator(writer, weights, cfg, target_type, state):
 # Unified driver
 # ===========================================================================
 
-def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
-    print(f"Loading SoVITS checkpoint: {sovits_path}")
-    weights, meta = load_checkpoint(sovits_path)
-    cfg = meta.get("config", {}).get("model", {})
+def convert_from_weights(weights: dict[str, np.ndarray], cfg: dict,
+                         output_path: str, dtype_str: str) -> None:
+    """Convert an in-memory checkpoint (weights + model cfg) to one GGUF.
+
+    Split out from :func:`convert` so the conversion can be exercised on a
+    synthetic checkpoint without a real .pth on disk.
+    """
     print(f"  Found {len(weights)} tensors")
 
     target_type = GGML_TYPES[dtype_str]
     print(f"  Output type: {dtype_str} ({target_type.name})")
 
-    version = str(cfg.get("version") or "v2")
+    # Derive the version-specific dimensions from the weights, rejecting a
+    # config that contradicts them (e.g. gin_channels=512 for a 1024 model).
+    is_v2pro    = v2pro_present(weights)
+    gin         = derive_gin_channels(weights, cfg)
+    gen_init    = derive_generator_initial_channels(weights, cfg)
+
+    if is_v2pro and gin != GIN_V2PRO:
+        raise ValueError(
+            "v2Pro/v2ProPlus checkpoint has gin_channels=%d, expected %d"
+            % (gin, GIN_V2PRO)
+        )
+    if not is_v2pro and gin != GIN_V2:
+        raise ValueError(
+            "non-v2Pro checkpoint has gin_channels=%d, expected %d"
+            % (gin, GIN_V2)
+        )
+
+    # The whole generator structure must be internally consistent before we
+    # emit anything (catches a single wrong kernel/channel early).
+    validate_generator_structure(weights, gin, gen_init)
+
+    version = _derive_version(cfg, is_v2pro, gen_init)
     sfr = str(cfg.get("semantic_frame_rate", "25hz"))
 
     writer = gguf.GGUFWriter(output_path, "sovits")
@@ -613,12 +933,21 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
     writer.add_string("sovits.version", version)
     writer.add_string("sovits.semantic_frame_rate", sfr)
 
+    # v2Pro / v2ProPlus flag, agreed upon by both the converter and the C++
+    # loader. Detection is driven by the actual presence of the full v2Pro
+    # module set, so it stays correct even when the checkpoint's embedded
+    # config omits the version field.
+    writer.add_bool("sovits.v2pro", is_v2pro)
+    if is_v2pro:
+        print(f"  Detected v2Pro/v2ProPlus checkpoint (gin={gin}, gen_init={gen_init})")
+
     state = {"n": 0}
-    emit_ref_enc(writer, weights, cfg, target_type, state)
+    emit_ref_enc(writer, weights, cfg, target_type, state, gin)
     emit_quantizer(writer, weights, cfg, target_type, state)
     emit_text_encoder(writer, weights, cfg, target_type, state)
-    emit_flow(writer, weights, cfg, target_type, state)
-    emit_generator(writer, weights, cfg, target_type, state)
+    emit_flow(writer, weights, cfg, target_type, state, gin)
+    emit_generator(writer, weights, cfg, target_type, state, gin)
+    emit_v2pro(writer, weights, cfg, target_type, state, gin)
 
     n_converted = state["n"]
     print(f"\nConverted {n_converted} tensors into one unified GGUF")
@@ -631,6 +960,14 @@ def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
 
     file_size = os.path.getsize(output_path)
     print(f"Done! Output: {output_path} ({file_size / 1024 / 1024:.1f} MB)")
+
+
+def convert(sovits_path: str, output_path: str, dtype_str: str) -> None:
+    """Load a checkpoint from disk and convert it (see convert_from_weights)."""
+    print(f"Loading SoVITS checkpoint: {sovits_path}")
+    weights, meta = load_checkpoint(sovits_path)
+    cfg = meta.get("config", {}).get("model", {})
+    convert_from_weights(weights, cfg, output_path, dtype_str)
 
 
 def main() -> None:

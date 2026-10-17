@@ -2,6 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
+#include "gpt_sovits/sv.h"
 
 #include <array>
 #include <random>
@@ -25,6 +26,17 @@ struct sovits_hparams {
     // Read from quantizer GGUF KV "sovits.semantic_frame_rate"; defaults
     // to true (matches the shipped v2 pretrained checkpoint).
     bool semantic_frame_rate_25hz = true;
+
+    // v2Pro / v2ProPlus path (SynthesizerTrn with version in v2pro_set).
+    // When true, MelStyleEncoder emits a gin_channels-wide ge (1024), an
+    // external speaker-verification embedding is fused via sv_emb + PReLU,
+    // and ge_to512 projects it down to 512 for enc_p. flow/dec still take
+    // the 1024-wide ge. Read from GGUF KV "sovits.v2pro"; defaults to false.
+    bool is_v2pro = false;
+
+    // ge (style embedding) channel count: 512 for v2, 1024 for v2Pro/Plus.
+    // Read from GGUF KV "sovits.ref_enc.out_dim"; defaults to 512.
+    int64_t gin_channels = 512;
 };
 
 static constexpr int kSovitsTextEncoderSslLayers = 3;
@@ -98,9 +110,35 @@ struct sovits_mel_style_encoder_block_weights {
     // self attention over the temporal sequence.
     sovits_mel_style_encoder_attention_block_weights attention;
 
-    // fc = Linear(128, 512)
-    struct ggml_tensor * fc_w;           // {128, 512}
-    struct ggml_tensor * fc_b;           // {512}
+    // fc = Linear(128, gin_channels). 512 for v2, 1024 for v2Pro/Plus.
+    struct ggml_tensor * fc_w;           // {128, gin_channels}
+    struct ggml_tensor * fc_b;           // {gin_channels}
+};
+
+// ---------------------------------------------------------------------------
+// SoVITS v2Pro / v2ProPlus extra weights (absent in v2).
+//
+// SynthesizerTrn adds three modules when `version in v2pro_set`:
+//   sv_emb   = Linear(20480, gin_channels)   speaker-verif embedding fuse
+//   ge_to512 = Linear(gin_channels, 512)     projects ge down for enc_p
+//   prelu    = PReLU(gin_channels)           per-channel slope
+//
+// Inference path (per refer slice):
+//   ge   = PReLU(MelStyleEncoder(spec) + sv_emb(sv))   -> {gin_channels, 1}
+//   ge512= ge_to512(ge)                                -> {512, 1}  (enc_p)
+// flow / dec still consume the 1024-wide `ge`.
+//
+// These tensors are only populated when hparams.is_v2pro; otherwise the
+// pointers stay nullptr and the v2 path is used unchanged.
+struct sovits_v2pro_block_weights {
+    // Linear weights stored as PyTorch [out, in]; ggml reverses to {in, out},
+    // matching the linear_2d convention (ne[0]=in, ne[1]=out).
+    struct ggml_tensor * sv_emb_w;    // {20480, gin_channels}
+    struct ggml_tensor * sv_emb_b;    // {gin_channels}
+    struct ggml_tensor * ge_to512_w;  // {gin_channels, 512}
+    struct ggml_tensor * ge_to512_b;  // {512}
+    // PReLU per-channel negative slope.
+    struct ggml_tensor * prelu_w;     // {gin_channels}
 };
 
 // Weights for the SoVITS RVQ decode path used by SynthesizerTrn.forward:
@@ -381,6 +419,34 @@ struct ggml_tensor * sovits_mel_style_encoder_block_forward(
     struct ggml_tensor                               * refer,
     const sovits_mel_style_encoder_block_weights     & weights);
 
+// Build the v2Pro/v2ProPlus ge post-processing graph.
+//
+// Mirrors SynthesizerTrn.decode's get_ge() is_v2pro branch:
+//   sv_proj = sv_emb(sv)                 -> {gin_channels, 1}
+//   ge     = PReLU(ge_raw + sv_proj)     -> {gin_channels, 1}
+//
+// Parameters:
+//   ctx     - ggml context for tensor/op allocation
+//   ge_raw  - MelStyleEncoder output {gin_channels, 1}
+//   sv      - speaker-verification embedding {20480} (graph input)
+//   weights - v2Pro extra weights (sv_emb + prelu)
+//
+// Returns:
+//   flow/dec conditioning ge {gin_channels, 1}
+struct ggml_tensor * sovits_v2pro_ge_forward(
+    struct ggml_context                          * ctx,
+    struct ggml_tensor                           * ge_raw,
+    struct ggml_tensor                           * sv,
+    const sovits_v2pro_block_weights             & weights);
+
+// Project the v2Pro ge down to 512 channels for enc_p.
+//
+// Mirrors:  ge512 = ge_to512(ge)   -> {512, 1}
+struct ggml_tensor * sovits_ge_to512_forward(
+    struct ggml_context                          * ctx,
+    struct ggml_tensor                           * ge,
+    const sovits_v2pro_block_weights             & weights);
+
 // Build the SoVITS single-layer RVQ decode graph.
 //
 // Parameters:
@@ -518,6 +584,7 @@ struct sovits_model {
     sovits_text_encoder_block_weights      text_encoder;   // enc_p (ssl/text/mrte/post)
     sovits_flow_block_weights              flow;           // ResidualCouplingBlock
     sovits_generator_block_weights         generator;      // HiFi-GAN
+    sovits_v2pro_block_weights             v2pro;          // v2Pro/Plus extras (else nullptr)
 
     sovits_hparams hparams = {};
 
@@ -574,11 +641,23 @@ struct sovits_session {
     // Host-side RNG state (bundled so caller doesn't manage noise)
     std::mt19937 rng;
 
-    // Cached style embedding ge {512, 1} F32, computed once per reference.
-    // Owned: ctx_ge holds the tensor metadata, buf_ge holds its data.
+    // Cached style embedding ge {gin_channels, 1} F32, computed once per
+    // reference. Consumed by flow + dec. Owned: ctx_ge holds the tensor
+    // metadata, buf_ge holds its data. Replaced atomically by compute_ge only
+    // after the new pair is fully computed (a failed compute_ge leaves the
+    // previous cache in place).
     struct ggml_context  * ctx_ge = nullptr;
     ggml_backend_buffer_t  buf_ge = nullptr;
     struct ggml_tensor   * ge     = nullptr;
+
+    // Cached enc_p conditioning ge_enc {512, 1} F32. For v2 this aliases ge
+    // (ge is already 512-wide; ctx_ge_enc/buf_ge_enc stay null). For
+    // v2Pro/v2ProPlus it is a separately allocated tensor holding ge_to512(ge).
+    // nullptr until compute_ge runs. When aliased, freeing the ge buffer also
+    // releases ge_enc.
+    struct ggml_context  * ctx_ge_enc = nullptr;
+    ggml_backend_buffer_t  buf_ge_enc = nullptr;
+    struct ggml_tensor   * ge_enc     = nullptr;
 
     // Scratch buffers reused across forward calls (grown on demand,
     // never shrunk; steady-state forward is allocation-free).
@@ -610,41 +689,147 @@ bool sovits_session_init(
 // Does not free the borrowed backend.
 void sovits_session_free(sovits_session & session);
 
+// One reference slice for style-embedding computation.
+//
+// spec is the v2 704-channel MelStyleEncoder input: caller supplies refer[:, :704]
+// for one reference clip. Memory layout is ggml {704, T} row-major, i.e. the
+// element for channel c (0..703) at frame t (0..T-1) is spec[t * 704 + c].
+// (PyTorch stores refer as [1, 1025, T] BCT; slice channels to 704 and repack
+// so that channel is the fast axis.)
+//
+// Pointer lifetime: spec and sv are BORROWED for the duration of the
+// sovits_session_compute_ge[_audio] call only. The session copies the resulting
+// ge/ge_enc into session-owned buffers and never retains these pointers, so the
+// caller may free/reuse spec and sv as soon as the call returns.
+struct sovits_refer_view {
+    const float * spec = nullptr;   // {704, T} row-major, spec[t*704 + c]
+    int64_t       T    = 0;
+
+    // Speaker-verification embedding {20480} for v2Pro/v2ProPlus (one per
+    // slice, produced externally by ERes2NetV2). Must be non-null for every
+    // slice when model.hparams.is_v2pro; ignored (may be null) for v2.
+    const float * sv = nullptr;
+};
+
 // Compute and cache the style embedding ge from reference audio.
 //
 // For each refer slice, builds a temporary graph that runs MelStyleEncoder
-// on the reference features; the per-slice results are averaged element-wise
-// (mirrors SynthesizerTrn.decode's `torch.stack(ges, 0).mean(0)` for list
-// refer input), and the mean is copied into a session-owned persistent
-// tensor (session.ge). Subsequent sovits_session_forward calls reuse it.
+// on the reference features; for v2Pro/v2ProPlus it additionally fuses the
+// per-slice sv embedding (sv_emb + PReLU). The per-slice ge results are
+// averaged element-wise (mirrors SynthesizerTrn.decode's
+// `torch.stack(ges, 0).mean(0)` for list refer input) and stored in the
+// session. Note the mean is taken over the POST-fuse per-slice ge, so for
+// v2Pro the average is of PReLU(MelStyleEncoder(spec_i) + sv_emb(sv_i)), which
+// is not the same as fusing the averaged encoder output.
 //
-// Switching references requires re-calling this; the previously cached ge
-// is freed first. Each refer slice's `data` must already be sliced to the
-// v2 704-channel slice (i.e. caller does refer[:, :704]).
+// Two conditionings are produced:
+//   ge     {gin_channels, 1}  gin_channels = 512 (v2) or 1024 (v2Pro/Plus).
+//                             Consumed by flow + decoder.
+//   ge_enc {512, 1}           enc_p conditioning. For v2Pro/Plus it is
+//                             ge_to512(ge); for v2 it ALIASES ge (ge is
+//                             already 512-wide, so get_ge_enc() == get_ge()).
+//
+// Replacement is atomic: the new ge/ge_enc are fully computed and allocated in
+// temporaries first, and the previously cached pair is only freed once both are
+// valid. On failure the function returns false and the PREVIOUS cache is left
+// unchanged, so a caller can safely retry or keep using the old reference.
+//
+// Recovery scope: host/C++ std::bad_alloc raised while building the ge cache
+// (host vectors, ggml host allocations, C++ trampolines) is caught and returns
+// false with the old cache preserved and nothing leaked. This does NOT apply to
+// backend buffer-type / allocator callbacks: they follow the C ABI and must not
+// throw (a throw from inside an alloc callback unwinds through C frames and is
+// not a supported recovery point). Failures inside ggml itself (asserts /
+// aborts) or a corrupt backend are likewise not recovery points.
+//
+// Input validation returns false rather than asserting.
 //
 // Parameters:
 //   session - initialized SoVITS session
-//   model   - loaded unified SoVITS model (ref_enc weights are read)
-//   refers  - list of {ptr to reference spectrogram features {704, T},
-//             T frames}. Must be non-empty. Each entry's data is F32,
-//             row-major C*T layout matching ggml {704, T}. Different
-//             entries may have different T.
+//   model   - loaded unified SoVITS model (ref_enc / v2pro weights read)
+//   refers  - non-empty list of refer slices (spec + optional sv)
 //
 // Returns true on success, false on failure.
 bool sovits_session_compute_ge(
     sovits_session       & session,
     const sovits_model   & model,
+    const std::vector<sovits_refer_view> & refers);
+
+// v2 legacy compatibility entry: same as sovits_session_compute_ge but takes
+// the pre-v2Pro API's (spec, T) pair list.
+//
+// This is a separate named function, NOT an overload, on purpose. Adding an
+// overload taking std::vector<std::pair<const float *, int64_t>> would make the
+// common braced call
+//     compute_ge(session, model, {{spec, T}})
+// ambiguous: the braced list can equally initialize a sovits_refer_view
+// (aggregate, sv defaults to null) or a std::pair. The main entry above still
+// accepts that braced form via aggregate initialization; this named entry
+// exists for callers that already hold a std::vector<std::pair<...>>.
+//
+// It passes sv = nullptr for every slice, so it only works on v2 models; on a
+// v2Pro/v2ProPlus model sovits_session_compute_ge returns false (missing sv).
+bool sovits_session_compute_ge_specs(
+    sovits_session       & session,
+    const sovits_model   & model,
     const std::vector<std::pair<const float *, int64_t>> & refers);
 
-// Get the cached style embedding tensor, or nullptr if not computed.
+// Get the cached flow/dec style embedding tensor (ge), or nullptr if not
+// computed. Returned ge/ge_enc pointers are borrowed: successful cache replacement
+// or session_free invalidates them; a failed cache update preserves them.
 struct ggml_tensor * sovits_session_get_ge(const sovits_session & session);
 
-// Run the full SoVITS v2 forward pipeline end-to-end.
+// Get the cached enc_p conditioning tensor (ge_enc {512, 1}), or nullptr.
+// For v2 this is the same tensor as ge.
+struct ggml_tensor * sovits_session_get_ge_enc(const sovits_session & session);
+
+// One reference slice for the audio-driven ge path (v2Pro/v2ProPlus): in
+// addition to the 704-channel spec, carries the 16 kHz mono waveform used to
+// compute the SV embedding in-process via sv_fbank + sv_forward3.
 //
-// Mirrors SynthesizerTrn.forward (v2 path, speed=1):
+// spec uses the same layout/lifetime as sovits_refer_view (spec[t*704 + c],
+// borrowed only for the call). audio16k / n_samples are likewise borrowed for
+// the duration of the call; the samples are consumed by sv_fbank and not
+// retained.
+struct sovits_audio_refer_view {
+    const float * spec     = nullptr;   // {704, T} row-major, spec[t*704 + c]
+    int64_t       T        = 0;
+    const float * audio16k = nullptr;   // 16 kHz mono waveform (float32)
+    int64_t       n_samples = 0;
+};
+
+// Compute and cache ge, deriving the per-refer SV embedding in-process from
+// the 16 kHz audio (no external sv dump needed). v2Pro/v2ProPlus only.
+//
+// Thinly composes sv_fbank + sv_forward3 (per refer) with the existing
+// sovits_session_compute_ge, so correctness rests on the two parity-verified
+// halves. Requires model.hparams.is_v2pro and a loaded sv_model.
+//
+// Input validation returns false rather than asserting. The cache is updated
+// with the same atomic semantics as sovits_session_compute_ge: any failure
+// (bad input, fbank/SV error, or ge compute error) leaves the previous
+// ge/ge_enc unchanged. Produces both conditionings (ge for flow/dec, ge_enc
+// for enc_p) exactly like sovits_session_compute_ge.
+//
+// Parameters:
+//   session  - initialized SoVITS session
+//   model    - loaded unified SoVITS model (v2pro weights used)
+//   sv_model - loaded ERes2NetV2 SV model
+//   refers   - non-empty list of audio refer slices (spec + audio16k)
+//
+// Returns true on success, false on failure.
+bool sovits_session_compute_ge_audio(
+    sovits_session       & session,
+    const sovits_model   & model,
+    const sv_model       & sv_model,
+    const std::vector<sovits_audio_refer_view> & refers);
+
+// Run the full SoVITS v2/v2Pro/v2ProPlus pipeline end-to-end.
+//
+// Mirrors SynthesizerTrn.decode (speed=1, batch=1):
 //   1. codes -> quantizer.decode         -> quantized {768, T_codes}
 //   2. (if 25hz) double time dim         -> quantized {768, 2*T_codes}
-//   3. enc_p(quantized, text, ge)        -> m, logs   {192, T_ssl} each
+//   3. enc_p(quantized, text, ge_enc)    -> m, logs   {192, T_ssl} each
 //   4. host: randn ~ N(0, noise_scale²)  -> randn     {192, T_ssl}
 //   5. z_p = m + randn * exp(logs)       -> z_p       {192, T_ssl}
 //   6. z = flow(z_p, ge, reverse=True)   -> z         {192, T_ssl}
@@ -661,6 +846,13 @@ struct ggml_tensor * sovits_session_get_ge(const sovits_session & session);
 //   T_text  - number of phoneme tokens
 //   wav_out - caller-allocated output buffer (F32)
 //   wav_cap - capacity of wav_out in floats; must be >= T_ssl * 640
+//
+// Input validation returns false rather than asserting. That includes the
+// length arithmetic (25hz doubling and the *640 / *192 products are
+// overflow-checked) and every token id in `codes` / `text` being within
+// [0, codebook_size) / [0, text_vocab). Host/allocator std::bad_alloc is caught
+// and reported as false; ggml asserts / a corrupt backend are not recovery
+// points.
 //
 // Returns true on success. On success, exactly T_ssl * 640 samples are
 // written to wav_out.

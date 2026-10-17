@@ -12,7 +12,6 @@ static constexpr int64_t kMelChannels = 704;
 static constexpr int64_t kRVQDim = 768;
 static constexpr int64_t kRVQBins = 1024;
 static constexpr int64_t kStyleHidden = 128;
-static constexpr int64_t kStyleOut = 512;
 static constexpr int64_t kStyleKernel = 5;
 static constexpr int64_t kStyleHeads = 2;
 static constexpr int64_t kStyleHeadDim = kStyleHidden / kStyleHeads;
@@ -37,14 +36,12 @@ static constexpr int64_t kTextEncoderMrteSslFusedDim =
 static constexpr int64_t kTextEncoderTextVocabV2 = 732;
 static constexpr float kLayerNormEps = 1.0e-5f;
 static constexpr float kGeneratorLreluSlope = 0.1f;
-static constexpr std::array<int64_t, kSovitsGeneratorStages> kGeneratorStageOutChannels = {
-    256, 128, 64, 32, 16,
-};
+// Upsample strides are identical across v2 / v2Pro / v2ProPlus
+// (upsample_rates = [10,8,2,2,2]). Per-stage output channels and kernels vary
+// (v2ProPlus initial=768, first kernel=20), so they are derived from the
+// loaded `up` weights at runtime instead of being fixed here.
 static constexpr std::array<int, kSovitsGeneratorStages> kGeneratorUpsampleStrides = {
     10, 8, 2, 2, 2,
-};
-static constexpr std::array<int, kSovitsGeneratorStages> kGeneratorUpsamplePaddings = {
-    3, 4, 3, 0, 0,
 };
 static constexpr std::array<int, kSovitsGeneratorBranches> kGeneratorResblockKernels = {
     3, 7, 11,
@@ -603,13 +600,18 @@ static ::ggml_tensor * generator_stage_forward(
     GGML_ASSERT(weights.up.b != nullptr);
 
     x = ggml_leaky_relu(ctx, x, kGeneratorLreluSlope, false);
+    // HiFi-GAN ConvTranspose1d uses padding = (kernel - stride) / 2. The kernel
+    // is read from the `up` weight (ggml ne[0]); stride is version-invariant.
+    const int stride  = kGeneratorUpsampleStrides[stage_idx];
+    const int kernel  = static_cast<int>(weights.up.w->ne[0]);
+    const int padding = (kernel - stride) / 2;
     x = conv_transpose1d_with_bias_time_first(
         ctx,
         x,
         weights.up.w,
         weights.up.b,
-        kGeneratorUpsampleStrides[stage_idx],
-        kGeneratorUpsamplePaddings[stage_idx]);
+        stride,
+        padding);
 
     ::ggml_tensor * sum = nullptr;
     for (int branch = 0; branch < kSovitsGeneratorBranches; ++branch) {
@@ -991,8 +993,8 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     GGML_ASSERT(weights.spectral_2_w->ne[1] == kStyleHidden);
     GGML_ASSERT(weights.spectral_2_b->ne[0] == kStyleHidden);
     GGML_ASSERT(weights.fc_w->ne[0] == kStyleHidden);
-    GGML_ASSERT(weights.fc_w->ne[1] == kStyleOut);
-    GGML_ASSERT(weights.fc_b->ne[0] == kStyleOut);
+    // fc output dim is variable: 512 for v2, 1024 for v2Pro/Plus.
+    GGML_ASSERT(weights.fc_w->ne[1] == weights.fc_b->ne[0]);
 
     ::ggml_tensor * x = linear_2d(ctx, refer, weights.spectral_1_w, weights.spectral_1_b);
     x = mish_2d(ctx, x);
@@ -1006,6 +1008,60 @@ static ::ggml_tensor * mrte_cross_attention_from_qkv(
     x = attention_block_forward(ctx, x, weights.attention);
     x = linear_2d(ctx, x, weights.fc_w, weights.fc_b);
     return masked_temporal_avg_pool(ctx, x);
+}
+
+// PReLU with per-channel negative slope: max(0, x) + slope * min(0, x).
+// Implemented as  (x + |x|)/2 + slope * (x - |x|)/2  to stay within the
+// ggml op set (no per-channel mask). slope is {C}; x is {C, T} (the 1-D
+// slope broadcasts over the trailing time axis).
+static ::ggml_tensor * prelu_2d(
+    ::ggml_context * ctx,
+    ::ggml_tensor  * x,
+    ::ggml_tensor  * slope)
+{
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(slope != nullptr);
+    GGML_ASSERT(slope->ne[0] == x->ne[0]);
+    ::ggml_tensor * ax  = ::ggml_abs(ctx, x);
+    ::ggml_tensor * pos = ::ggml_scale(ctx, ::ggml_add(ctx, x, ax), 0.5f);
+    ::ggml_tensor * neg = ::ggml_scale(ctx, ::ggml_sub(ctx, x, ax), 0.5f);
+    return ::ggml_add(ctx, pos, ::ggml_mul(ctx, neg, slope));
+}
+
+// v2Pro/v2ProPlus ge post-processing: sv_emb fuse + PReLU.
+//   ge_raw {gin, 1} + sv_emb(sv {20480}) -> PReLU -> {gin, 1}
+::ggml_tensor * sovits_v2pro_ge_forward(
+    ::ggml_context                          * ctx,
+    ::ggml_tensor                           * ge_raw,
+    ::ggml_tensor                           * sv,
+    const sovits_v2pro_block_weights        & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(ge_raw != nullptr);
+    GGML_ASSERT(sv != nullptr);
+    GGML_ASSERT(weights.sv_emb_w != nullptr);
+    GGML_ASSERT(weights.sv_emb_b != nullptr);
+    GGML_ASSERT(weights.prelu_w != nullptr);
+
+    // sv {20480} -> {20480, 1}; sv_emb: Linear(20480, gin) -> {gin, 1}
+    ::ggml_tensor * sv_in   = ::ggml_reshape_2d(ctx, sv, weights.sv_emb_w->ne[0], 1);
+    ::ggml_tensor * sv_proj = linear_2d(ctx, sv_in, weights.sv_emb_w, weights.sv_emb_b);
+    ::ggml_tensor * ge      = ::ggml_add(ctx, ge_raw, sv_proj);
+    return prelu_2d(ctx, ge, weights.prelu_w);
+}
+
+// v2Pro/v2ProPlus ge -> 512 projection for enc_p.
+//   ge {gin, 1} -> ge_to512 Linear(gin, 512) -> {512, 1}
+::ggml_tensor * sovits_ge_to512_forward(
+    ::ggml_context                          * ctx,
+    ::ggml_tensor                           * ge,
+    const sovits_v2pro_block_weights        & weights)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(ge != nullptr);
+    GGML_ASSERT(weights.ge_to512_w != nullptr);
+    GGML_ASSERT(weights.ge_to512_b != nullptr);
+    return linear_2d(ctx, ge, weights.ge_to512_w, weights.ge_to512_b);
 }
 
 ::ggml_tensor * sovits_rvq_decode_block_forward(
@@ -1184,8 +1240,10 @@ static ::ggml_tensor * sovits_wn_forward(
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(g != nullptr);
     GGML_ASSERT(x->ne[0] == kSovitsFlowHidden);
-    GGML_ASSERT(g->ne[0] == kSovitsFlowGin);
+    // gin is variable (512 for v2, 1024 for v2Pro/Plus); cond_w's input dim
+    // (ne[0] of the flattened Conv1d weight) is the source of truth.
     GGML_ASSERT(w.cond_w != nullptr);
+    GGML_ASSERT(g->ne[0] == w.cond_w->ne[0]);
     GGML_ASSERT(w.cond_b != nullptr);
 
     const int64_t H = kSovitsFlowHidden;
@@ -1290,7 +1348,7 @@ static ::ggml_tensor * flip_flow_channels(
     GGML_ASSERT(x != nullptr);
     GGML_ASSERT(g != nullptr);
     GGML_ASSERT(x->ne[0] == kSovitsFlowChannels);
-    GGML_ASSERT(g->ne[0] == kSovitsFlowGin);
+    GGML_ASSERT(g->ne[0] > 0);  // gin validated per-layer against cond_w
 
     // Reverse-channel index [C-1, ..., 0] built once, reused for every Flip.
     ::ggml_tensor * arange = ::ggml_arange(ctx, 0.0f,
@@ -1318,11 +1376,13 @@ static ::ggml_tensor * flip_flow_channels(
     GGML_ASSERT(z != nullptr);
     GGML_ASSERT(g != nullptr);
     GGML_ASSERT(z->ne[0] == kSovitsGeneratorIn);
-    GGML_ASSERT(g->ne[0] == kSovitsGeneratorGin);
+    // gin is variable (512 v2, 1024 v2Pro/Plus); cond.w's input dim (ne[0]
+    // of the flattened Conv1d weight) is the source of truth.
+    GGML_ASSERT(weights.cond.w != nullptr);
+    GGML_ASSERT(g->ne[0] == weights.cond.w->ne[0]);
     GGML_ASSERT(g->ne[1] == 1);
     GGML_ASSERT(weights.conv_pre.w != nullptr);
     GGML_ASSERT(weights.conv_pre.b != nullptr);
-    GGML_ASSERT(weights.cond.w != nullptr);
     GGML_ASSERT(weights.cond.b != nullptr);
     GGML_ASSERT(weights.conv_post_w != nullptr);
 
@@ -1347,9 +1407,15 @@ static ::ggml_tensor * flip_flow_channels(
     x = ggml_add(ctx, x, cond);
 
     for (int stage = 0; stage < kSovitsGeneratorStages; ++stage) {
-        GGML_ASSERT(x->ne[1] == (stage == 0 ? 512 : kGeneratorStageOutChannels[stage - 1]));
+        // Expected input channels: conv_pre out for stage 0, else the previous
+        // stage's up out. Both are read from the loaded weights so the channel
+        // plan (256/16 for v2/v2Pro, 384/24 for v2ProPlus) is data-driven.
+        const int64_t expected_in = (stage == 0)
+            ? static_cast<int64_t>(weights.conv_pre.b->ne[0])
+            : static_cast<int64_t>(weights.stages[stage - 1].up.b->ne[0]);
+        GGML_ASSERT(x->ne[1] == expected_in);
         x = generator_stage_forward(ctx, x, weights.stages[stage], stage);
-        GGML_ASSERT(x->ne[1] == kGeneratorStageOutChannels[stage]);
+        GGML_ASSERT(x->ne[1] == static_cast<int64_t>(weights.stages[stage].up.b->ne[0]));
     }
 
     x = ggml_leaky_relu(ctx, x, kGeneratorLreluSlope, false);
