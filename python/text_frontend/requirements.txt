@@ -1,0 +1,6 @@
+# Models and dependencies are loaded lazily; no PyTorch is required.
+pypinyin>=0.49
+numpy>=1.21
+g2p-en==2.1.0
+nltk==3.9.2
+wordsegment==1.3.1

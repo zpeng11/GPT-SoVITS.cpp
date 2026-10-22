@@ -1,0 +1,79 @@
+GPT-SoVITS.cpp text frontend — third-party notices
+==================================================
+
+This directory contains a self-contained, torch-free Python text frontend.
+The implementation and data below were adapted from existing projects.  The
+original copyright notices and license texts are preserved in ./licenses/.
+
+1. GPT-SoVITS text preprocessing algorithms and data
+   Source: https://github.com/RVC-Boss/GPT-SoVITS
+   Copyright (c) 2024 RVC-Boss
+   License: MIT (licenses/MIT-GPT-SoVITS.txt)
+
+   Adapted pieces:
+   - v2 phoneme symbol table and ordering (symbols_v2.py)
+   - pypinyin-based Chinese G2P and opencpop-strict.txt mapping
+   - Chinese tone-sandhi and erhua rules (tone_sandhi.py)
+   - English CMUdict lookup / G2P rules, cmudict-fast.rep, namedict.json
+     (converted from OIE's primitive-only name dictionary), and engdict-hot.rep
+
+2. GPT-SoVITS-OIE packaging and text-preprocessing adaptations
+   Source: https://github.com/zpeng11/GPT-SoVITS-OIE
+   Copyright (c) 2025 zpeng11
+   License: MIT (licenses/MIT-GPT-SoVITS-OIE.txt)
+
+   The algorithms were inspected in that project but its runtime is not
+   imported or required at runtime here.
+
+3. PaddleSpeech Chinese text normalization
+   Source: https://github.com/PaddlePaddle/PaddleSpeech
+   Copyright (c) 2020-2021 PaddlePaddle Authors
+   License: Apache License 2.0 (licenses/Apache-2.0.txt)
+
+   Files: zh_normalization/*.py (number/date/time/telephone normalization,
+   traditional-to-simplified character table).
+
+4. CMU Pronouncing Dictionary 0.7b
+   Source: https://svn.code.sf.net/p/cmusphinx/code/branches/cmudict/
+   Copyright (C) 1993-2015 Carnegie Mellon University
+   License: CMUdict BSD-style terms (licenses/CMUdict.txt)
+   File: data/cmudict.rep
+
+5. pypinyin
+   Source: https://github.com/mozillazg/python-pinyin
+   Copyright (c) 2016 mozillazg, 闲耘
+   License: MIT (licenses/MIT-pypinyin.txt)
+   Runtime dependency (imported lazily for Chinese text only).
+
+6. jieba
+   Source: https://github.com/fxsjy/jieba
+   Copyright (c) 2013 Sun Junyi
+   License: MIT (licenses/MIT-jieba.txt)
+   Optional dependency (imported lazily; Chinese G2P falls back to a
+   character/rule-based segmenter when it is unavailable).
+
+7. g2p-en 2.1.0 NumPy prediction
+   Source: https://github.com/Kyubyong/g2p
+   Authors: Kyubyong Park and Jongseok Kim
+   License: Apache License 2.0 (licenses/Apache-2.0.txt)
+   english_model.py adapts the encoder/decoder inference and phoneme alphabet.
+   Changes: offline data loading, validation, lazy initialization; no import of
+   g2p_en. checkpoint20.npz and homographs.en are read from the installed pinned
+   distribution or an explicit model directory, not copied into this package.
+
+8. NLTK and wordsegment
+   Sources: https://github.com/nltk/nltk, https://github.com/grantjenks/python-wordsegment
+   License: Apache License 2.0 (licenses/Apache-2.0.txt)
+   Runtime dependencies for English POS tagging and compound segmentation.
+   NLTK POS data is prepared separately, not distributed in this directory.
+
+No torch, transformers, MNN or ONNX Runtime is required. English defaults to
+NumPy g2p-en data with NLTK and wordsegment; the explicit basic backend retains
+the earlier dictionary/rule-only implementation. Runtime inference never
+downloads data. The separate resource preparation command downloads NLTK data
+only on explicit invocation.
+
+The opencpop-strict.txt mapping is small data distributed with GPT-SoVITS;
+its upstream dataset is OpenCpop.  It is reproduced here under the GPT-SoVITS
+MIT distribution.  If a downstream distributor has a stricter dataset policy,
+replace data/opencpop-strict.txt with an equivalent pinyin-to-phoneme table.

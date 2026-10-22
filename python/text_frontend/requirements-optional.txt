@@ -1,0 +1,2 @@
+# Optional POS-aware Chinese word segmentation / neutral-tone sandhi.
+jieba>=0.42
