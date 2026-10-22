@@ -23,6 +23,7 @@ set(HUBERT_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_load.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_parity.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_flac.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/test_hubert_extract.cpp
 )
 
 foreach(test_src ${HUBERT_TEST_SOURCES})
@@ -45,6 +46,7 @@ endforeach()
 set(ROBERTA_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/roberta/test_roberta_load.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/roberta/test_roberta_parity.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/roberta/test_roberta_extract.cpp
 )
 
 foreach(test_src ${ROBERTA_TEST_SOURCES})
@@ -90,6 +92,29 @@ foreach(test_src ${SOVITS_TEST_SOURCES})
     )
     target_compile_definitions(${test_name} PRIVATE
         SOVITS_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sovits/"
+    )
+    gtest_discover_tests(${test_name})
+endforeach()
+
+# Audio DSP/IO tests (use cnpy for .npy loading)
+set(AUDIO_TEST_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_stft.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_resample.cpp
+)
+
+foreach(test_src ${AUDIO_TEST_SOURCES})
+    get_filename_component(test_name ${test_src} NAME_WE)
+    add_executable(${test_name} ${test_src} ${COMMON_TEST_SOURCES})
+    target_include_directories(${test_name} PRIVATE
+        ${COMMON_TEST_INCLUDE_DIR}
+    )
+    target_link_libraries(${test_name} PRIVATE
+        gpt_sovits_cpp_static
+        GTest::gtest_main
+    )
+    target_compile_definitions(${test_name} PRIVATE
+        AUDIO_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/audio/"
     )
     gtest_discover_tests(${test_name})
 endforeach()

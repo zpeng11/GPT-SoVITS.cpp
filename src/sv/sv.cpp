@@ -1,4 +1,5 @@
 #include "gpt_sovits/sv.h"
+#include "gpt_sovits/audio.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -321,39 +322,6 @@ static bool validate_model(gguf_context * gctx, ggml_context * ctx) {
 // Kaldi fbank frontend
 // ---------------------------------------------------------------------------
 
-// Iterative radix-2 Cooley-Tukey FFT (in-place), n a power of two.
-static void fft(std::vector<float> & re, std::vector<float> & im) {
-    const int n = static_cast<int>(re.size());
-    GGML_ASSERT(n > 0 && (n & (n - 1)) == 0);
-    // bit reversal
-    for (int i = 1, j = 0; i < n; ++i) {
-        int bit = n >> 1;
-        for (; j & bit; bit >>= 1) j ^= bit;
-        j ^= bit;
-        if (i < j) {
-            std::swap(re[i], re[j]); std::swap(im[i], im[j]);
-        }
-    }
-    for (int len = 2; len <= n; len <<= 1) {
-        const float ang = -2.0f * kPi / len;
-        const float wre = std::cos(ang), wim = std::sin(ang);
-        for (int i = 0; i < n; i += len) {
-            float cre = 1.0f, cim = 0.0f;
-            for (int k = 0; k < len / 2; ++k) {
-                const float ar = re[i + k], ai = im[i + k];
-                const float br = re[i + k + len / 2], bi = im[i + k + len / 2];
-                const float tr = cre * br - cim * bi;
-                const float ti = cre * bi + cim * br;
-                re[i + k] = ar + tr; im[i + k] = ai + ti;
-                re[i + k + len / 2] = ar - tr; im[i + k + len / 2] = ai - ti;
-                const float ncre = cre * wre - cim * wim;
-                cim = cre * wim + cim * wre;
-                cre = ncre;
-            }
-        }
-    }
-}
-
 static float mel_scale_scalar(float freq) { return 1127.0f * std::log(1.0f + freq / 700.0f); }
 
 // Triangular mel filterbank: [num_bins, num_fft_bins/2] (last col dropped at use).
@@ -553,7 +521,7 @@ int sv_fbank(const float * audio, int64_t n_samples, std::vector<float> & out_fe
         std::fill(re.begin(), re.end(), 0.0f);
         std::fill(im.begin(), im.end(), 0.0f);
         for (int i = 0; i < window_size; ++i) re[i] = frame[i] * win[i];
-        fft(re, im);
+        GGML_ASSERT(audio_fft_radix2(re.data(), im.data(), static_cast<int64_t>(re.size())));
         // power spectrum (first n_fft_bins+1 rfft bins = indices 0..n_fft_bins)
         std::vector<float> spec(n_fft_bins + 1);
         for (int k = 0; k <= n_fft_bins; ++k) {

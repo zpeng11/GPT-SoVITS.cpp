@@ -1,6 +1,10 @@
 set(GPTSOVITS_SOURCES
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/stft.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/io.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/resample.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/loader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/hubert/session.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/sovits/session.cpp
@@ -10,6 +14,7 @@ set(GPTSOVITS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/t2s/session.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/roberta/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/roberta/loader.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/roberta/session.cpp
 )
 
 set(GPTSOVITS_PUBLIC_INCLUDE_DIR ${CMAKE_SOURCE_DIR}/include)

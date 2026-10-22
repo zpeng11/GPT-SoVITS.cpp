@@ -235,4 +235,39 @@ bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_bac
 // Free all resources owned by a HuBERT model.
 void hubert_model_free(hubert_model & model);
 
+// ---------------------------------------------------------------------------
+// Feature extraction (caller-normalized input)
+// ---------------------------------------------------------------------------
+
+// Number of HuBERT output frames for a 16 kHz mono waveform of n_samples:
+// T' = 1 + (n_samples - 400) / 320 for n_samples >= 400, else 0.
+int64_t hubert_output_frames(int64_t n_samples);
+
+// Run full HuBERT feature extraction on an already-normalized waveform
+// (feature encoder -> projection -> positional conv -> 12-layer transformer),
+// encapsulating the standard ephemeral-graph compute sequence.
+//
+// Input normalization is NOT performed here. The caller must apply the
+// upstream Wav2Vec2FeatureExtractor preprocessing (zero mean, unit variance)
+// before calling; raw PCM would produce features that do not match the
+// reference pipeline.
+//
+// Parameters:
+//   model      - loaded HuBERT model (weights read, not modified)
+//   pcm        - normalized 16 kHz mono waveform (F32), host pointer
+//   n_samples  - number of waveform samples
+//   out        - caller-allocated destination (F32), ggml {768, T'} layout:
+//                out[t * 768 + c]
+//   out_cap    - capacity of out in floats; must be >= 768 * T'
+//   out_frames - optional; receives T'
+//
+// Input validation returns false rather than asserting.
+// Returns true on success.
+bool hubert_extract_features_from_normalized_pcm(const hubert_model & model,
+                                                 const float        * pcm,
+                                                 int64_t              n_samples,
+                                                 float              * out,
+                                                 int64_t              out_cap,
+                                                 int64_t            * out_frames = nullptr);
+
 } // namespace gpt_sovits

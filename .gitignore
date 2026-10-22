@@ -46,3 +46,6 @@ tests/t2s/ref/sampled_tokens.npy
 
 # Test output artifacts (smoke-test wav dumps, etc.)
 tests/*/out/
+
+# Local agent tooling (.zcode series)
+.zcode*

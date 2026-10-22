@@ -8,7 +8,7 @@
 // (f32, f16, q8, q5, q4).
 
 #define DR_FLAC_IMPLEMENTATION
-#include "dr_flac.h"
+#include "../../third_party/dr_libs/dr_flac.h"
 
 #include <gtest/gtest.h>
 

@@ -213,4 +213,68 @@ bool roberta_model_load(const std::string & fname, roberta_model & model, ggml_b
 // Free all resources owned by a RoBERTa model.
 void roberta_model_free(roberta_model & model);
 
+// ---------------------------------------------------------------------------
+// End-to-end feature extraction and phoneme alignment
+// ---------------------------------------------------------------------------
+
+// Run full RoBERTa (chinese-roberta-wwm-ext-large) feature extraction
+// end-to-end (embeddings + 24 encoder layers), encapsulating the standard
+// ephemeral-graph compute sequence.
+//
+// Parameters:
+//   model          - loaded RoBERTa model (weights read, not modified)
+//   token_ids      - token IDs {T} (I32), host pointer; T must be <= 512
+//   T              - sequence length (> 0)
+//   out            - caller-allocated destination (F32), ggml {1024, T} layout:
+//                    out[t * 1024 + c]
+//   out_cap        - capacity of out in floats; must be >= 1024 * T
+//   token_type_ids - optional segment IDs {T} (I32); nullptr = all zeros
+//
+// Input validation returns false rather than asserting.
+// Returns true on success.
+bool roberta_extract_features(const roberta_model & model,
+                              const int32_t       * token_ids,
+                              int64_t               T,
+                              float               * out,
+                              int64_t               out_cap,
+                              const int32_t       * token_type_ids = nullptr);
+
+// Expand per-WordPiece-token BERT features into per-phoneme BERT features,
+// replicating python/text_frontend/layout.py:expand_bert_features.
+//
+// For each normalized character i (0 <= i < n_chars), word2ph[i] phonemes are
+// emitted; they all receive a copy of the 1024-dim feature vector of the body
+// token whose char span covers i (char_starts[t] <= i < char_ends[t]).
+// Special tokens ([CLS]/[SEP]) have span -1/-1 and are never selected.
+// sum(word2ph) must equal n_phones.
+//
+// Span-conflict rule (same as the Python reference): for every character with
+// word2ph[i] > 0 the Python code requires EXACTLY ONE covering body token and
+// raises LayoutError when there are zero or several matches.  There is no
+// "first token wins" / "last token wins" precedence: a character covered by
+// more than one token span is invalid, and this function returns false.
+// Characters with word2ph[i] == 0 are not looked up at all.
+//
+// Parameters:
+//   tok_feat    - per-token features {1024, n_tok} F32, layout tok_feat[t*1024 + c]
+//   n_tok       - number of WordPiece tokens (incl. specials)
+//   char_starts / char_ends - token char spans, length n_tok; -1 for specials
+//   word2ph     - phoneme count per normalized char, length n_chars
+//   n_phones    - total phoneme count (== sum(word2ph))
+//   out         - caller-allocated {1024, n_phones} F32, out[p*1024 + c]
+//
+// English-segment zero-fill is NOT this function's job: callers handle
+// multi-segment text by calling this per Chinese segment and zero-filling
+// English segments' phoneme ranges themselves.
+// Returns false on invalid input (nulls, span out of range, no covering token,
+// several covering tokens, sum(word2ph) != n_phones).
+bool roberta_expand_bert_features(const float   * tok_feat,
+                                  int64_t         n_tok,
+                                  const int32_t * char_starts,
+                                  const int32_t * char_ends,
+                                  const int32_t * word2ph,
+                                  int64_t         n_chars,
+                                  int64_t         n_phones,
+                                  float         * out);
+
 } // namespace gpt_sovits
