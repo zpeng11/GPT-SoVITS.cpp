@@ -9,6 +9,7 @@
 
 #include "test_backend.h"
 #include "npy_loader.h"
+#include "../../third_party/ggml/src/ggml-backend-impl.h"
 
 #include <cmath>
 #include <string>
@@ -299,6 +300,102 @@ TEST(T2SSession, BuildDecodeGraph) {
     ggml_backend_free(backend);
 }
 
+TEST(T2SSession, DecodeBuildRejectsUninitializedSession) {
+    gpt_sovits::t2s_session session;
+    gpt_sovits::t2s_model model;
+    EXPECT_FALSE(gpt_sovits::t2s_session_build_decode_graph(session, model));
+    EXPECT_EQ(session.ctx_graph, nullptr);
+    EXPECT_EQ(session.alloc_dec, nullptr);
+    EXPECT_EQ(session.decode_model, nullptr);
+}
+
+TEST(T2SSession, DecodeBuildFailureRetryAndDuplicatePreserveState) {
+    struct Resources {
+        ggml_backend_t backend = ggml_backend_cpu_init();
+        gpt_sovits::t2s_model model;
+        gpt_sovits::t2s_session session;
+        ~Resources() {
+            gpt_sovits::t2s_session_free(session);
+            gpt_sovits::t2s_model_free(model);
+            if (backend) ggml_backend_free(backend);
+        }
+    } r;
+    ASSERT_NE(r.backend, nullptr);
+    gpt_sovits::t2s_hparams hp;
+    hp.embedding_dim = hp.hidden_dim = 32;
+    hp.n_head = 1;
+    hp.n_layer = 1;
+    hp.linear_units = 64;
+    hp.vocab_size = 32;
+    hp.eos = 31;
+    gpt_sovits::t2s_sampler_config sampler;
+    sampler.top_k = 15;
+    sampler.top_p = 0.95f;
+    r.model = create_minimal_model(hp, r.backend);
+    ASSERT_NE(r.model.buf_w, nullptr);
+    ggml_backend_buffer_clear(r.model.buf_w, 0);
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(r.session, hp, r.backend, 1, 16, sampler));
+    // The CPU buffer type is shared; this process runs tests serially.
+    struct AllocationFailure {
+        ggml_backend_buffer_type_t buft;
+        decltype(ggml_backend_buffer_type_i::alloc_buffer) original;
+        explicit AllocationFailure(ggml_backend_buffer_type_t b)
+            : buft(b), original(b->iface.alloc_buffer) {
+            buft->iface.alloc_buffer = [](ggml_backend_buffer_type_t, size_t) -> ggml_backend_buffer_t {
+                return nullptr;
+            };
+        }
+        ~AllocationFailure() { buft->iface.alloc_buffer = original; }
+    };
+    {
+        AllocationFailure failure(ggml_backend_get_default_buffer_type(r.backend));
+        EXPECT_FALSE(gpt_sovits::t2s_session_build_decode_graph(r.session, r.model));
+        EXPECT_EQ(r.session.ctx_graph, nullptr);
+        EXPECT_EQ(r.session.gf_dec, nullptr);
+        EXPECT_EQ(r.session.alloc_dec, nullptr);
+        EXPECT_EQ(r.session.sampled, nullptr);
+        EXPECT_EQ(r.session.greedy, nullptr);
+        EXPECT_EQ(r.session.decode_model, nullptr);
+        EXPECT_NE(r.session.buf_kv, nullptr);
+    }
+    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(r.session, r.model));
+    auto * ctx = r.session.ctx_graph;
+    auto * graph = r.session.gf_dec;
+    auto * sampled = r.session.sampled;
+    auto * greedy = r.session.greedy;
+    auto * alloc = r.session.alloc_dec;
+    EXPECT_EQ(r.session.decode_model, &r.model);
+    EXPECT_FALSE(gpt_sovits::t2s_session_build_decode_graph(r.session, r.model));
+    EXPECT_EQ(r.session.ctx_graph, ctx);
+    EXPECT_EQ(r.session.gf_dec, graph);
+    EXPECT_EQ(r.session.sampled, sampled);
+    EXPECT_EQ(r.session.greedy, greedy);
+    EXPECT_EQ(r.session.alloc_dec, alloc);
+    EXPECT_EQ(r.session.decode_model, &r.model);
+
+    gpt_sovits::t2s_session_free(r.session);
+    EXPECT_EQ(r.session.decode_model, nullptr);
+    EXPECT_EQ(r.session.ref_model, nullptr);
+    EXPECT_EQ(r.session.ctx_graph, nullptr);
+    EXPECT_EQ(r.session.alloc_dec, nullptr);
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(r.session, hp, r.backend, 1, 16, sampler));
+    EXPECT_TRUE(gpt_sovits::t2s_session_build_decode_graph(r.session, r.model));
+    for (int n_query : {3, 16}) {
+        gpt_sovits::t2s_batch_plan plan{{n_query}};
+        {
+            AllocationFailure failure(ggml_backend_get_default_buffer_type(r.backend));
+            auto flex = gpt_sovits::t2s_session_build_flex_graph(r.session, r.model, plan);
+            EXPECT_EQ(flex.ctx, nullptr);
+            EXPECT_EQ(r.session.alloc_flex, nullptr);
+            gpt_sovits::t2s_flex_graph_free(flex);
+        }
+        auto flex = gpt_sovits::t2s_session_build_flex_graph(r.session, r.model, plan);
+        EXPECT_NE(flex.ctx, nullptr);
+        EXPECT_NE(r.session.alloc_flex, nullptr);
+        gpt_sovits::t2s_flex_graph_free(flex);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Mask management (fixture)
 // ---------------------------------------------------------------------------
@@ -508,6 +605,7 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
         ref_bert.data(),
         hubert.data(), T_hub);
     ASSERT_TRUE(ok);
+    EXPECT_EQ(session.ref_model, &model);
 
     // Verify cached tensor shapes.
     struct ggml_tensor * ref_text_emb = gpt_sovits::t2s_session_get_ref_text_emb(session);

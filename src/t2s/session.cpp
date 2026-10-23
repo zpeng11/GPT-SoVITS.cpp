@@ -6,6 +6,7 @@
 
 #include <cmath>
 #include <cstdio>
+#include <new>
 #include <vector>
 
 namespace gpt_sovits {
@@ -178,6 +179,7 @@ void t2s_session_free(t2s_session & session) {
     session.ref_audio_emb = nullptr;
     session.ref_T_ref     = 0;
     session.ref_T_prompt  = 0;
+    session.ref_model     = nullptr;
 
     if (session.alloc_dec) {
         ggml_gallocr_free(session.alloc_dec);
@@ -191,6 +193,7 @@ void t2s_session_free(t2s_session & session) {
         ggml_free(session.ctx_graph);
         session.ctx_graph = nullptr;
     }
+    session.decode_model = nullptr;
     session.gf_dec   = nullptr;
     session.sampled  = nullptr;
     session.greedy   = nullptr;
@@ -333,95 +336,100 @@ bool t2s_session_build_decode_graph(
     t2s_session             & session,
     const t2s_model         & model)
 {
-    const auto & hparams = model.hparams;
-    const int64_t d_model = hparams.hidden_dim;
-    const int     n_layer = (int) hparams.n_layer;
-    const int     n_head  = (int) hparams.n_head;
-    const int     n_kv    = t2s_session_get_n_kv(session);
-    const int     n_batch = (int) session.n_batch;
-
-    const t2s_sampler_config & sampler_cfg = session.sampler_cfg;
-
-    // Graph context: holds intermediate tensors and the cgraph structure.
-    // Attention layers need ~32 intermediates each; sampler needs ~50 per batch element.
-    // Embedding path adds ~4 intermediates (get_rows x2, mul, add).
-    const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 50 + 12;
-    const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
-
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 1) +
-                         ggml_graph_overhead_custom(graph_size, false),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-
-    session.ctx_graph = ggml_init(params);
-    if (!session.ctx_graph) {
-        fprintf(stderr, "%s: ggml_init() for graph context failed\n", __func__);
+    if (session.ctx_graph || session.gf_dec || session.alloc_dec || session.decode_model) {
+        fprintf(stderr, "%s: decode graph already built\n", __func__);
+        return false;
+    }
+    if (!session.backend || !session.ctx_kv || !session.buf_kv) {
+        fprintf(stderr, "%s: session is not initialized\n", __func__);
         return false;
     }
 
-    session.gf_dec = ggml_new_graph_custom(session.ctx_graph, graph_size, false);
+    struct graph_resources {
+        ggml_context * ctx = nullptr;
+        ggml_gallocr_t alloc = nullptr;
+        ~graph_resources() {
+            if (alloc) ggml_gallocr_free(alloc);
+            if (ctx) ggml_free(ctx);
+        }
+    } resources;
 
-    // In-graph embedding: token_id → audio_embed lookup + PE(position) * alpha.
-    struct ggml_tensor * emb = ggml_get_rows(session.ctx_graph,
-        model.weights.embed.audio_embedding, session.token_id);
-    struct ggml_tensor * pe = ggml_get_rows(session.ctx_graph,
-        session.pe_table, session.position);
-    struct ggml_tensor * scaled_pe = ggml_mul(session.ctx_graph, pe,
-        model.weights.embed.audio_pos_alpha);
-    struct ggml_tensor * x = ggml_add(session.ctx_graph, emb, scaled_pe);
+    try {
+        const auto & hparams = model.hparams;
+        const int     n_layer = (int) hparams.n_layer;
+        const int     n_head  = (int) hparams.n_head;
+        const int     n_kv    = t2s_session_get_n_kv(session);
+        const int     n_batch = (int) session.n_batch;
+        const t2s_sampler_config & sampler_cfg = session.sampler_cfg;
 
-    // Build 24-layer decode graph.
-    for (int i = 0; i < n_layer; i++) {
-        x = t2s_attention_block_forward(
-            session.ctx_graph, session.gf_dec, x,
-            session.mask,
-            session.k_caches[i], session.v_caches[i],
-            session.kv_pos,
-            model.weights.attention[i],
-            n_kv, n_head, 1e-5f);
-    }
+        // Top-p, top-k and repetition filtering together need over 60 tensors per slot.
+        const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 80 + 12;
+        const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 1) +
+                             ggml_graph_overhead_custom(graph_size, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
 
-    // Attach sampler: project hidden states to logits, apply filtering, sample tokens.
-    t2s_sampler_result sampler_result = t2s_sampler_block_forward(
-        session.ctx_graph,
-        x,                          // hidden states from last attention layer
-        model.weights.lm_head_w,    // {d_model, vocab} projection weight
-        session.seen_mask,          // {vocab, n_batch} graph input
-        sampler_cfg.top_k,
-        sampler_cfg.top_p,
-        sampler_cfg.temperature,
-        sampler_cfg.repetition_penalty,
-        session.exp_noise);         // {vocab, n_batch} graph input
+        resources.ctx = ggml_init(params);
+        if (!resources.ctx) {
+            fprintf(stderr, "%s: ggml_init() for graph context failed\n", __func__);
+            return false;
+        }
+        auto * ctx = resources.ctx;
+        auto * gf = ggml_new_graph_custom(ctx, graph_size, false);
 
-    // Mark outputs so the allocator preserves their storage.
-    ggml_set_name(sampler_result.sampled, "sampled");
-    ggml_set_output(sampler_result.sampled);
-    ggml_build_forward_expand(session.gf_dec, sampler_result.sampled);
+        struct ggml_tensor * emb = ggml_get_rows(ctx,
+            model.weights.embed.audio_embedding, session.token_id);
+        struct ggml_tensor * pe = ggml_get_rows(ctx, session.pe_table, session.position);
+        struct ggml_tensor * scaled_pe = ggml_mul(ctx, pe, model.weights.embed.audio_pos_alpha);
+        struct ggml_tensor * x = ggml_add(ctx, emb, scaled_pe);
 
-    ggml_set_name(sampler_result.greedy, "greedy");
-    ggml_set_output(sampler_result.greedy);
-    ggml_build_forward_expand(session.gf_dec, sampler_result.greedy);
+        for (int i = 0; i < n_layer; i++) {
+            x = t2s_attention_block_forward(
+                ctx, gf, x, session.mask,
+                session.k_caches[i], session.v_caches[i], session.kv_pos,
+                model.weights.attention[i], n_kv, n_head, 1e-5f);
+        }
 
-    session.sampled = sampler_result.sampled;
-    session.greedy  = sampler_result.greedy;
+        t2s_sampler_result sampler_result = t2s_sampler_block_forward(
+            ctx, x, model.weights.lm_head_w, session.seen_mask,
+            sampler_cfg.top_k, sampler_cfg.top_p, sampler_cfg.temperature,
+            sampler_cfg.repetition_penalty, session.exp_noise);
 
-    // Pre-allocate intermediate tensor storage for stable data pointers.
-    // This ensures CUDA Graph can reuse the captured graph even when other
-    // graphs execute on the same backend between decode steps.
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
-    session.alloc_dec = ggml_gallocr_new(buft);
-    if (!session.alloc_dec) {
-        fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
+        ggml_set_name(sampler_result.sampled, "sampled");
+        ggml_set_output(sampler_result.sampled);
+        ggml_build_forward_expand(gf, sampler_result.sampled);
+        ggml_set_name(sampler_result.greedy, "greedy");
+        ggml_set_output(sampler_result.greedy);
+        ggml_build_forward_expand(gf, sampler_result.greedy);
+
+        // Persistent allocation keeps data pointers stable for CUDA graph reuse.
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
+        resources.alloc = ggml_gallocr_new(buft);
+        if (!resources.alloc) {
+            fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
+            return false;
+        }
+        if (!ggml_gallocr_alloc_graph(resources.alloc, gf)) {
+            fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
+            return false;
+        }
+
+        session.ctx_graph = resources.ctx;
+        session.alloc_dec = resources.alloc;
+        session.gf_dec = gf;
+        session.sampled = sampler_result.sampled;
+        session.greedy = sampler_result.greedy;
+        session.decode_model = &model;
+        resources.ctx = nullptr;
+        resources.alloc = nullptr;
+        return true;
+    } catch (const std::bad_alloc &) {
+        fprintf(stderr, "%s: out of memory\n", __func__);
         return false;
     }
-    if (!ggml_gallocr_alloc_graph(session.alloc_dec, session.gf_dec)) {
-        fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
-        return false;
-    }
-
-    return true;
 }
 
 struct ggml_tensor * t2s_session_get_token_id(const t2s_session & session) {
@@ -530,10 +538,10 @@ t2s_flex_graph t2s_session_build_flex_graph(
     const int N_decode = n_decode;  // each decode slot contributes exactly 1 token
 
     // --- 1. Create graph context ---
-    // Attention layers need ~32 intermediates each; sampler needs ~50 per active slot.
+    // Include the sampler's top-p, top-k and repetition-filtering branches.
     // Decode embedding path adds ~4 intermediates per decode slot (get_rows x2, mul, add).
     const size_t n_intermediates = (size_t) n_layer * 32
-                                 + (size_t) n_active * 50
+                                 + (size_t) n_active * 80
                                  + (size_t) n_decode * 4
                                  + 8;
     const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
@@ -550,6 +558,18 @@ t2s_flex_graph t2s_session_build_flex_graph(
         fprintf(stderr, "%s: ggml_init() failed\n", __func__);
         return graph;
     }
+
+    struct graph_cleanup {
+        t2s_flex_graph * graph;
+        t2s_session & session;
+        ~graph_cleanup() {
+            if (!graph) return;
+            t2s_flex_graph_free(*graph);
+            // Failed gallocr reservations can retain a plan without its buffer.
+            if (session.alloc_flex) ggml_gallocr_free(session.alloc_flex);
+            session.alloc_flex = nullptr;
+        }
+    } cleanup{&graph, session};
 
     // --- 2. Create input tensors ---
     if (N_prefill > 0) {
@@ -735,6 +755,7 @@ t2s_flex_graph t2s_session_build_flex_graph(
     graph.n_active = n_active;
     graph.n_decode = n_decode;
 
+    cleanup.graph = nullptr;
     return graph;
 }
 
@@ -1076,6 +1097,7 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
 
     session.ref_T_ref    = T_ref;
     session.ref_T_prompt = T_prompt;
+    session.ref_model    = &model;
 
     // --- Free temporaries ---
     ggml_gallocr_free(alloc);

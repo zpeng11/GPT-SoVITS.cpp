@@ -340,6 +340,7 @@ struct t2s_session {
     struct ggml_context * ctx_graph = nullptr;  // owned
     struct ggml_cgraph  * gf_dec    = nullptr;  // owned
     ggml_gallocr_t        alloc_dec = nullptr;  // owned — pre-allocates intermediate storage
+    const t2s_model     * decode_model = nullptr;  // borrowed; must not move or reload
 
     // Decode embedding inputs (filled per decode step)
     struct ggml_tensor  * token_id  = nullptr;  // {n_batch} I32 — audio token to embed
@@ -367,6 +368,7 @@ struct t2s_session {
     struct ggml_tensor   * ref_audio_emb  = nullptr;  // cached {d_model, T_prompt}
     int64_t                ref_T_ref      = 0;        // ref text token count (input pos offset)
     int64_t                ref_T_prompt   = 0;        // ref prompt audio token count
+    const t2s_model      * ref_model      = nullptr;  // borrowed; must not move or reload
 
     // Shared allocator for flexible computation graphs (owned).
     // Reused across t2s_session_build_flex_graph calls to avoid repeated
@@ -440,7 +442,8 @@ int t2s_session_get_n_kv(const t2s_session & session);
 //
 // Accepts raw host data pointers for all inputs. Internally builds a temporary
 // graph, executes it, and copies the result to a session-owned persistent tensor.
-// Call once after session init; one session = one ref.
+// Call once after session init; one session = one ref. For subsequent generate
+// calls, keep this model alive at the same address without moving/reloading it.
 //
 // Parameters:
 //   session     - initialized T2S session
@@ -472,8 +475,11 @@ int64_t t2s_session_get_ref_T_ref(const t2s_session & session);
 // Get the cached T_prompt (number of reference prompt audio tokens), or 0 if not computed.
 int64_t t2s_session_get_ref_T_prompt(const t2s_session & session);
 
-// Build a persistent decode graph for this session. Call exactly once after
-// t2s_session_init; the graph is reused for every decode step.
+// Build a persistent decode graph for this session after t2s_session_init.
+// A duplicate build returns false without changing the existing graph. A failed
+// build leaves the session without a decode graph and may be retried. The model
+// must stay alive at the same address, without moving or reloading its weights,
+// until the session is freed. The graph is reused for every decode step.
 //
 // Includes the sampler (using session's sampler_cfg). Outputs are `sampled`
 // and `greedy` token id tensors.
@@ -586,5 +592,59 @@ void t2s_flex_graph_free(t2s_flex_graph & graph);
 //   - Prefill slots: sets audio_offset = n_query - ref_T_prompt
 //   - Reveals new KV positions in session decode mask; increments n_pos
 void t2s_session_flex_advance(t2s_session & session, const t2s_batch_plan & plan, t2s_flex_graph & graph);
+
+// ---------------------------------------------------------------------------
+// Single-request synchronous generation
+// ---------------------------------------------------------------------------
+
+struct t2s_generate_config {
+    int32_t  max_new_tokens = 200;
+    uint32_t seed = 42;
+};
+
+enum class t2s_stop_reason {
+    eos,
+    max_new_tokens,
+};
+
+struct t2s_generate_result {
+    std::vector<int32_t> codes;
+    t2s_stop_reason stop_reason = t2s_stop_reason::max_new_tokens;
+};
+
+// Generate semantic codes from target phonemes and caller-expanded BERT features.
+// Requires n_batch == 1, an idle slot, and reference embeddings prepared by
+// compute_ref_emb with this model. The model/backend must outlive the session;
+// do not move/reload the model, mutate sampler_cfg, or use the session concurrently.
+//
+// input_tokens: {T_in} I32; input_bert: contiguous {1024, T_in} F32,
+// indexed as input_bert[t * 1024 + c]. Inputs are borrowed only for this call.
+// max_new_tokens > 0 includes the first prediction from prefill. With
+// N = T_ref + T_in + T_prompt, N + max_new_tokens - 1 must fit slot_size.
+//
+// Either sampled or greedy EOS stops generation BEFORE accepting that step's
+// candidate. The result contains neither prompt tokens nor EOS; immediate EOS
+// succeeds with empty codes. At the length limit all accepted codes are kept.
+// Unlike Python infer_panel, there is no early-step EOS suppression and the
+// repetition mask covers only accepted tokens from this request, not the prompt.
+// RNG is reset per call; reproducibility is limited to the same build/backend.
+//
+// Returns false with diagnostics on invalid input or recoverable compute/allocation
+// failure, leaving result unchanged. Releases this request's slot on completion
+// or failure, retaining the reference cache and successfully built decode graph.
+// An already-active slot is rejected without modifying it. ggml aborts and corrupt
+// backends are not recovery points. The caller must handle an empty result before
+// passing codes to SoVITS and use a compatible SoVITS codebook.
+// Other sampler settings come from session.sampler_cfg.
+//
+// Returns true on EOS or max_new_tokens termination.
+bool t2s_session_generate(
+    t2s_session & session,
+    const t2s_model & model,
+    const int32_t * input_tokens,
+    int64_t T_in,
+    const float * input_bert,
+    t2s_generate_result & result,
+    const t2s_generate_config & config = {});
 
 } // namespace gpt_sovits
