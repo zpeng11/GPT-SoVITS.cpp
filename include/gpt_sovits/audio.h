@@ -76,4 +76,35 @@ bool audio_write_wav_f32(const std::string & path, const float * samples, int64_
 // or n_in <= 0.
 bool audio_resample(const float * in, int64_t n_in, int src_rate, int dst_rate, std::vector<float> & out);
 
+// Prepared reference inputs for the v2/v2Pro/v2ProPlus synthesis path.
+struct audio_reference_data {
+    std::vector<float> pcm16k;             // SV: resampled PCM, not normalized
+    std::vector<float> normalized_pcm16k;  // HuBERT: same length as pcm16k
+    std::vector<float> spec704;            // SoVITS: spec704[t * 704 + c]
+    int64_t spec_frames = 0;
+};
+
+// Prepare reference inputs from decoded mono PCM. Resample directly from the
+// source to 16 kHz (SV / HuBERT) and 32 kHz (SoVITS), without silence padding,
+// trimming, gain adjustment or clipping. Samples need not be within [-1, 1],
+// but inputs and computed outputs must be finite.
+//
+// HuBERT normalization uses population variance and (x - mean) / sqrt(var +
+// 1e-7). The SoVITS spectrum uses unnormalized 32 kHz PCM, n_fft=win_length=2048,
+// hop_length=640 and the first 704 bins of audio_stft_magnitude. On success,
+// spec_frames > 0 and spec704.size() == 704 * spec_frames. At least 400 samples
+// at 16 kHz are required for HuBERT / SV; this is not an audio-quality minimum.
+//
+// Input is borrowed only for the call and is not modified before replacement
+// of out; it may point into out's existing vectors. Success replaces out and
+// invalidates its old buffers. Failure preserves out, including its buffers.
+// Returns false with diagnostics on invalid arguments, unsupported resampling,
+// non-finite data, size overflow or host allocation failure. No models needed.
+// File decoding / channel mixing remain the job of audio_read_file.
+// This host-side preparation does not establish end-to-end inference parity.
+//
+// The caller must supply n_samples readable floats at pcm.
+bool audio_prepare_reference(const float * pcm, int64_t n_samples, int sample_rate,
+                             audio_reference_data & out);
+
 } // namespace gpt_sovits

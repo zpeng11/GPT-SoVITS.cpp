@@ -101,6 +101,7 @@ set(AUDIO_TEST_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_stft.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_resample.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/test_audio_reference.cpp
 )
 
 foreach(test_src ${AUDIO_TEST_SOURCES})

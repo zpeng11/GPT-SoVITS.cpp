@@ -2,6 +2,7 @@ set(GPTSOVITS_SOURCES
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/stft.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/io.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/audio/resample.cpp
+    ${CMAKE_CURRENT_SOURCE_DIR}/audio/reference.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/block.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/loader.cpp
     ${CMAKE_CURRENT_SOURCE_DIR}/hubert/session.cpp
