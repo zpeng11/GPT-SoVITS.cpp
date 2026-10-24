@@ -1,0 +1,829 @@
+{
+  "schema": "gpt-sovits-text-frontend/v1",
+  "version": "v2",
+  "language_mode": "auto",
+  "english_backend": "basic",
+  "input_text": "你好，世界！今天是2026年10月20日。Hello world! 𠮷野家。",
+  "normalized_text": "你好,世界!今天是二零二六年十月二十日.Hello world! 𠮷野家.",
+  "phones": [
+    "n",
+    "i2",
+    "h",
+    "ao3",
+    ",",
+    "sh",
+    "ir4",
+    "j",
+    "ie4",
+    "!",
+    "j",
+    "in1",
+    "t",
+    "ian1",
+    "sh",
+    "ir4",
+    "EE",
+    "er4",
+    "l",
+    "ing2",
+    "EE",
+    "er4",
+    "l",
+    "iu4",
+    "n",
+    "ian2",
+    "sh",
+    "ir2",
+    "y",
+    "ve4",
+    "EE",
+    "er4",
+    "sh",
+    "ir2",
+    "r",
+    "ir4",
+    ".",
+    "HH",
+    "AH0",
+    "L",
+    "OW1",
+    "W",
+    "ER1",
+    "L",
+    "D",
+    "!",
+    "UNK",
+    "y",
+    "E3",
+    "j",
+    "ia1",
+    "."
+  ],
+  "phoneme_ids": [
+    227,
+    167,
+    158,
+    119,
+    1,
+    251,
+    214,
+    221,
+    194,
+    0,
+    221,
+    196,
+    252,
+    176,
+    251,
+    214,
+    33,
+    153,
+    224,
+    202,
+    33,
+    153,
+    224,
+    219,
+    227,
+    177,
+    251,
+    212,
+    318,
+    309,
+    33,
+    153,
+    251,
+    212,
+    248,
+    214,
+    3,
+    51,
+    12,
+    62,
+    68,
+    91,
+    39,
+    62,
+    26,
+    0,
+    86,
+    318,
+    30,
+    221,
+    171,
+    3
+  ],
+  "phoneme_ids_dtype": "int32",
+  "phoneme_count": 52,
+  "word2ph": null,
+  "word2ph_dtype": "int32",
+  "word2ph_note": "word2ph is per-segment for mixed text; see segments[].word2ph",
+  "segments": [
+    {
+      "index": 0,
+      "language": "zh",
+      "source_text": "你好，世界！今天是2026年10月20日。",
+      "normalized_text": "你好,世界!今天是二零二六年十月二十日.",
+      "normalized_start": 0,
+      "normalized_end": 20,
+      "char_count": 20,
+      "phones": [
+        "n",
+        "i2",
+        "h",
+        "ao3",
+        ",",
+        "sh",
+        "ir4",
+        "j",
+        "ie4",
+        "!",
+        "j",
+        "in1",
+        "t",
+        "ian1",
+        "sh",
+        "ir4",
+        "EE",
+        "er4",
+        "l",
+        "ing2",
+        "EE",
+        "er4",
+        "l",
+        "iu4",
+        "n",
+        "ian2",
+        "sh",
+        "ir2",
+        "y",
+        "ve4",
+        "EE",
+        "er4",
+        "sh",
+        "ir2",
+        "r",
+        "ir4",
+        "."
+      ],
+      "phoneme_ids": [
+        227,
+        167,
+        158,
+        119,
+        1,
+        251,
+        214,
+        221,
+        194,
+        0,
+        221,
+        196,
+        252,
+        176,
+        251,
+        214,
+        33,
+        153,
+        224,
+        202,
+        33,
+        153,
+        224,
+        219,
+        227,
+        177,
+        251,
+        212,
+        318,
+        309,
+        33,
+        153,
+        251,
+        212,
+        248,
+        214,
+        3
+      ],
+      "phoneme_offset": 0,
+      "phoneme_count": 37,
+      "word2ph": [
+        2,
+        2,
+        1,
+        2,
+        2,
+        1,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        2,
+        1
+      ],
+      "word2ph_unit": "char",
+      "word2ph_note": null,
+      "tokenizer": {
+        "status": "ok",
+        "input_ids": [
+          2,
+          25,
+          24,
+          5,
+          26,
+          27,
+          7,
+          23,
+          18,
+          22,
+          12,
+          28,
+          12,
+          15,
+          19,
+          16,
+          21,
+          12,
+          16,
+          20,
+          6,
+          3
+        ],
+        "tokens": [
+          "[CLS]",
+          "你",
+          "好",
+          ",",
+          "世",
+          "界",
+          "!",
+          "今",
+          "天",
+          "是",
+          "二",
+          "零",
+          "二",
+          "六",
+          "年",
+          "十",
+          "月",
+          "二",
+          "十",
+          "日",
+          ".",
+          "[SEP]"
+        ],
+        "body_start": 1,
+        "body_end": 21,
+        "body_token_ids": [
+          25,
+          24,
+          5,
+          26,
+          27,
+          7,
+          23,
+          18,
+          22,
+          12,
+          28,
+          12,
+          15,
+          19,
+          16,
+          21,
+          12,
+          16,
+          20,
+          6
+        ],
+        "token_char_spans": [
+          null,
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            3,
+            4
+          ],
+          [
+            4,
+            5
+          ],
+          [
+            5,
+            6
+          ],
+          [
+            6,
+            7
+          ],
+          [
+            7,
+            8
+          ],
+          [
+            8,
+            9
+          ],
+          [
+            9,
+            10
+          ],
+          [
+            10,
+            11
+          ],
+          [
+            11,
+            12
+          ],
+          [
+            12,
+            13
+          ],
+          [
+            13,
+            14
+          ],
+          [
+            14,
+            15
+          ],
+          [
+            15,
+            16
+          ],
+          [
+            16,
+            17
+          ],
+          [
+            17,
+            18
+          ],
+          [
+            18,
+            19
+          ],
+          [
+            19,
+            20
+          ],
+          null
+        ],
+        "normalized_text": " 你  好 , 世  界 ! 今  天  是  二  零  二  六  年  十  月  二  十  日 .",
+        "unknown_token_count": 0,
+        "special_token_count": 2,
+        "literal_special_tokens_removed": 0,
+        "cls_id": 2,
+        "sep_id": 3,
+        "unk_id": 1
+      },
+      "unknown_words": [],
+      "warnings": [
+        "jieba is not installed; Chinese G2P uses character segmentation and rule-based tone sandhi (POS-aware neutral tones are unavailable)"
+      ]
+    },
+    {
+      "index": 1,
+      "language": "en",
+      "source_text": "Hello world! ",
+      "normalized_text": "Hello world! ",
+      "normalized_start": 20,
+      "normalized_end": 33,
+      "char_count": 13,
+      "phones": [
+        "HH",
+        "AH0",
+        "L",
+        "OW1",
+        "W",
+        "ER1",
+        "L",
+        "D",
+        "!"
+      ],
+      "phoneme_ids": [
+        51,
+        12,
+        62,
+        68,
+        91,
+        39,
+        62,
+        26,
+        0
+      ],
+      "phoneme_offset": 37,
+      "phoneme_count": 9,
+      "word2ph": null,
+      "word2ph_unit": null,
+      "word2ph_note": "English segments do not produce word2ph. The reference pipeline zero-fills their BERT features; use segment phoneme offsets for slicing.",
+      "tokenizer": {
+        "status": "ok",
+        "input_ids": [
+          2,
+          32,
+          33,
+          7,
+          3
+        ],
+        "tokens": [
+          "[CLS]",
+          "hello",
+          "world",
+          "!",
+          "[SEP]"
+        ],
+        "body_start": 1,
+        "body_end": 4,
+        "body_token_ids": [
+          32,
+          33,
+          7
+        ],
+        "token_char_spans": [
+          null,
+          [
+            0,
+            5
+          ],
+          [
+            6,
+            11
+          ],
+          [
+            11,
+            12
+          ],
+          null
+        ],
+        "normalized_text": "hello world! ",
+        "unknown_token_count": 0,
+        "special_token_count": 2,
+        "literal_special_tokens_removed": 0,
+        "cls_id": 2,
+        "sep_id": 3,
+        "unk_id": 1
+      },
+      "unknown_words": [],
+      "warnings": [
+        "explicit basic English backend: no POS disambiguation or NumPy prediction"
+      ]
+    },
+    {
+      "index": 2,
+      "language": "zh",
+      "source_text": "𠮷野家。",
+      "normalized_text": "𠮷野家.",
+      "normalized_start": 33,
+      "normalized_end": 37,
+      "char_count": 4,
+      "phones": [
+        "UNK",
+        "y",
+        "E3",
+        "j",
+        "ia1",
+        "."
+      ],
+      "phoneme_ids": [
+        86,
+        318,
+        30,
+        221,
+        171,
+        3
+      ],
+      "phoneme_offset": 46,
+      "phoneme_count": 6,
+      "word2ph": [
+        1,
+        2,
+        2,
+        1
+      ],
+      "word2ph_unit": "char",
+      "word2ph_note": null,
+      "tokenizer": {
+        "status": "ok",
+        "input_ids": [
+          2,
+          31,
+          29,
+          30,
+          6,
+          3
+        ],
+        "tokens": [
+          "[CLS]",
+          "𠮷",
+          "野",
+          "家",
+          ".",
+          "[SEP]"
+        ],
+        "body_start": 1,
+        "body_end": 5,
+        "body_token_ids": [
+          31,
+          29,
+          30,
+          6
+        ],
+        "token_char_spans": [
+          null,
+          [
+            0,
+            1
+          ],
+          [
+            1,
+            2
+          ],
+          [
+            2,
+            3
+          ],
+          [
+            3,
+            4
+          ],
+          null
+        ],
+        "normalized_text": " 𠮷  野  家 .",
+        "unknown_token_count": 0,
+        "special_token_count": 2,
+        "literal_special_tokens_removed": 0,
+        "cls_id": 2,
+        "sep_id": 3,
+        "unk_id": 1
+      },
+      "unknown_words": [],
+      "warnings": [
+        "unmapped Chinese pinyin '' -> UNK",
+        "jieba is not installed; Chinese G2P uses character segmentation and rule-based tone sandhi (POS-aware neutral tones are unavailable)"
+      ]
+    }
+  ],
+  "segment_phoneme_offsets": [
+    0,
+    37,
+    46,
+    52
+  ],
+  "tokenizer": {
+    "status": "ok",
+    "input_ids": [
+      2,
+      25,
+      24,
+      5,
+      26,
+      27,
+      7,
+      23,
+      18,
+      22,
+      12,
+      28,
+      12,
+      15,
+      19,
+      16,
+      21,
+      12,
+      16,
+      20,
+      6,
+      32,
+      33,
+      7,
+      31,
+      29,
+      30,
+      6,
+      3
+    ],
+    "tokens": [
+      "[CLS]",
+      "你",
+      "好",
+      ",",
+      "世",
+      "界",
+      "!",
+      "今",
+      "天",
+      "是",
+      "二",
+      "零",
+      "二",
+      "六",
+      "年",
+      "十",
+      "月",
+      "二",
+      "十",
+      "日",
+      ".",
+      "hello",
+      "world",
+      "!",
+      "𠮷",
+      "野",
+      "家",
+      ".",
+      "[SEP]"
+    ],
+    "body_start": 1,
+    "body_end": 28,
+    "body_token_ids": [
+      25,
+      24,
+      5,
+      26,
+      27,
+      7,
+      23,
+      18,
+      22,
+      12,
+      28,
+      12,
+      15,
+      19,
+      16,
+      21,
+      12,
+      16,
+      20,
+      6,
+      32,
+      33,
+      7,
+      31,
+      29,
+      30,
+      6
+    ],
+    "token_char_spans": [
+      null,
+      [
+        0,
+        1
+      ],
+      [
+        1,
+        2
+      ],
+      [
+        2,
+        3
+      ],
+      [
+        3,
+        4
+      ],
+      [
+        4,
+        5
+      ],
+      [
+        5,
+        6
+      ],
+      [
+        6,
+        7
+      ],
+      [
+        7,
+        8
+      ],
+      [
+        8,
+        9
+      ],
+      [
+        9,
+        10
+      ],
+      [
+        10,
+        11
+      ],
+      [
+        11,
+        12
+      ],
+      [
+        12,
+        13
+      ],
+      [
+        13,
+        14
+      ],
+      [
+        14,
+        15
+      ],
+      [
+        15,
+        16
+      ],
+      [
+        16,
+        17
+      ],
+      [
+        17,
+        18
+      ],
+      [
+        18,
+        19
+      ],
+      [
+        19,
+        20
+      ],
+      [
+        20,
+        25
+      ],
+      [
+        26,
+        31
+      ],
+      [
+        31,
+        32
+      ],
+      [
+        33,
+        34
+      ],
+      [
+        34,
+        35
+      ],
+      [
+        35,
+        36
+      ],
+      [
+        36,
+        37
+      ],
+      null
+    ],
+    "normalized_text": " 你  好 , 世  界 ! 今  天  是  二  零  二  六  年  十  月  二  十  日 .hello world!  𠮷  野  家 .",
+    "unknown_token_count": 0,
+    "special_token_count": 2,
+    "literal_special_tokens_removed": 0,
+    "cls_id": 2,
+    "sep_id": 3,
+    "unk_id": 1
+  },
+  "tokenizer_status": "ok",
+  "bert_feature_layout": {
+    "status": "not_computed",
+    "channels": 1024,
+    "numpy_shape": [
+      52,
+      1024
+    ],
+    "ggml_ne": [
+      1024,
+      52
+    ],
+    "dtype": "float32",
+    "note": "NumPy features are (T, 1024) C-order; the same buffer is ggml {1024, T}. Do not transpose a (T, 1024) array before writing it."
+  },
+  "unknown_words": [],
+  "warnings": [
+    "jieba is not installed; Chinese G2P uses character segmentation and rule-based tone sandhi (POS-aware neutral tones are unavailable)",
+    "explicit basic English backend: no POS disambiguation or NumPy prediction",
+    "unmapped Chinese pinyin '' -> UNK"
+  ]
+}

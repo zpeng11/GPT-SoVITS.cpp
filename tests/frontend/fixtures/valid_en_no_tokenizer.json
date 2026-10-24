@@ -1,0 +1,102 @@
+{
+  "schema": "gpt-sovits-text-frontend/v1",
+  "version": "v2",
+  "language_mode": "auto",
+  "english_backend": "basic",
+  "input_text": "Hello world!",
+  "normalized_text": "Hello world!",
+  "phones": [
+    "HH",
+    "AH0",
+    "L",
+    "OW1",
+    "W",
+    "ER1",
+    "L",
+    "D",
+    "!"
+  ],
+  "phoneme_ids": [
+    51,
+    12,
+    62,
+    68,
+    91,
+    39,
+    62,
+    26,
+    0
+  ],
+  "phoneme_ids_dtype": "int32",
+  "phoneme_count": 9,
+  "word2ph": null,
+  "word2ph_dtype": "int32",
+  "word2ph_note": "word2ph is per-segment for mixed text; see segments[].word2ph",
+  "segments": [
+    {
+      "index": 0,
+      "language": "en",
+      "source_text": "Hello world!",
+      "normalized_text": "Hello world!",
+      "normalized_start": 0,
+      "normalized_end": 12,
+      "char_count": 12,
+      "phones": [
+        "HH",
+        "AH0",
+        "L",
+        "OW1",
+        "W",
+        "ER1",
+        "L",
+        "D",
+        "!"
+      ],
+      "phoneme_ids": [
+        51,
+        12,
+        62,
+        68,
+        91,
+        39,
+        62,
+        26,
+        0
+      ],
+      "phoneme_offset": 0,
+      "phoneme_count": 9,
+      "word2ph": null,
+      "word2ph_unit": null,
+      "word2ph_note": "English segments do not produce word2ph. The reference pipeline zero-fills their BERT features; use segment phoneme offsets for slicing.",
+      "tokenizer": null,
+      "unknown_words": [],
+      "warnings": [
+        "explicit basic English backend: no POS disambiguation or NumPy prediction"
+      ]
+    }
+  ],
+  "segment_phoneme_offsets": [
+    0,
+    9
+  ],
+  "tokenizer": null,
+  "tokenizer_status": "not_configured",
+  "bert_feature_layout": {
+    "status": "not_computed",
+    "channels": 1024,
+    "numpy_shape": [
+      9,
+      1024
+    ],
+    "ggml_ne": [
+      1024,
+      9
+    ],
+    "dtype": "float32",
+    "note": "NumPy features are (T, 1024) C-order; the same buffer is ggml {1024, T}. Do not transpose a (T, 1024) array before writing it."
+  },
+  "unknown_words": [],
+  "warnings": [
+    "explicit basic English backend: no POS disambiguation or NumPy prediction"
+  ]
+}

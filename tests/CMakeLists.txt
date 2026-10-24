@@ -145,6 +145,19 @@ foreach(test_src ${T2S_TEST_SOURCES})
     gtest_discover_tests(${test_name})
 endforeach()
 
+add_executable(test_text_frontend_json frontend/test_text_frontend_json.cpp)
+target_include_directories(test_text_frontend_json PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/nlohmann/include
+)
+target_link_libraries(test_text_frontend_json PRIVATE
+    gpt_sovits_cpp_static
+    GTest::gtest_main
+)
+target_compile_definitions(test_text_frontend_json PRIVATE
+    FRONTEND_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/frontend/"
+)
+gtest_discover_tests(test_text_frontend_json)
+
 add_executable(test_t2s_sovits_bridge
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/test_t2s_sovits_bridge.cpp
     ${COMMON_TEST_SOURCES}
