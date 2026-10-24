@@ -143,3 +143,22 @@ foreach(test_src ${T2S_TEST_SOURCES})
     )
     gtest_discover_tests(${test_name})
 endforeach()
+
+add_executable(test_t2s_sovits_bridge
+    ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/test_t2s_sovits_bridge.cpp
+    ${COMMON_TEST_SOURCES}
+)
+target_include_directories(test_t2s_sovits_bridge PRIVATE
+    ${COMMON_TEST_INCLUDE_DIR}
+)
+target_link_libraries(test_t2s_sovits_bridge PRIVATE
+    gpt_sovits_cpp_static
+    GTest::gtest_main
+)
+target_compile_definitions(test_t2s_sovits_bridge PRIVATE
+    T2S_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/t2s/"
+    SOVITS_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sovits/"
+)
+gtest_discover_tests(test_t2s_sovits_bridge
+    PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
+)
