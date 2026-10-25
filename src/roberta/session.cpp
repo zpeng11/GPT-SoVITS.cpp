@@ -1,4 +1,5 @@
 #include "gpt_sovits/roberta.h"
+#include "block_internal.h"
 
 #include "ggml.h"
 #include "ggml-alloc.h"
@@ -17,6 +18,8 @@ namespace gpt_sovits {
 
 static constexpr int64_t kHiddenSize   = 1024;
 static constexpr int64_t kMaxPositions = 512;
+static constexpr int kNumLayers = 24;
+static constexpr int kTTSLayers = 22; // hidden_states includes embeddings at index 0.
 
 // Same graph budget the RoBERTa parity test uses for the full model
 // (embeddings + 24 encoder layers).
@@ -57,15 +60,16 @@ static bool mul_ok(int64_t a, int64_t b, int64_t & out) {
 } // namespace
 
 // ---------------------------------------------------------------------------
-// Full-model feature extraction
+// Feature extraction
 // ---------------------------------------------------------------------------
 
-bool roberta_extract_features(const roberta_model & model,
-                              const int32_t       * token_ids,
-                              int64_t               T,
-                              float               * out,
-                              int64_t               out_cap,
-                              const int32_t       * token_type_ids)
+static bool roberta_extract_features_impl(const roberta_model & model,
+                                         const int32_t       * token_ids,
+                                         int64_t               T,
+                                         float               * out,
+                                         int64_t               out_cap,
+                                         const int32_t       * token_type_ids,
+                                         int                   n_layers)
 {
     if (model.backend == nullptr) {
         fprintf(stderr, "%s: model has no backend (load it first)\n", __func__);
@@ -166,11 +170,11 @@ bool roberta_extract_features(const roberta_model & model,
             ggml_set_input(type_ids);
         }
 
-        // --- Build: embeddings + 24 encoder layers ---
+        // --- Build ---
         struct ggml_cgraph * gf = ggml_new_graph_custom(ctx.p, kMaxNodes, false);
 
-        struct ggml_tensor * result =
-            roberta_model_block_forward(ctx.p, inp, type_ids, model.weights);
+        struct ggml_tensor * result = detail::roberta_model_block_forward_n_layers(
+            ctx.p, inp, type_ids, model.weights, n_layers);
         ggml_set_name(result, "features");
         ggml_set_output(result);
         ggml_build_forward_expand(gf, result);
@@ -211,6 +215,28 @@ bool roberta_extract_features(const roberta_model & model,
     }
 
     return true;
+}
+
+bool roberta_extract_features(const roberta_model & model,
+                              const int32_t       * token_ids,
+                              int64_t               T,
+                              float               * out,
+                              int64_t               out_cap,
+                              const int32_t       * token_type_ids)
+{
+    return roberta_extract_features_impl(
+        model, token_ids, T, out, out_cap, token_type_ids, kNumLayers);
+}
+
+bool roberta_extract_tts_features(const roberta_model & model,
+                                  const int32_t       * token_ids,
+                                  int64_t               T,
+                                  float               * out,
+                                  int64_t               out_cap,
+                                  const int32_t       * token_type_ids)
+{
+    return roberta_extract_features_impl(
+        model, token_ids, T, out, out_cap, token_type_ids, kTTSLayers);
 }
 
 // ---------------------------------------------------------------------------

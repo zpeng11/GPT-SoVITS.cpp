@@ -11,8 +11,9 @@ namespace gpt_sovits {
 
 // chinese-roberta-wwm-ext-large (BERT-large) forward blocks.
 //
-// These blocks match the Hugging Face BertModel eager-attention inference path
-// used by GPT-SoVITS.  Despite the "roberta" name in the model checkpoint, the
+// These blocks match Hugging Face BertModel with eager attention. GPT-SoVITS
+// uses hidden_states[-3], exposed by roberta_extract_tts_features below.
+// Despite the "roberta" name in the model checkpoint, the
 // architecture is standard BERT (model_type = "bert") with post-norm Transformer
 // encoder layers.
 //
@@ -218,8 +219,9 @@ void roberta_model_free(roberta_model & model);
 // ---------------------------------------------------------------------------
 
 // Run full RoBERTa (chinese-roberta-wwm-ext-large) feature extraction
-// end-to-end (embeddings + 24 encoder layers), encapsulating the standard
-// ephemeral-graph compute sequence.
+// end-to-end (embeddings + 24 encoder layers), returning last_hidden_state.
+// This is not GPT-SoVITS's TTS feature layer; use roberta_extract_tts_features
+// for that. Encapsulates the standard ephemeral-graph compute sequence.
 //
 // Parameters:
 //   model          - loaded RoBERTa model (weights read, not modified)
@@ -238,6 +240,22 @@ bool roberta_extract_features(const roberta_model & model,
                               float               * out,
                               int64_t               out_cap,
                               const int32_t       * token_type_ids = nullptr);
+
+// Extract GPT-SoVITS TTS features: Hugging Face hidden_states[-3] for the
+// 24-layer chinese-roberta-wwm-ext-large model. This is hidden_states[22], the
+// output after encoder layer index 21; the final two encoder layers are not run.
+//
+// Arguments, validation and {1024, T} F32 layout match roberta_extract_features.
+// T includes any caller-supplied CLS/SEP tokens; their output rows are retained.
+// No tokenization, special-token stripping or phoneme expansion is performed.
+// Use roberta_expand_bert_features with token spans to select body-token rows.
+// Returns true on success, false on invalid input or recoverable compute failure.
+bool roberta_extract_tts_features(const roberta_model & model,
+                                  const int32_t       * token_ids,
+                                  int64_t               T,
+                                  float               * out,
+                                  int64_t               out_cap,
+                                  const int32_t       * token_type_ids = nullptr);
 
 // Expand per-WordPiece-token BERT features into per-phoneme BERT features,
 // replicating python/text_frontend/layout.py:expand_bert_features.

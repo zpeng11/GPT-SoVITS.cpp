@@ -1,4 +1,5 @@
 #include "gpt_sovits/roberta.h"
+#include "block_internal.h"
 #include "ggml.h"
 
 #include <cmath>
@@ -248,20 +249,30 @@ static ::ggml_tensor * linear_2d(
 // Encoder (24 layers)
 // ---------------------------------------------------------------------------
 
+static ::ggml_tensor * roberta_encoder_block_forward_n_layers(
+    ::ggml_context                     * ctx,
+    ::ggml_tensor                      * x,
+    const roberta_encoder_block_weights & weights,
+    int                                  n_layers)
+{
+    GGML_ASSERT(ctx != nullptr);
+    GGML_ASSERT(x != nullptr);
+    GGML_ASSERT(x->ne[0] == kHiddenSize);
+    GGML_ASSERT(n_layers > 0 && n_layers <= kNumLayers);
+
+    for (int i = 0; i < n_layers; ++i) {
+        x = roberta_encoder_layer_block_forward(ctx, x, weights.layers[i]);
+    }
+
+    return x;
+}
+
 ::ggml_tensor * roberta_encoder_block_forward(
     ::ggml_context                     * ctx,
     ::ggml_tensor                      * x,
     const roberta_encoder_block_weights & weights)
 {
-    GGML_ASSERT(ctx != nullptr);
-    GGML_ASSERT(x != nullptr);
-    GGML_ASSERT(x->ne[0] == kHiddenSize);
-
-    for (const roberta_encoder_layer_block_weights & layer : weights.layers) {
-        x = roberta_encoder_layer_block_forward(ctx, x, layer);
-    }
-
-    return x;
+    return roberta_encoder_block_forward_n_layers(ctx, x, weights, kNumLayers);
 }
 
 // ---------------------------------------------------------------------------
@@ -274,11 +285,25 @@ static ::ggml_tensor * linear_2d(
     ::ggml_tensor                    * token_type_ids,
     const roberta_model_block_weights & weights)
 {
+    return detail::roberta_model_block_forward_n_layers(
+        ctx, input_ids, token_type_ids, weights, kNumLayers);
+}
+
+namespace detail {
+
+::ggml_tensor * roberta_model_block_forward_n_layers(
+    ::ggml_context                   * ctx,
+    ::ggml_tensor                    * input_ids,
+    ::ggml_tensor                    * token_type_ids,
+    const roberta_model_block_weights & weights,
+    int                                n_layers)
+{
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(input_ids != nullptr);
 
     ::ggml_tensor * x = roberta_embeddings_block_forward(ctx, input_ids, token_type_ids, weights.embeddings);
-    return roberta_encoder_block_forward(ctx, x, weights.encoder);
+    return roberta_encoder_block_forward_n_layers(ctx, x, weights.encoder, n_layers);
 }
 
+} // namespace detail
 } // namespace gpt_sovits

@@ -13,6 +13,7 @@ Output files (raw, little-endian):
     ref_embeddings.bin      - embeddings output         {1024, T}  (f32)
     ref_encoder_layer0.bin  - encoder layer 0 output    {1024, T}  (f32)
     ref_model_output.bin    - final encoder output      {1024, T}  (f32)
+    ref_tts_output.bin      - hidden_states[-3] for TTS  {1024, T}  (f32)
 """
 
 import argparse
@@ -43,6 +44,9 @@ def main():
                         help="Number of input tokens (default: 32)")
     parser.add_argument("--seed", "-s", type=int, default=42,
                         help="Random seed for reproducible input (default: 42)")
+    parser.add_argument("--gguf",
+                        help="Load local F16/F32 GGUF weights instead of HF weights; "
+                             "model_dir still supplies config.json (requires gguf)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -67,12 +71,26 @@ def main():
     config._attn_implementation = "eager"
     config.attention_probs_dropout_prob = 0.0
     config.hidden_dropout_prob = 0.0
+    if config.num_hidden_layers != 24 or config.hidden_size != 1024:
+        raise ValueError("Expected the 24-layer, 1024-channel BERT-large configuration")
 
-    model = BertModel.from_pretrained(
-        args.model_dir,
-        config=config,
-        local_files_only=True,
-    )
+    if args.gguf:
+        from gguf import GGUFReader, GGMLQuantizationType
+
+        model = BertModel(config, add_pooling_layer=False)
+        state = {}
+        for tensor in GGUFReader(args.gguf).tensors:
+            if tensor.tensor_type not in (GGMLQuantizationType.F16, GGMLQuantizationType.F32):
+                raise ValueError(f"{tensor.name}: --gguf requires F16/F32 weights")
+            name = tensor.name.removeprefix("bert.")
+            state[name] = torch.from_numpy(np.array(tensor.data, dtype=np.float32))
+        model.load_state_dict(state, strict=True)
+    else:
+        model = BertModel.from_pretrained(
+            args.model_dir,
+            config=config,
+            local_files_only=True,
+        )
     model.eval()
     model = model.float()
 
@@ -87,6 +105,7 @@ def main():
         # embeddings: outputs.hidden_states[0]  [1, T, 1024]
         # encoder layer 0: outputs.hidden_states[1]  [1, T, 1024]
         # final: outputs.last_hidden_state  [1, T, 1024]
+        # TTS: outputs.hidden_states[-3] == hidden_states[22], after layer index 21
 
     # ------------------------------------------------------------------
     # 4. Convert to ggml memory layout and save
@@ -110,6 +129,9 @@ def main():
     # Full model output
     model_out = outputs.last_hidden_state.squeeze(0).contiguous().numpy()  # [T, 1024]
     save_raw_bin(os.path.join(args.output_dir, "ref_model_output.bin"), model_out)
+
+    tts_out = outputs.hidden_states[-3].squeeze(0).contiguous().numpy()  # [T, 1024]
+    save_raw_bin(os.path.join(args.output_dir, "ref_tts_output.bin"), tts_out)
 
     T = args.length
     print(f"\nSequence length: T = {T}")

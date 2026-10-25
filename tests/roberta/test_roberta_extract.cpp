@@ -7,6 +7,7 @@
 // same F16 model/tolerances as test_roberta_parity.cpp.
 
 #include <gtest/gtest.h>
+#include <gtest/gtest-spi.h>
 
 #include "gpt_sovits/roberta.h"
 
@@ -16,9 +17,13 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cerrno>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
+#include <filesystem>
 #include <fstream>
+#include <limits>
 #include <string>
 #include <vector>
 
@@ -30,6 +35,8 @@ static const std::string kModelPath = kTestDir + "chinese-roberta-wwm-ext-large-
 // F16 full-model parity tolerance, from test_roberta_parity.cpp.
 static constexpr double kMaxAbsTol = 1e-1;
 static constexpr double kRmseTol   = 1e-2;
+static constexpr double kTTSAbsTol = 5e-2;
+static constexpr double kTTSRelTol = 5e-3;
 
 static constexpr int64_t kHiddenSize = 1024;
 
@@ -37,31 +44,30 @@ static constexpr int64_t kHiddenSize = 1024;
 // Fixture loading
 // ---------------------------------------------------------------------------
 
-std::vector<float> load_f32_bin(const std::string & path) {
+template<typename T>
+std::vector<T> load_bin(const std::string & path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f.is_open()) {
         ADD_FAILURE() << "Failed to open: " << path;
         return {};
     }
-    auto size = static_cast<size_t>(f.tellg());
+    const std::streamoff size = f.tellg();
+    if (size <= 0 || size % sizeof(T) != 0 ||
+        size > std::numeric_limits<std::streamsize>::max()) {
+        ADD_FAILURE() << "Invalid reference size: " << path;
+        return {};
+    }
     f.seekg(0);
-    std::vector<float> data(size / sizeof(float));
-    f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
+    std::vector<T> data(static_cast<size_t>(size) / sizeof(T));
+    if (!f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size))) {
+        ADD_FAILURE() << "Incomplete reference read: " << path;
+        return {};
+    }
     return data;
 }
 
-std::vector<int32_t> load_i32_bin(const std::string & path) {
-    std::ifstream f(path, std::ios::binary | std::ios::ate);
-    if (!f.is_open()) {
-        ADD_FAILURE() << "Failed to open: " << path;
-        return {};
-    }
-    auto size = static_cast<size_t>(f.tellg());
-    f.seekg(0);
-    std::vector<int32_t> data(size / sizeof(int32_t));
-    f.read(reinterpret_cast<char *>(data.data()), static_cast<std::streamsize>(size));
-    return data;
-}
+std::vector<float> load_f32_bin(const std::string & path) { return load_bin<float>(path); }
+std::vector<int32_t> load_i32_bin(const std::string & path) { return load_bin<int32_t>(path); }
 
 struct ErrorStats {
     double max_abs;
@@ -86,12 +92,6 @@ ErrorStats compute_errors(const std::vector<float> & actual,
     return s;
 }
 
-#define ASSERT_MODEL_EXISTS(path) do { \
-    FILE * f = fopen(path.c_str(), "rb"); \
-    if (!f) GTEST_SKIP() << "Model file not found: " << path; \
-    fclose(f); \
-} while (0)
-
 // ---------------------------------------------------------------------------
 // Fixture: loads the F16 model once per test
 // ---------------------------------------------------------------------------
@@ -99,13 +99,17 @@ ErrorStats compute_errors(const std::vector<float> & actual,
 class RobertaExtract : public ::testing::Test {
 protected:
     void SetUp() override {
-        ASSERT_MODEL_EXISTS(kModelPath);
-
-        backend_ = create_test_backend();
-        ASSERT_NE(backend_, nullptr);
-        if (!gpt_sovits::roberta_model_load(kModelPath, model_, backend_)) {
-            GTEST_SKIP() << "Could not load " << kModelPath;
+        FILE * f = fopen(kModelPath.c_str(), "rb");
+        if (!f) {
+            const int error = errno;
+            if (error == ENOENT) GTEST_SKIP() << "Model file not found: " << kModelPath;
+            FAIL() << "Cannot open model " << kModelPath << ": " << std::strerror(error);
         }
+        fclose(f);
+
+        backend_ = CreateBackend();
+        ASSERT_NE(backend_, nullptr);
+        ASSERT_TRUE(gpt_sovits::roberta_model_load(kModelPath, model_, backend_));
     }
     void TearDown() override {
         gpt_sovits::roberta_model_free(model_);
@@ -114,8 +118,54 @@ protected:
         }
     }
 
+    virtual ggml_backend_t CreateBackend() { return create_test_backend(); }
+
+    void AssertTTSMatchesReference() {
+        const auto input_ids = load_i32_bin(kTestDir + "ref_input_ids.bin");
+        const auto ref = load_f32_bin(kTestDir + "ref_tts_output.bin");
+        const auto final_ref = load_f32_bin(kTestDir + "ref_model_output.bin");
+        ASSERT_FALSE(input_ids.empty());
+        ASSERT_FALSE(ref.empty());
+        ASSERT_EQ(ref.size(), input_ids.size() * kHiddenSize);
+        ASSERT_EQ(final_ref.size(), ref.size());
+        ASSERT_TRUE(std::all_of(ref.begin(), ref.end(), [](float v) { return std::isfinite(v); }));
+        ASSERT_TRUE(std::all_of(final_ref.begin(), final_ref.end(), [](float v) { return std::isfinite(v); }));
+        ASSERT_GT(compute_errors(ref, final_ref).rmse, kRmseTol * 10)
+            << "TTS reference must distinguish hidden_states[-3] from last_hidden_state";
+
+        // Borrow the loaded weights, but leave the unused final two layers absent.
+        auto tts_model = model_;
+        tts_model.weights.encoder.layers[22] = {};
+        tts_model.weights.encoder.layers[23] = {};
+
+        constexpr size_t kGuardSize = 8;
+        constexpr float kSentinel = 12345.0f;
+        std::vector<float> out(ref.size() + kGuardSize, kSentinel);
+        ASSERT_TRUE(gpt_sovits::roberta_extract_tts_features(
+            tts_model, input_ids.data(), static_cast<int64_t>(input_ids.size()),
+            out.data(), static_cast<int64_t>(ref.size())));
+        for (size_t i = ref.size(); i < out.size(); ++i) {
+            EXPECT_FLOAT_EQ(out[i], kSentinel) << "Output guard overwritten at " << i;
+        }
+        out.resize(ref.size());
+        ASSERT_TRUE(std::all_of(out.begin(), out.end(), [](float v) { return std::isfinite(v); }));
+        const auto err = compute_errors(out, ref);
+        printf("  [F16] TTS hidden_states[-3] : max_abs=%.4e  rmse=%.4e  mean_abs=%.4e\n",
+               err.max_abs, err.rmse, err.mean_abs);
+        for (size_t i = 0; i < ref.size(); ++i) {
+            EXPECT_NEAR(out[i], ref[i], kTTSAbsTol + kTTSRelTol * std::abs(ref[i]))
+                << "token " << i / kHiddenSize << " channel " << i % kHiddenSize;
+        }
+        EXPECT_LT(err.rmse, kRmseTol);
+    }
+
     ggml_backend_t           backend_ = nullptr;
     gpt_sovits::roberta_model model_{};
+};
+
+class RobertaExtractCPU : public RobertaExtract {
+protected:
+    ggml_backend_t CreateBackend() override { return ggml_backend_cpu_init(); }
 };
 
 // ---------------------------------------------------------------------------
@@ -143,6 +193,68 @@ TEST_F(RobertaExtract, MatchesReferenceOutput) {
 
     EXPECT_LT(err.max_abs, kMaxAbsTol) << "max abs error too large";
     EXPECT_LT(err.rmse,    kRmseTol)   << "RMSE too large";
+}
+
+TEST_F(RobertaExtract, TTSMatchesReferenceOutput) {
+    ASSERT_NO_FATAL_FAILURE(AssertTTSMatchesReference());
+}
+
+TEST_F(RobertaExtractCPU, TTSMatchesReferenceOutput) {
+    ASSERT_NO_FATAL_FAILURE(AssertTTSMatchesReference());
+}
+
+TEST_F(RobertaExtractCPU, RepeatedCallsAndExplicitTokenTypes) {
+    const int32_t input_ids[] = {101, 1, 102};
+    const int32_t zero_types[] = {0, 0, 0};
+    const int32_t mixed_types[] = {0, 1, 1};
+    constexpr int64_t T = 3;
+    constexpr int64_t n = T * kHiddenSize;
+    std::vector<float> tts(n), final(n), repeated(n), typed(n);
+    ASSERT_TRUE(gpt_sovits::roberta_extract_tts_features(model_, input_ids, T, tts.data(), n));
+    ASSERT_TRUE(gpt_sovits::roberta_extract_features(model_, input_ids, T, final.data(), n));
+    ASSERT_TRUE(gpt_sovits::roberta_extract_tts_features(model_, input_ids, T, repeated.data(), n));
+    EXPECT_EQ(tts, repeated);
+    EXPECT_GT(compute_errors(tts, final).rmse, 0.1);
+    ASSERT_TRUE(gpt_sovits::roberta_extract_tts_features(model_, input_ids, T, typed.data(), n, zero_types));
+    for (size_t i = 0; i < tts.size(); ++i) EXPECT_NEAR(tts[i], typed[i], 1e-5);
+    ASSERT_TRUE(gpt_sovits::roberta_extract_tts_features(model_, input_ids, T, typed.data(), n, mixed_types));
+    ASSERT_TRUE(std::all_of(typed.begin(), typed.end(), [](float v) { return std::isfinite(v); }));
+    EXPECT_GT(compute_errors(tts, typed).rmse, 1e-5);
+}
+
+TEST_F(RobertaExtractCPU, AcceptsBoundaryLengths) {
+    for (int64_t T : {int64_t{1}, int64_t{512}}) {
+        SCOPED_TRACE(T);
+        const std::vector<int32_t> input_ids(static_cast<size_t>(T), 1);
+        std::vector<float> out(static_cast<size_t>(T * kHiddenSize) + 8, 12345.0f);
+        ASSERT_TRUE(gpt_sovits::roberta_extract_tts_features(
+            model_, input_ids.data(), T, out.data(), T * kHiddenSize));
+        EXPECT_TRUE(std::all_of(out.begin(), out.begin() + T * kHiddenSize,
+                               [](float v) { return std::isfinite(v) && v != 12345.0f; }));
+        EXPECT_TRUE(std::all_of(out.begin() + T * kHiddenSize, out.end(),
+                               [](float v) { return v == 12345.0f; }));
+    }
+}
+
+TEST(RobertaReference, RejectsMalformedFiles) {
+    const auto path = std::filesystem::temp_directory_path() /
+        ("roberta-reference-" + std::to_string(
+            reinterpret_cast<uintptr_t>(::testing::UnitTest::GetInstance())) + ".bin");
+    ASSERT_FALSE(std::filesystem::exists(path));
+    struct cleanup {
+        std::filesystem::path path;
+        ~cleanup() { std::error_code ec; std::filesystem::remove(path, ec); }
+    } guard{path};
+    const std::string name = path.string();
+    for (size_t size : {size_t{0}, size_t{1}, size_t{3}, size_t{5}, size_t{7}}) {
+        {
+            std::ofstream f(path, std::ios::binary);
+            const std::string bytes(size, 'x');
+            ASSERT_TRUE(f.write(bytes.data(), static_cast<std::streamsize>(bytes.size())));
+        }
+        EXPECT_NONFATAL_FAILURE(EXPECT_TRUE(load_f32_bin(name).empty()), "Invalid reference size");
+        EXPECT_NONFATAL_FAILURE(EXPECT_TRUE(load_i32_bin(name).empty()), "Invalid reference size");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -262,40 +374,51 @@ TEST(RobertaExpand, RejectsInvalidInput) {
 // ---------------------------------------------------------------------------
 
 TEST_F(RobertaExtract, RejectsInvalidInput) {
-    auto input_ids = load_i32_bin(kTestDir + "ref_input_ids.bin");
-    ASSERT_FALSE(input_ids.empty());
-
-    const int64_t T = static_cast<int64_t>(input_ids.size());
-    std::vector<float> out(static_cast<size_t>(T * kHiddenSize), 0.0f);
+    const int32_t token_id = 1;
+    const int64_t T = 1;
+    const std::vector<float> sentinel(kHiddenSize, 12345.0f);
+    std::vector<float> out = sentinel;
     const int64_t out_cap = static_cast<int64_t>(out.size());
 
-    // T == 0.
-    EXPECT_FALSE(gpt_sovits::roberta_extract_features(
-        model_, input_ids.data(), 0, out.data(), out_cap));
+    for (auto extract : {gpt_sovits::roberta_extract_features,
+                         gpt_sovits::roberta_extract_tts_features}) {
+        SCOPED_TRACE(extract == gpt_sovits::roberta_extract_features ? "final" : "TTS");
+        EXPECT_FALSE(extract(model_, &token_id, 0, out.data(), out_cap, nullptr));
+        EXPECT_FALSE(extract(model_, &token_id, -1, out.data(), out_cap, nullptr));
+        EXPECT_FALSE(extract(model_, nullptr, T, out.data(), out_cap, nullptr));
+        EXPECT_FALSE(extract(model_, &token_id, T, nullptr, out_cap, nullptr));
+        EXPECT_FALSE(extract(model_, &token_id, T, out.data(), out_cap - 1, nullptr));
+        EXPECT_FALSE(extract(model_, &token_id, T, out.data(), -1, nullptr));
 
-    // Null token ids.
-    EXPECT_FALSE(gpt_sovits::roberta_extract_features(
-        model_, nullptr, T, out.data(), out_cap));
+        const std::vector<int32_t> long_ids(513, token_id);
+        EXPECT_FALSE(extract(model_, long_ids.data(), static_cast<int64_t>(long_ids.size()),
+                             out.data(), out_cap, nullptr));
+        for (int32_t bad_id : {-1, static_cast<int32_t>(model_.weights.embeddings.word_embeddings->ne[1])}) {
+            EXPECT_FALSE(extract(model_, &bad_id, T, out.data(), out_cap, nullptr));
+        }
+        for (int32_t bad_type : {-1, static_cast<int32_t>(model_.weights.embeddings.token_type_embeddings->ne[1])}) {
+            EXPECT_FALSE(extract(model_, &token_id, T, out.data(), out_cap, &bad_type));
+        }
+        EXPECT_EQ(out, sentinel);
+    }
+}
 
-    // Null destination.
-    EXPECT_FALSE(gpt_sovits::roberta_extract_features(
-        model_, input_ids.data(), T, nullptr, out_cap));
-
-    // Destination too small.
-    EXPECT_FALSE(gpt_sovits::roberta_extract_features(
-        model_, input_ids.data(), T, out.data(), out_cap - 1));
-
-    // T beyond max_position_embeddings (512).
-    std::vector<int32_t> long_ids(513, input_ids.front());
-    EXPECT_FALSE(gpt_sovits::roberta_extract_features(
-        model_, long_ids.data(), static_cast<int64_t>(long_ids.size()),
-        out.data(), out_cap));
-
-    // Out-of-range token id.
-    std::vector<int32_t> bad_ids(input_ids.begin(), input_ids.end());
-    bad_ids[0] = -1;
-    EXPECT_FALSE(gpt_sovits::roberta_extract_features(
-        model_, bad_ids.data(), T, out.data(), out_cap));
+TEST(RobertaExtractValidation, RejectsUnloadedModel) {
+    gpt_sovits::roberta_model model{};
+    const int32_t token_id = 1;
+    std::vector<float> out(kHiddenSize, 12345.0f);
+    for (auto extract : {gpt_sovits::roberta_extract_features,
+                         gpt_sovits::roberta_extract_tts_features}) {
+        EXPECT_FALSE(extract(model, &token_id, 1, out.data(), kHiddenSize, nullptr));
+    }
+    model.backend = ggml_backend_cpu_init();
+    ASSERT_NE(model.backend, nullptr);
+    for (auto extract : {gpt_sovits::roberta_extract_features,
+                         gpt_sovits::roberta_extract_tts_features}) {
+        EXPECT_FALSE(extract(model, &token_id, 1, out.data(), kHiddenSize, nullptr));
+    }
+    ggml_backend_free(model.backend);
+    EXPECT_TRUE(std::all_of(out.begin(), out.end(), [](float v) { return v == 12345.0f; }));
 }
 
 }  // anonymous namespace
