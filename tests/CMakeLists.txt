@@ -158,6 +158,32 @@ target_compile_definitions(test_text_frontend_json PRIVATE
 )
 gtest_discover_tests(test_text_frontend_json)
 
+add_executable(test_text_frontend_bert frontend/test_text_frontend_bert.cpp)
+target_include_directories(test_text_frontend_bert PRIVATE
+    ${CMAKE_SOURCE_DIR}/src/frontend
+)
+target_link_libraries(test_text_frontend_bert PRIVATE
+    gpt_sovits_cpp_static
+    GTest::gtest_main
+)
+target_compile_definitions(test_text_frontend_bert PRIVATE
+    FRONTEND_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/frontend/"
+)
+gtest_discover_tests(test_text_frontend_bert)
+
+add_executable(test_text_frontend_bert_integration frontend/test_text_frontend_bert_integration.cpp)
+target_link_libraries(test_text_frontend_bert_integration PRIVATE
+    gpt_sovits_cpp_static
+    GTest::gtest_main
+)
+target_compile_definitions(test_text_frontend_bert_integration PRIVATE
+    FRONTEND_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/frontend/"
+    ROBERTA_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/roberta/"
+)
+gtest_discover_tests(test_text_frontend_bert_integration
+    PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
+)
+
 add_executable(test_t2s_sovits_bridge
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/test_t2s_sovits_bridge.cpp
     ${COMMON_TEST_SOURCES}

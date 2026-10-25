@@ -1,4 +1,5 @@
 #include "gpt_sovits/text_frontend.h"
+#include "frontend_internal.h"
 
 #include <nlohmann/json.hpp>
 
@@ -15,18 +16,11 @@ namespace {
 
 using json = nlohmann::json;
 
-class contract_error : public std::runtime_error {
-public:
-    using std::runtime_error::runtime_error;
-};
-
-[[noreturn]] void invalid(const std::string & path, const std::string & reason) {
-    throw contract_error(path + ": " + reason);
-}
-
-std::string indexed(const std::string & path, size_t i) {
-    return path + "[" + std::to_string(i) + "]";
-}
+using frontend_detail::contract_error;
+using frontend_detail::invalid;
+using frontend_detail::indexed;
+using frontend_detail::codepoint_count;
+using frontend_detail::report_error;
 
 const json & field(const json & object, const char * key, const std::string & path) {
     if (!object.is_object()) invalid(path, "expected an object");
@@ -59,33 +53,6 @@ const json & array_value(const json & value, const std::string & path) {
         invalid(path, "array length is out of range");
     }
     return value;
-}
-
-int64_t codepoint_count(const std::string & text, const std::string & path) {
-    int64_t count = 0;
-    for (size_t i = 0; i < text.size();) {
-        const auto lead = static_cast<unsigned char>(text[i]);
-        size_t width = 0;
-        uint32_t cp = 0;
-        if (lead < 0x80) { width = 1; cp = lead; }
-        else if (lead >= 0xc2 && lead <= 0xdf) { width = 2; cp = lead & 0x1f; }
-        else if (lead >= 0xe0 && lead <= 0xef) { width = 3; cp = lead & 0x0f; }
-        else if (lead >= 0xf0 && lead <= 0xf4) { width = 4; cp = lead & 0x07; }
-        else invalid(path, "invalid UTF-8");
-        if (width > text.size() - i) invalid(path, "truncated UTF-8");
-        for (size_t j = 1; j < width; ++j) {
-            const auto c = static_cast<unsigned char>(text[i + j]);
-            if ((c & 0xc0) != 0x80) invalid(path, "invalid UTF-8 continuation");
-            cp = (cp << 6) | (c & 0x3f);
-        }
-        if ((width == 2 && cp < 0x80) || (width == 3 && cp < 0x800) ||
-            (width == 4 && cp < 0x10000) || cp > 0x10ffff ||
-            (cp >= 0xd800 && cp <= 0xdfff)) invalid(path, "invalid UTF-8 code point");
-        if (count == std::numeric_limits<int64_t>::max()) invalid(path, "text is too long");
-        ++count;
-        i += width;
-    }
-    return count;
 }
 
 std::vector<int32_t> integers(const json & value, const std::string & path, int32_t maximum) {
@@ -271,19 +238,6 @@ text_frontend_result parse_document(const json & root) {
         invalid("normalized_text", "does not equal concatenated segment texts");
     }
     return result;
-}
-
-bool report_error(std::string * error, const char * message) noexcept {
-    if (error) {
-        try {
-            *error = message;
-            return false;
-        } catch (const std::bad_alloc &) {
-        } catch (const std::length_error &) {
-        }
-    }
-    fprintf(stderr, "text_frontend: %s\n", message);
-    return false;
 }
 
 } // namespace

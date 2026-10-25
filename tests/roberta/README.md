@@ -16,7 +16,10 @@ CLS/SEP tokens count toward T and retain their output rows. Neither function
 runs tokenization, removes special tokens or expands features to phonemes.
 Use `roberta_expand_bert_features` with token spans for phoneme expansion;
 special-token spans `-1/-1` are never selected. Mixed-language assembly and
-English zero-fill remain outside these APIs.
+English zero-fill remain outside these low-level APIs; use
+`text_frontend_build_bert_features` from `gpt_sovits/text_frontend.h` to consume
+parsed frontend results and assemble features for T2S. See the
+[frontend contract](../frontend/README.md#phoneme-level-bert-feature-builder).
 
 ## Local reference assets
 

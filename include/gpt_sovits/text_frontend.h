@@ -52,4 +52,27 @@ bool text_frontend_read_json(const std::string & path,
                              text_frontend_result & out,
                              std::string * error = nullptr);
 
+struct roberta_model;
+
+// Build phoneme-level BERT features from a frontend result (v2 vocabulary).
+// Chinese segments use their own tokenizer and RoBERTa hidden_states[-3];
+// English phoneme ranges are zero-filled without accessing model/tokenizer.
+// Zero-phoneme segments require neither a tokenizer nor model inference.
+// A Chinese segment with phonemes requires a loaded model and tokenizer; there is
+// no fallback, truncation or chunking. Its CLS/SEP-inclusive length is <= 512
+// and token IDs must fit the model vocabulary. Structural input is validated.
+//
+// out is contiguous F32 ggml {1024, T_phonemes}, out[p * 1024 + channel].
+// Success replaces out and clears error; failure preserves out and reports a
+// diagnostic through error (or stderr when null). Recoverable host allocation
+// and compute failures return false; ggml aborts/corrupt backends do not.
+// model/backend are borrowed only for the call and must not be freed, reloaded
+// or used concurrently during it. model may be null when no Chinese segment
+// has phonemes. Do not alias error with any string inside text.
+// This assembles features, not T2S generation or end-to-end synthesis.
+bool text_frontend_build_bert_features(const text_frontend_result & text,
+                                       const roberta_model * model,
+                                       std::vector<float> & out,
+                                       std::string * error = nullptr);
+
 } // namespace gpt_sovits
