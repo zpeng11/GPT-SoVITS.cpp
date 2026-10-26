@@ -291,7 +291,7 @@ static ::ggml_tensor * linear_2d(
                 kLayerNormEps);
         }
 
-        x = ggml_gelu(ctx, x);
+        x = ggml_gelu_erf(ctx, x);
     }
 
     return x;
@@ -375,7 +375,7 @@ static ::ggml_tensor * linear_2d(
 
     ::ggml_tensor * trimmed = ggml_view_2d(ctx, out, out->ne[0], hidden_states->ne[1], out->nb[1], 0);
     trimmed = ggml_cont(ctx, trimmed);
-    return ggml_gelu(ctx, trimmed);
+    return ggml_gelu_erf(ctx, trimmed);
 }
 
 ::ggml_tensor * hubert_attention_block_forward(
@@ -471,7 +471,7 @@ static ::ggml_tensor * linear_2d(
     ::ggml_tensor * ln1 = layer_norm_last_dim_2d(ctx, res1, weights.ln1_w, weights.ln1_b, kLayerNormEps);
 
     ::ggml_tensor * ffn = linear_2d(ctx, ln1, weights.ffn_up_w, weights.ffn_up_b);
-    ffn = ggml_gelu(ctx, ffn);
+    ffn = ggml_gelu_erf(ctx, ffn);
     ffn = linear_2d(ctx, ffn, weights.ffn_down_w, weights.ffn_down_b);
 
     ::ggml_tensor * res2 = ggml_add(ctx, ln1, ffn);
