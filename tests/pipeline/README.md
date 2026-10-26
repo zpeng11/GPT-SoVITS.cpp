@@ -1,4 +1,84 @@
-# CPU reference conditioning and T2S → SoVITS bridge
+# Single-request CPU synthesis and pipeline tests
+
+## Public synthesis API
+
+`gpt_sovits/pipeline.h` exposes `synthesize_cpu`. It borrows five preloaded
+models on one CPU backend and owns the T2S/SoVITS sessions for exactly one call.
+The caller supplies decoded mono PCM, its sample rate, and reference/target
+`text_frontend_result` values. No Python process, model loading or file IO occurs
+inside the runner. RoBERTa can be null only when neither text needs Chinese BERT.
+
+```cpp
+#include "gpt_sovits/pipeline.h"
+
+// Models have already been loaded on the same CPU backend, and the two
+// frontend results have been parsed from the v2 JSON contract.
+gpt_sovits::synthesis_models models{&hubert, &roberta, &t2s, &sovits, &sv};
+gpt_sovits::synthesis_config config;
+config.generate.max_new_tokens = 100;
+config.generate.seed = 42;
+config.noise_seed = 7;
+gpt_sovits::synthesis_result result;
+std::string error;
+bool ok = gpt_sovits::synthesize_cpu(
+    models, pcm.data(), static_cast<int64_t>(pcm.size()), sample_rate,
+    reference_text, target_text, result, config, &error);
+```
+
+Success replaces `result`; failure preserves it and reports a diagnostic. Models
+and backend remain caller-owned and must not be freed, moved, reloaded or used
+concurrently during the call. All per-request sessions are released on return,
+including failures. A subsequent request can reuse the models without reusing any
+request state.
+
+The initial scope is the verified v2Pro, 25 Hz, 732-phone configuration. T2S F32
+and SoVITS F16 codebooks must agree exactly after rounding the former to F16;
+unsupported codebook types, non-finite values or mismatches fail before inference.
+This validates the current conversion format, not arbitrary quantized model pairs.
+The request allocates F32 KV storage for exactly
+`reference_phones + target_phones + prompt_codes + max_new_tokens - 1` positions,
+with an initial total limit of 1024. Over-budget requests fail without truncation.
+
+`result.samples` is raw mono F32 at `result.sample_rate == 32000`, containing
+`result.codes.size() * 1280` samples. Codes exclude the reference prompt and EOS.
+An immediate EOS is an error and never calls SoVITS or retries. Length-limit
+termination retains all accepted codes and reports `max_new_tokens` through
+`result.stop_reason`. No normalization, clipping, trailing silence or int16
+conversion is applied. The runner preserves the existing C++ T2S sampling rules;
+it does not reproduce Python's early EOS suppression or prompt repetition mask.
+Same-seed reproducibility is restricted to the same build/backend.
+
+Build and run the runner tests using the same explicit local case setting as the
+reference tests below:
+
+```sh
+cmake --build build --target gpt_sovits_cpp_static gpt_sovits_cpp_shared \
+  test_synthesis test_synthesis_integration test_t2s_sovits_bridge -j 4
+ctest --test-dir build \
+  -R '^(Synthesis|SynthesizeCpuPublic|CodebookValidation|GenerateAndDecode|T2SSoVITSBridge\.)' \
+  --output-on-failure
+```
+
+Runner contract tests cover invalid configuration, request budgets, codebook
+pairing and failure result preservation without model assets. Local integration
+separates fixed-input decoding (recorded codes, target phones, conditioning and
+actual scaled noise) from a full public API request using the original recording
+and frontend JSON. The fixed-noise injection is confined to a test backend; it is
+not a production API. The complete request checks waveform length, finiteness and
+non-degeneracy, not equality to Python's randomly generated codes or waveform.
+Neither test claims resampler parity or replaces a listening evaluation.
+The public API test also injects generation and waveform compute failures, then
+reuses the same loaded models successfully. One-token length-limit requests
+check that the accepted code is retained and that repeated calls with the same
+seeds produce identical results within the tested build/backend.
+
+For the matched local CPU case, fixed codes/conditioning/noise produced 87,040
+samples with peak absolute error `1.45e-2`, RMSE `1.95e-3` and correlation
+`0.999923` against the Python raw waveform. The asserted limits are `3e-2`,
+`5e-3` and correlation above `0.999`. The full runner with greedy top-k 1,
+semantic seed 42 and noise seed 7 generated 73 codes, stopped at EOS and returned
+93,440 samples (2.92 seconds). Python's separate stochastic run generated 68
+codes; that difference is not treated as a decoding mismatch.
 
 ## Reference conditioning
 
@@ -45,8 +125,8 @@ Keep recordings, transcriptions, model identities and dumps under
 into tracked fixtures. A capture contains `manifest.json`, original `ref.wav`,
 reference/target frontend JSON, BERT/phones, actual HuBERT/SV inputs and outputs,
 conditioning tensors, generated codes, noise and waveforms from one run.
-The latter target/decoder artifacts are retained for the next synthesis milestone,
-but are not consumed by this reference-only delivery.
+Target/decoder artifacts are consumed by the synthesis tests above; the
+reference-only tests below use only the reference-side artifacts.
 
 Configure a case explicitly (leave the setting empty to skip optional local
 integration tests):

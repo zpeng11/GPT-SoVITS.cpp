@@ -2,6 +2,7 @@
 
 #include "gpt_sovits/sovits.h"
 #include "gpt_sovits/t2s.h"
+#include "synthesis_internal.h"
 
 #include "cnpy.h"
 #include "npy_loader.h"
@@ -29,7 +30,6 @@ const std::string kReferPath = std::string(SOVITS_TEST_DIR) + "ref/v2pro_refer.n
 const std::string kSVPath = std::string(SOVITS_TEST_DIR) + "ref/v2pro_sv_emb.npy";
 
 constexpr int64_t kCodeDim = 768;
-constexpr int64_t kCodeCount = 1024;
 constexpr int64_t kSpecChannels = 704;
 constexpr int64_t kSVSize = 20480;
 constexpr int64_t kFrameSamples = 640;
@@ -74,40 +74,9 @@ protected:
         ASSERT_NE(sovits_model.generator.conv_pre.w, nullptr);
         ASSERT_EQ(sovits_model.generator.conv_pre.w->ne[1], 512);
 
-        ggml_tensor * t2s_book = t2s_model.weights.extract_latent.codebook;
-        ggml_tensor * sovits_book = sovits_model.quantizer.codebook;
-        ASSERT_NE(t2s_book, nullptr);
-        ASSERT_NE(sovits_book, nullptr);
-        ASSERT_EQ(t2s_book->type, GGML_TYPE_F32);
-        ASSERT_EQ(sovits_book->type, GGML_TYPE_F16);
-        for (const auto * book : {t2s_book, sovits_book}) {
-            ASSERT_EQ(book->ne[0], kCodeDim);
-            ASSERT_EQ(book->ne[1], kCodeCount);
-            ASSERT_EQ(ggml_nelements(book), kCodeDim * kCodeCount);
-            ASSERT_TRUE(ggml_is_contiguous(book));
-        }
-
-        const size_t n = static_cast<size_t>(kCodeDim * kCodeCount);
-        std::vector<float> t2s_values(n);
-        std::vector<ggml_fp16_t> expected(n), actual(n);
-        ggml_backend_tensor_get(t2s_book, t2s_values.data(), 0, n * sizeof(float));
-        ggml_backend_tensor_get(sovits_book, actual.data(), 0, n * sizeof(ggml_fp16_t));
-        ASSERT_TRUE(std::all_of(t2s_values.begin(), t2s_values.end(),
-                               [](float v) { return std::isfinite(v); }));
-        ASSERT_TRUE(std::all_of(actual.begin(), actual.end(), [](ggml_fp16_t v) {
-            return std::isfinite(ggml_fp16_to_fp32(v));
-        }));
-        for (size_t i = 0; i < n; ++i) {
-            expected[i] = ggml_fp32_to_fp16(t2s_values[i]);
-        }
-        const auto mismatch = std::mismatch(expected.begin(), expected.end(), actual.begin());
-        if (mismatch.first != expected.end()) {
-            const size_t i = static_cast<size_t>(mismatch.first - expected.begin());
-            FAIL() << "Codebooks differ at channel " << i % kCodeDim
-                   << ", code " << i / kCodeDim
-                   << ": T2S rounded to F16=" << ggml_fp16_to_fp32(expected[i])
-                   << ", SoVITS=" << ggml_fp16_to_fp32(actual[i]);
-        }
+        std::string error;
+        ASSERT_TRUE(gpt_sovits::pipeline_detail::validate_codebooks(
+            t2s_model, sovits_model, &error)) << error;
     }
 
     void LoadReference() {
