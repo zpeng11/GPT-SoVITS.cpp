@@ -1,7 +1,8 @@
 // tests/hubert/test_hubert_extract.cpp
 //
-// Tests for the host-side normalized-input HuBERT feature extraction runner
-// (hubert_extract_features_from_normalized_pcm) and the output-frame formula.
+// Tests for the host-side HuBERT feature extraction runners
+// (hubert_extract_features_from_pcm and its compatibility alias
+// hubert_extract_features_from_normalized_pcm) and the output-frame formula.
 //
 // The parity reference files are produced by tests/hubert/generate_reference.py
 // and stored as raw f32 little-endian binaries whose memory layout matches
@@ -93,6 +94,32 @@ TEST(HubertOutputFrames, EdgeCases) {
 // graph is built).
 // ===========================================================================
 
+// Both public entry points share the same signature; exercise the validation
+// paths of each so the compatibility proxy cannot silently diverge.
+struct ExtractEntry {
+    const char * name;
+    bool (*fn)(const gpt_sovits::hubert_model &, const float *, int64_t,
+               float *, int64_t, int64_t *);
+};
+
+static const ExtractEntry kExtractEntries[] = {
+    {"from_pcm", &gpt_sovits::hubert_extract_features_from_pcm},
+    {"from_normalized_pcm",
+     &gpt_sovits::hubert_extract_features_from_normalized_pcm},
+};
+
+TEST(HubertExtractValidation, NullBackendReturnsFalse) {
+    gpt_sovits::hubert_model model{};  // backend stays null
+    std::vector<float> pcm(720, 0.0f);
+    std::vector<float> out(2 * kHiddenSize, 0.0f);
+    for (const auto & e : kExtractEntries) {
+        SCOPED_TRACE(e.name);
+        EXPECT_FALSE(e.fn(model, pcm.data(), static_cast<int64_t>(pcm.size()),
+                          out.data(), static_cast<int64_t>(out.size()),
+                          nullptr));
+    }
+}
+
 class HubertExtractArgs : public ::testing::Test {
 protected:
     void SetUp() override {
@@ -115,40 +142,65 @@ protected:
 
 TEST_F(HubertExtractArgs, NullPcmReturnsFalse) {
     std::vector<float> out(2 * kHiddenSize, 0.0f);
-    EXPECT_FALSE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
-        model_, nullptr, 720, out.data(), static_cast<int64_t>(out.size())));
+    for (const auto & e : kExtractEntries) {
+        SCOPED_TRACE(e.name);
+        EXPECT_FALSE(e.fn(model_, nullptr, 720, out.data(),
+                          static_cast<int64_t>(out.size()), nullptr));
+    }
 }
 
 TEST_F(HubertExtractArgs, NullOutReturnsFalse) {
     std::vector<float> pcm(720, 0.0f);
-    EXPECT_FALSE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
-        model_, pcm.data(), static_cast<int64_t>(pcm.size()), nullptr,
-        static_cast<int64_t>(2 * kHiddenSize)));
+    for (const auto & e : kExtractEntries) {
+        SCOPED_TRACE(e.name);
+        EXPECT_FALSE(e.fn(model_, pcm.data(), static_cast<int64_t>(pcm.size()),
+                          nullptr, static_cast<int64_t>(2 * kHiddenSize),
+                          nullptr));
+    }
 }
 
 TEST_F(HubertExtractArgs, NonPositiveSamplesReturnsFalse) {
     std::vector<float> pcm(720, 0.0f);
     std::vector<float> out(2 * kHiddenSize, 0.0f);
-    EXPECT_FALSE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
-        model_, pcm.data(), 0, out.data(), static_cast<int64_t>(out.size())));
-    EXPECT_FALSE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
-        model_, pcm.data(), -1, out.data(), static_cast<int64_t>(out.size())));
+    for (const auto & e : kExtractEntries) {
+        SCOPED_TRACE(e.name);
+        EXPECT_FALSE(e.fn(model_, pcm.data(), 0, out.data(),
+                          static_cast<int64_t>(out.size()), nullptr));
+        EXPECT_FALSE(e.fn(model_, pcm.data(), -1, out.data(),
+                          static_cast<int64_t>(out.size()), nullptr));
+    }
 }
 
 TEST_F(HubertExtractArgs, OutCapTooSmallReturnsFalse) {
-    // 720 samples -> T' = 2 -> 1536 floats required.
-    std::vector<float> pcm(720, 0.0f);
-    std::vector<float> out(2 * kHiddenSize, 0.0f);
-    EXPECT_FALSE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
-        model_, pcm.data(), static_cast<int64_t>(pcm.size()), out.data(),
-        static_cast<int64_t>(out.size()) - 1));
+    for (const auto & e : kExtractEntries) {
+        SCOPED_TRACE(e.name);
 
-    // 400 samples -> T' = 1 -> 768 floats required.
-    std::vector<float> pcm400(400, 0.0f);
-    std::vector<float> out400(kHiddenSize, 0.0f);
-    EXPECT_FALSE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
-        model_, pcm400.data(), static_cast<int64_t>(pcm400.size()),
-        out400.data(), static_cast<int64_t>(out400.size()) - 1));
+        // 720 samples -> T' = 2 -> 1536 floats required.
+        std::vector<float> pcm(720, 0.0f);
+        std::vector<float> out(2 * kHiddenSize, 0.0f);
+        EXPECT_FALSE(e.fn(model_, pcm.data(), static_cast<int64_t>(pcm.size()),
+                          out.data(), static_cast<int64_t>(out.size()) - 1,
+                          nullptr));
+
+        // 400 samples -> T' = 1 -> 768 floats required.
+        std::vector<float> pcm400(400, 0.0f);
+        std::vector<float> out400(kHiddenSize, 0.0f);
+        EXPECT_FALSE(e.fn(model_, pcm400.data(),
+                          static_cast<int64_t>(pcm400.size()), out400.data(),
+                          static_cast<int64_t>(out400.size()) - 1, nullptr));
+    }
+}
+
+TEST_F(HubertExtractArgs, HugeSampleCountReturnsFalse) {
+    // n_samples * sizeof(float) overflows before any buffer access; both
+    // entries must reject it identically.
+    std::vector<float> pcm(1, 0.0f);
+    std::vector<float> out(1, 0.0f);
+    for (const auto & e : kExtractEntries) {
+        SCOPED_TRACE(e.name);
+        EXPECT_FALSE(e.fn(model_, pcm.data(), INT64_MAX, out.data(),
+                          static_cast<int64_t>(out.size()), nullptr));
+    }
 }
 
 // ===========================================================================
@@ -192,7 +244,9 @@ TEST_F(HubertExtract, MatchesReference) {
     std::vector<float> out(static_cast<size_t>(kHiddenSize * T), 0.0f);
     int64_t frames = -1;
 
-    ASSERT_TRUE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
+    // The primary entry point must reproduce the Python reference on the
+    // caller-provided waveform.
+    ASSERT_TRUE(gpt_sovits::hubert_extract_features_from_pcm(
         model_, input.data(), n_samples, out.data(),
         static_cast<int64_t>(out.size()), &frames));
     EXPECT_EQ(frames, T);
@@ -203,4 +257,25 @@ TEST_F(HubertExtract, MatchesReference) {
 
     EXPECT_LT(err.max_abs, kMaxAbsTol) << "max abs error too large";
     EXPECT_LT(err.rmse,    kRmseTol)   << "RMSE too large";
+
+    // The legacy normalized entry is a compatibility alias and must produce
+    // bit-identical results for the same samples. Use a single-frame input
+    // here to keep the extra compute cheap; the model is already loaded.
+    ASSERT_GE(input.size(), static_cast<size_t>(400));
+    std::vector<float> short_pcm(input.begin(), input.begin() + 400);
+    std::vector<float> out_pcm(kHiddenSize, 0.0f);
+    std::vector<float> out_norm(kHiddenSize, 0.0f);
+    int64_t frames_pcm  = -1;
+    int64_t frames_norm = -1;
+
+    ASSERT_TRUE(gpt_sovits::hubert_extract_features_from_pcm(
+        model_, short_pcm.data(), static_cast<int64_t>(short_pcm.size()),
+        out_pcm.data(), static_cast<int64_t>(out_pcm.size()), &frames_pcm));
+    ASSERT_TRUE(gpt_sovits::hubert_extract_features_from_normalized_pcm(
+        model_, short_pcm.data(), static_cast<int64_t>(short_pcm.size()),
+        out_norm.data(), static_cast<int64_t>(out_norm.size()), &frames_norm));
+
+    EXPECT_EQ(frames_pcm, 1);
+    EXPECT_EQ(frames_norm, frames_pcm);
+    EXPECT_EQ(out_norm, out_pcm) << "legacy entry diverged from the pcm entry";
 }

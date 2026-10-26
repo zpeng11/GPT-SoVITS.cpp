@@ -442,8 +442,18 @@ int t2s_session_get_n_kv(const t2s_session & session);
 //
 // Accepts raw host data pointers for all inputs. Internally builds a temporary
 // graph, executes it, and copies the result to a session-owned persistent tensor.
-// Call once after session init; one session = one ref. For subsequent generate
-// calls, keep this model alive at the same address without moving/reloading it.
+// Call once after session init; one session = one ref. A second call after a
+// successful computation is rejected with false and leaves the cache untouched;
+// free and re-init the session to use a different reference. For subsequent
+// generate calls, keep this model alive at the same address without
+// moving/reloading it.
+//
+// Inputs are validated before any resource is allocated: backend, pointers,
+// T_ref > 0, T_hub >= 2 (Conv1d kernel 2), reference token ids in
+// [0, phoneme_vocab_size), and checked size arithmetic. All resources are
+// committed atomically only after the computation succeeds, so on any failure
+// the session's reference cache is left unchanged. Host/allocator exhaustion is
+// reported as false rather than propagating std::bad_alloc/std::length_error.
 //
 // Parameters:
 //   session     - initialized T2S session
@@ -454,7 +464,7 @@ int t2s_session_get_n_kv(const t2s_session & session);
 //   hubert_data - HuBERT features from ref audio     {768, T_hub}, host pointer (F32)
 //   T_hub       - number of HuBERT time frames
 //
-// Returns true on success, false on failure.
+// Returns true on success, false on invalid input or allocation/compute failure.
 bool t2s_session_compute_ref_emb(t2s_session       & session,
                                   const t2s_model   & model,
                                   const int32_t     * ref_token,

@@ -5,8 +5,10 @@
 #include "ggml-backend.h"
 
 #include <cmath>
+#include <cstdint>
 #include <cstdio>
 #include <new>
+#include <stdexcept>
 #include <vector>
 
 namespace gpt_sovits {
@@ -927,6 +929,48 @@ void t2s_session_flex_advance(t2s_session       & session,
 // Reference embedding
 // ---------------------------------------------------------------------------
 
+namespace {
+
+// RAII guards for the short-lived graph resources and the new persistent ref
+// cache. Ownership is handed to the session only after every step succeeds;
+// on any failure the destructors release exactly the resources created here.
+struct ref_temp_resources {
+    struct ggml_context * ctx   = nullptr;
+    ggml_gallocr_t        alloc = nullptr;
+    ~ref_temp_resources() {
+        if (alloc) ggml_gallocr_free(alloc);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+struct ref_cache_resources {
+    struct ggml_context  * ctx = nullptr;
+    ggml_backend_buffer_t  buf = nullptr;
+    ~ref_cache_resources() {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+    }
+};
+
+// Overflow-checked multiply for host-side size arithmetic (operands >= 0).
+static bool mul_ok(int64_t a, int64_t b, int64_t & out) {
+    if (a < 0 || b < 0) return false;
+    if (a != 0 && b > INT64_MAX / a) return false;
+    out = a * b;
+    return true;
+}
+
+// Convert an element count to bytes, rejecting negative or overflowing sizes.
+static bool bytes_ok(int64_t n, size_t elem_size, size_t & out) {
+    if (n < 0) return false;
+    const size_t ne = (size_t) n;
+    if (elem_size != 0 && ne > SIZE_MAX / elem_size) return false;
+    out = ne * elem_size;
+    return true;
+}
+
+} // namespace
+
 struct ggml_tensor * t2s_session_get_ref_text_emb(const t2s_session & session) {
     return session.ref_text_emb;
 }
@@ -951,161 +995,227 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
                                   const float       * hubert_data,
                                   int64_t             T_hub)
 {
-    GGML_ASSERT(session.backend != nullptr);
-    GGML_ASSERT(ref_token_data != nullptr);
-    GGML_ASSERT(ref_bert_data  != nullptr);
-    GGML_ASSERT(hubert_data    != nullptr);
-    GGML_ASSERT(T_ref > 0);
-    GGML_ASSERT(T_hub > 0);
+    // One session = one reference. Reject duplicates before touching any state
+    // so a second call cannot overwrite (and leak) the cached tensors.
+    if (session.ctx_ref || session.buf_ref || session.ref_text_emb ||
+        session.ref_audio_emb || session.ref_model) {
+        fprintf(stderr, "%s: reference embedding already computed\n", __func__);
+        return false;
+    }
+    if (session.backend == nullptr) {
+        fprintf(stderr, "%s: session backend is null\n", __func__);
+        return false;
+    }
+    if (ref_token_data == nullptr || ref_bert_data == nullptr || hubert_data == nullptr) {
+        fprintf(stderr, "%s: input data must be non-null\n", __func__);
+        return false;
+    }
+    if (T_ref <= 0) {
+        fprintf(stderr, "%s: T_ref must be > 0 (got %lld)\n",
+                __func__, (long long) T_ref);
+        return false;
+    }
+    // extract-latent uses Conv1d(kernel=2, stride=2), which needs a complete
+    // two-frame window; T_hub < 2 yields no prompt frame.
+    if (T_hub < 2) {
+        fprintf(stderr, "%s: T_hub must be >= 2 (got %lld)\n",
+                __func__, (long long) T_hub);
+        return false;
+    }
+    if (model.hparams.phoneme_vocab_size == 0) {
+        fprintf(stderr, "%s: model has no phoneme vocabulary\n", __func__);
+        return false;
+    }
 
-    const int64_t d_model    = (int64_t) model.hparams.hidden_dim;
     const int64_t bert_dim   = 1024;
     const int64_t hubert_dim = 768;
 
-    // --- Temporary graph context ---
-    const size_t n_intermediates = 64;
-    const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
-
-    struct ggml_init_params params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 4) +
-                         ggml_graph_overhead_custom(graph_size, false),
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-
-    struct ggml_context * ctx_tmp = ggml_init(params);
-    if (!ctx_tmp) {
-        fprintf(stderr, "%s: ggml_init() for temp context failed\n", __func__);
-        return false;
-    }
-
-    // --- Input tensors ---
-    struct ggml_tensor * ref_token_tensor = ggml_new_tensor_1d(ctx_tmp, GGML_TYPE_I32, T_ref);
-    ggml_set_name(ref_token_tensor, "ref_token");
-    ggml_set_input(ref_token_tensor);
-
-    struct ggml_tensor * ref_bert_tensor = ggml_new_tensor_2d(ctx_tmp, GGML_TYPE_F32, bert_dim, T_ref);
-    ggml_set_name(ref_bert_tensor, "ref_bert");
-    ggml_set_input(ref_bert_tensor);
-
-    struct ggml_tensor * hubert_tensor = ggml_new_tensor_2d(ctx_tmp, GGML_TYPE_F32, hubert_dim, T_hub);
-    ggml_set_name(hubert_tensor, "hubert");
-    ggml_set_input(hubert_tensor);
-
-    // --- Build graph ---
-    struct ggml_cgraph * gf = ggml_new_graph_custom(ctx_tmp, graph_size, false);
-
-    struct ggml_tensor * result = t2s_embed_ref_forward(
-        ctx_tmp,
-        ref_token_tensor,
-        ref_bert_tensor,
-        hubert_tensor,
-        model.weights.extract_latent,
-        model.weights.embed);
-
-    ggml_set_name(result, "ref_emb_out");
-    ggml_set_output(result);
-    ggml_build_forward_expand(gf, result);
-
-    // --- Allocate and execute ---
-    ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
-    ggml_gallocr_t alloc = ggml_gallocr_new(buft);
-    if (!alloc) {
-        fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
-        ggml_free(ctx_tmp);
-        return false;
-    }
-
-    if (!ggml_gallocr_alloc_graph(alloc, gf)) {
-        fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx_tmp);
-        return false;
-    }
-
-    ggml_backend_tensor_set(ref_token_tensor, ref_token_data,
-                            0, (size_t) T_ref * sizeof(int32_t));
-    ggml_backend_tensor_set(ref_bert_tensor, ref_bert_data,
-                            0, (size_t) bert_dim * T_ref * sizeof(float));
-    ggml_backend_tensor_set(hubert_tensor, hubert_data,
-                            0, (size_t) hubert_dim * T_hub * sizeof(float));
-
-    if (ggml_backend_graph_compute(session.backend, gf) != GGML_STATUS_SUCCESS) {
-        fprintf(stderr, "%s: ggml_backend_graph_compute() failed\n", __func__);
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx_tmp);
-        return false;
-    }
-
-    // --- Create persistent tensors and copy result ---
-    const int64_t out_d    = result->ne[0];
-    const int64_t out_T    = result->ne[1];
-    const int64_t T_prompt = out_T - T_ref;
-
-    struct ggml_init_params ref_params = {
-        /*.mem_size   =*/ ggml_tensor_overhead() * 3,
-        /*.mem_buffer =*/ nullptr,
-        /*.no_alloc   =*/ true,
-    };
-
-    session.ctx_ref = ggml_init(ref_params);
-    if (!session.ctx_ref) {
-        fprintf(stderr, "%s: ggml_init() for ref context failed\n", __func__);
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx_tmp);
-        return false;
-    }
-
-    session.ref_text_emb = ggml_new_tensor_2d(session.ctx_ref, GGML_TYPE_F32, out_d, T_ref);
-    ggml_set_name(session.ref_text_emb, "ref_text_emb");
-
-    session.ref_audio_emb = ggml_new_tensor_2d(session.ctx_ref, GGML_TYPE_F32, out_d, T_prompt);
-    ggml_set_name(session.ref_audio_emb, "ref_audio_emb");
-
-    session.buf_ref = ggml_backend_alloc_ctx_tensors(session.ctx_ref, session.backend);
-    if (!session.buf_ref) {
-        fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() for ref failed\n", __func__);
-        session.ctx_ref       = nullptr;
-        session.ref_text_emb  = nullptr;
-        session.ref_audio_emb = nullptr;
-        ggml_gallocr_free(alloc);
-        ggml_free(ctx_tmp);
-        return false;
-    }
-
-    // Copy: split result (temp alloc) into two persistent tensors.
+    // Validate every host-side size before allocating so a bad input cannot
+    // throw std::length_error / std::bad_alloc out of the public API.
+    size_t token_bytes = 0;
+    size_t bert_bytes  = 0;
+    size_t hub_bytes   = 0;
     {
-        const size_t row_bytes = (size_t) out_d * sizeof(float);
-
-        // Text portion: columns [0, T_ref)
-        {
-            const size_t nbytes = row_bytes * T_ref;
-            std::vector<uint8_t> tmp_buf(nbytes);
-            ggml_backend_tensor_get(result, tmp_buf.data(), 0, nbytes);
-            ggml_backend_tensor_set(session.ref_text_emb, tmp_buf.data(), 0, nbytes);
-        }
-
-        // Audio portion: columns [T_ref, T_ref + T_prompt)
-        {
-            const size_t offset = row_bytes * T_ref;
-            const size_t nbytes = row_bytes * T_prompt;
-            std::vector<uint8_t> tmp_buf(nbytes);
-            ggml_backend_tensor_get(result, tmp_buf.data(), offset, nbytes);
-            ggml_backend_tensor_set(session.ref_audio_emb, tmp_buf.data(), 0, nbytes);
+        int64_t bert_elems   = 0;
+        int64_t hubert_elems = 0;
+        if (!bytes_ok(T_ref, sizeof(int32_t), token_bytes) ||
+            !mul_ok(bert_dim, T_ref, bert_elems) ||
+            !bytes_ok(bert_elems, sizeof(float), bert_bytes) ||
+            !mul_ok(hubert_dim, T_hub, hubert_elems) ||
+            !bytes_ok(hubert_elems, sizeof(float), hub_bytes)) {
+            fprintf(stderr, "%s: input size overflow\n", __func__);
+            return false;
         }
     }
 
-    session.ref_T_ref    = T_ref;
-    session.ref_T_prompt = T_prompt;
-    session.ref_model    = &model;
+    // Only walk the token array once T_ref has passed the size checks above,
+    // otherwise a bogus length could read past the caller's buffer.
+    for (int64_t i = 0; i < T_ref; i++) {
+        const int32_t tok = ref_token_data[i];
+        if (tok < 0 || (uint32_t) tok >= model.hparams.phoneme_vocab_size) {
+            fprintf(stderr, "%s: ref_token[%lld]=%d out of range [0, %u)\n",
+                    __func__, (long long) i, tok, model.hparams.phoneme_vocab_size);
+            return false;
+        }
+    }
 
-    // --- Free temporaries ---
-    ggml_gallocr_free(alloc);
-    ggml_free(ctx_tmp);
+    ref_temp_resources  temp;
+    ref_cache_resources cache;
+
+    try {
+        // --- Temporary graph context ---
+        const size_t n_intermediates = 64;
+        const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
+
+        struct ggml_init_params params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 4) +
+                             ggml_graph_overhead_custom(graph_size, false),
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        temp.ctx = ggml_init(params);
+        if (!temp.ctx) {
+            fprintf(stderr, "%s: ggml_init() for temp context failed\n", __func__);
+            return false;
+        }
+
+        // --- Input tensors ---
+        struct ggml_tensor * ref_token_tensor = ggml_new_tensor_1d(temp.ctx, GGML_TYPE_I32, T_ref);
+        ggml_set_name(ref_token_tensor, "ref_token");
+        ggml_set_input(ref_token_tensor);
+
+        struct ggml_tensor * ref_bert_tensor = ggml_new_tensor_2d(temp.ctx, GGML_TYPE_F32, bert_dim, T_ref);
+        ggml_set_name(ref_bert_tensor, "ref_bert");
+        ggml_set_input(ref_bert_tensor);
+
+        struct ggml_tensor * hubert_tensor = ggml_new_tensor_2d(temp.ctx, GGML_TYPE_F32, hubert_dim, T_hub);
+        ggml_set_name(hubert_tensor, "hubert");
+        ggml_set_input(hubert_tensor);
+
+        // --- Build graph ---
+        struct ggml_cgraph * gf = ggml_new_graph_custom(temp.ctx, graph_size, false);
+
+        struct ggml_tensor * result = t2s_embed_ref_forward(
+            temp.ctx,
+            ref_token_tensor,
+            ref_bert_tensor,
+            hubert_tensor,
+            model.weights.extract_latent,
+            model.weights.embed);
+
+        ggml_set_name(result, "ref_emb_out");
+        ggml_set_output(result);
+        ggml_build_forward_expand(gf, result);
+
+        // --- Allocate and execute ---
+        ggml_backend_buffer_type_t buft = ggml_backend_get_default_buffer_type(session.backend);
+        temp.alloc = ggml_gallocr_new(buft);
+        if (!temp.alloc) {
+            fprintf(stderr, "%s: ggml_gallocr_new() failed\n", __func__);
+            return false;
+        }
+
+        if (!ggml_gallocr_alloc_graph(temp.alloc, gf)) {
+            fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
+            return false;
+        }
+
+        ggml_backend_tensor_set(ref_token_tensor, ref_token_data, 0, token_bytes);
+        ggml_backend_tensor_set(ref_bert_tensor, ref_bert_data, 0, bert_bytes);
+        ggml_backend_tensor_set(hubert_tensor, hubert_data, 0, hub_bytes);
+
+        if (ggml_backend_graph_compute(session.backend, gf) != GGML_STATUS_SUCCESS) {
+            fprintf(stderr, "%s: ggml_backend_graph_compute() failed\n", __func__);
+            return false;
+        }
+
+        // --- Validate output shape and derive the persistent sizes ---
+        const int64_t out_d = result->ne[0];
+        const int64_t out_T = result->ne[1];
+        if (out_d <= 0 || out_T <= 0 || out_T < T_ref) {
+            fprintf(stderr, "%s: invalid ref embedding shape {%lld, %lld}\n",
+                    __func__, (long long) out_d, (long long) out_T);
+            return false;
+        }
+        const int64_t T_prompt = out_T - T_ref;
+        if (T_prompt <= 0) {
+            fprintf(stderr, "%s: ref prompt token count must be > 0\n", __func__);
+            return false;
+        }
+
+        int64_t text_elems  = 0;
+        int64_t audio_elems = 0;
+        size_t  text_bytes  = 0;
+        size_t  audio_bytes = 0;
+        if (!mul_ok(out_d, T_ref, text_elems) ||
+            !bytes_ok(text_elems, sizeof(float), text_bytes) ||
+            !mul_ok(out_d, T_prompt, audio_elems) ||
+            !bytes_ok(audio_elems, sizeof(float), audio_bytes)) {
+            fprintf(stderr, "%s: output size overflow\n", __func__);
+            return false;
+        }
+
+        // --- Create (but do not yet publish) the persistent tensors ---
+        struct ggml_init_params ref_params = {
+            /*.mem_size   =*/ ggml_tensor_overhead() * 3,
+            /*.mem_buffer =*/ nullptr,
+            /*.no_alloc   =*/ true,
+        };
+
+        cache.ctx = ggml_init(ref_params);
+        if (!cache.ctx) {
+            fprintf(stderr, "%s: ggml_init() for ref context failed\n", __func__);
+            return false;
+        }
+
+        struct ggml_tensor * new_text =
+            ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, out_d, T_ref);
+        ggml_set_name(new_text, "ref_text_emb");
+        struct ggml_tensor * new_audio =
+            ggml_new_tensor_2d(cache.ctx, GGML_TYPE_F32, out_d, T_prompt);
+        ggml_set_name(new_audio, "ref_audio_emb");
+
+        cache.buf = ggml_backend_alloc_ctx_tensors(cache.ctx, session.backend);
+        if (!cache.buf) {
+            fprintf(stderr, "%s: ggml_backend_alloc_ctx_tensors() for ref failed\n", __func__);
+            return false;
+        }
+
+        // Copy: split result (temp alloc) into two persistent tensors.
+        {
+            std::vector<uint8_t> tmp_buf(text_bytes);
+            ggml_backend_tensor_get(result, tmp_buf.data(), 0, text_bytes);
+            ggml_backend_tensor_set(new_text, tmp_buf.data(), 0, text_bytes);
+        }
+        {
+            std::vector<uint8_t> tmp_buf(audio_bytes);
+            ggml_backend_tensor_get(result, tmp_buf.data(), text_bytes, audio_bytes);
+            ggml_backend_tensor_set(new_audio, tmp_buf.data(), 0, audio_bytes);
+        }
+
+        // --- All steps succeeded: atomically publish the cache. Everything
+        //     past this point is a non-throwing pointer move. ---
+        session.ctx_ref       = cache.ctx;
+        session.buf_ref       = cache.buf;
+        session.ref_text_emb  = new_text;
+        session.ref_audio_emb = new_audio;
+        session.ref_T_ref     = T_ref;
+        session.ref_T_prompt  = T_prompt;
+        session.ref_model     = &model;
+        cache.ctx = nullptr;
+        cache.buf = nullptr;
+    } catch (const std::bad_alloc &) {
+        fprintf(stderr, "%s: out of memory (reference cache left unchanged)\n", __func__);
+        return false;
+    } catch (const std::length_error &) {
+        fprintf(stderr, "%s: input size too large (reference cache left unchanged)\n", __func__);
+        return false;
+    }
 
     fprintf(stderr, "%s: cached ref_text_emb {%lld, %lld}, ref_audio_emb {%lld, %lld}\n",
-            __func__, (long long) out_d, (long long) T_ref,
-                    (long long) out_d, (long long) T_prompt);
+            __func__, (long long) session.ref_text_emb->ne[0],  (long long) session.ref_T_ref,
+                    (long long) session.ref_audio_emb->ne[0], (long long) session.ref_T_prompt);
     return true;
 }
 

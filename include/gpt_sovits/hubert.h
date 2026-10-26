@@ -236,25 +236,27 @@ bool hubert_model_load(const std::string & fname, hubert_model & model, ggml_bac
 void hubert_model_free(hubert_model & model);
 
 // ---------------------------------------------------------------------------
-// Feature extraction (caller-normalized input)
+// Feature extraction (caller-provided waveform)
 // ---------------------------------------------------------------------------
 
 // Number of HuBERT output frames for a 16 kHz mono waveform of n_samples:
 // T' = 1 + (n_samples - 400) / 320 for n_samples >= 400, else 0.
 int64_t hubert_output_frames(int64_t n_samples);
 
-// Run full HuBERT feature extraction on an already-normalized waveform
+// Run full HuBERT feature extraction on a caller-provided waveform
 // (feature encoder -> projection -> positional conv -> 12-layer transformer),
 // encapsulating the standard ephemeral-graph compute sequence.
 //
-// Input normalization is NOT performed here. The caller must apply the
-// upstream Wav2Vec2FeatureExtractor preprocessing (zero mean, unit variance)
-// before calling; raw PCM would produce features that do not match the
-// reference pipeline.
+// The samples are consumed exactly as given: this function does NOT normalize,
+// resample, or pad the waveform. Callers that need the upstream
+// Wav2Vec2FeatureExtractor preprocessing (zero mean, unit variance) must apply
+// it before calling; otherwise the features will not match the reference
+// pipeline.
 //
 // Parameters:
 //   model      - loaded HuBERT model (weights read, not modified)
-//   pcm        - normalized 16 kHz mono waveform (F32), host pointer
+//   pcm        - mono waveform samples (F32) at the model's expected sample
+//                rate (16 kHz), host pointer
 //   n_samples  - number of waveform samples
 //   out        - caller-allocated destination (F32), ggml {768, T'} layout:
 //                out[t * 768 + c]
@@ -263,6 +265,22 @@ int64_t hubert_output_frames(int64_t n_samples);
 //
 // Input validation returns false rather than asserting.
 // Returns true on success.
+bool hubert_extract_features_from_pcm(const hubert_model & model,
+                                      const float        * pcm,
+                                      int64_t              n_samples,
+                                      float              * out,
+                                      int64_t              out_cap,
+                                      int64_t            * out_frames = nullptr);
+
+// Compatibility entry point preserving the original "caller-normalized" API
+// contract. Normalization is still NOT performed here; the caller must apply
+// the upstream Wav2Vec2FeatureExtractor preprocessing (zero mean, unit
+// variance) before calling. This is a thin proxy for
+// hubert_extract_features_from_pcm() and therefore produces identical results
+// for the same input samples.
+//
+// Parameters and return value are the same as
+// hubert_extract_features_from_pcm().
 bool hubert_extract_features_from_normalized_pcm(const hubert_model & model,
                                                  const float        * pcm,
                                                  int64_t              n_samples,

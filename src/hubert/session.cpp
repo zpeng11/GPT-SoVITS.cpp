@@ -2,9 +2,13 @@
 //
 // Host-side runner for full HuBERT feature extraction.
 //
-// The input waveform is expected to be already normalized (zero mean, unit
-// variance) by the caller, matching Wav2Vec2FeatureExtractor; this runner only
-// owns the graph construction and compute sequence.
+// hubert_extract_features_from_pcm() consumes the caller's waveform verbatim:
+// it owns only the graph construction and compute sequence and never
+// normalizes, resamples, or pads the input.
+//
+// hubert_extract_features_from_normalized_pcm() is kept as a compatibility
+// proxy for the historical "caller pre-normalized" contract; it delegates to
+// hubert_extract_features_from_pcm() without touching the samples.
 //
 // This wraps the same ephemeral-graph compute sequence used by
 // tests/hubert/test_hubert_parity.cpp: build a no-alloc context/graph, create
@@ -78,12 +82,12 @@ int64_t hubert_output_frames(int64_t n_samples) {
     return 1 + (n_samples - kHubertReceptiveField) / kHubertStrideProduct;
 }
 
-bool hubert_extract_features_from_normalized_pcm(const hubert_model & model,
-                                                 const float        * pcm,
-                                                 int64_t              n_samples,
-                                                 float              * out,
-                                                 int64_t              out_cap,
-                                                 int64_t            * out_frames)
+bool hubert_extract_features_from_pcm(const hubert_model & model,
+                                      const float        * pcm,
+                                      int64_t              n_samples,
+                                      float              * out,
+                                      int64_t              out_cap,
+                                      int64_t            * out_frames)
 {
     // --- Input validation: external errors return false, never assert. ---
     if (model.backend == nullptr) {
@@ -227,6 +231,20 @@ bool hubert_extract_features_from_normalized_pcm(const hubert_model & model,
         *out_frames = T;
     }
     return true;
+}
+
+bool hubert_extract_features_from_normalized_pcm(const hubert_model & model,
+                                                 const float        * pcm,
+                                                 int64_t              n_samples,
+                                                 float              * out,
+                                                 int64_t              out_cap,
+                                                 int64_t            * out_frames)
+{
+    // Compatibility proxy: the historical API only documents that normalization
+    // is the caller's responsibility. The runner has no normalization stage, so
+    // it simply forwards the samples unchanged.
+    return hubert_extract_features_from_pcm(model, pcm, n_samples, out, out_cap,
+                                            out_frames);
 }
 
 } // namespace gpt_sovits

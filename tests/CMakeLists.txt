@@ -184,6 +184,34 @@ gtest_discover_tests(test_text_frontend_bert_integration
     PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
 )
 
+set(GPTSOVITS_REFERENCE_CASE "" CACHE PATH "Local matched inference dump for CPU reference integration tests")
+
+add_executable(test_reference pipeline/test_reference.cpp)
+target_include_directories(test_reference PRIVATE ${CMAKE_SOURCE_DIR}/src/pipeline)
+target_link_libraries(test_reference PRIVATE gpt_sovits_cpp_static GTest::gtest_main)
+gtest_discover_tests(test_reference)
+
+add_executable(test_reference_integration
+    pipeline/test_reference_integration.cpp
+    ${COMMON_TEST_SOURCES}
+)
+target_include_directories(test_reference_integration PRIVATE
+    ${COMMON_TEST_INCLUDE_DIR}
+    ${CMAKE_SOURCE_DIR}/src/pipeline
+    ${CMAKE_SOURCE_DIR}/third_party/nlohmann/include
+)
+target_link_libraries(test_reference_integration PRIVATE gpt_sovits_cpp_static GTest::gtest_main)
+target_compile_definitions(test_reference_integration PRIVATE
+    PIPELINE_REFERENCE_CASE="${GPTSOVITS_REFERENCE_CASE}"
+    HUBERT_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/hubert/"
+    ROBERTA_MODEL_DIR="${CMAKE_CURRENT_SOURCE_DIR}/roberta/"
+    T2S_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/t2s/"
+    SOVITS_TEST_DIR="${CMAKE_CURRENT_SOURCE_DIR}/sovits/"
+)
+gtest_discover_tests(test_reference_integration
+    PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
+)
+
 add_executable(test_t2s_sovits_bridge
     ${CMAKE_CURRENT_SOURCE_DIR}/pipeline/test_t2s_sovits_bridge.cpp
     ${COMMON_TEST_SOURCES}

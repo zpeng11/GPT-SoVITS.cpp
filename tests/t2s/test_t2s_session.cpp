@@ -12,6 +12,7 @@
 #include "../../third_party/ggml/src/ggml-backend-impl.h"
 
 #include <cmath>
+#include <cstdint>
 #include <string>
 
 static const std::string kTestDir = T2S_TEST_DIR;
@@ -105,6 +106,35 @@ struct ErrorStats {
     double max_abs;
     double rmse;
     double mean_abs;
+};
+
+// Override a buffer type's allocator to fail the Nth allocation made while the
+// guard is alive. Tests run serially, so a single active override is enough.
+struct FailNthAllocation {
+    static inline int  calls    = 0;
+    static inline int  fail_on  = 0;
+    static inline decltype(ggml_backend_buffer_type_i::alloc_buffer) original = nullptr;
+
+    ggml_backend_buffer_type_t buft;
+    decltype(ggml_backend_buffer_type_i::alloc_buffer) saved;
+
+    FailNthAllocation(ggml_backend_buffer_type_t b, int nth)
+        : buft(b), saved(b->iface.alloc_buffer) {
+        original = saved;
+        calls    = 0;
+        fail_on  = nth;
+        buft->iface.alloc_buffer = [](ggml_backend_buffer_type_t bt, size_t size) -> ggml_backend_buffer_t {
+            ++FailNthAllocation::calls;
+            if (FailNthAllocation::calls == FailNthAllocation::fail_on) return nullptr;
+            return FailNthAllocation::original(bt, size);
+        };
+    }
+    ~FailNthAllocation() {
+        buft->iface.alloc_buffer = saved;
+        original = nullptr;
+    }
+    FailNthAllocation(const FailNthAllocation &) = delete;
+    FailNthAllocation & operator=(const FailNthAllocation &) = delete;
 };
 
 static ErrorStats compute_errors(const std::vector<float> & actual,
@@ -638,6 +668,172 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
     check_nonzero(ref_audio_emb, "ref_audio_emb");
 
     // Cleanup.
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SSession, ComputeRefEmbRejectsInvalidInput) {
+    ggml_backend_t backend = create_test_backend();
+    ASSERT_NE(backend, nullptr);
+
+    // Validation runs before the weights are touched, so a default model
+    // (hparams only) is enough for these cases.
+    gpt_sovits::t2s_model model;
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, 1, 16));
+
+    const int64_t T_ref = 2;
+    const int64_t T_hub = 4;
+    std::vector<int32_t> ref_tokens(T_ref, 1);
+    std::vector<float>   ref_bert(1024 * T_ref, 0.1f);
+    std::vector<float>   hubert(768 * T_hub, 0.5f);
+
+    auto call = [&](const int32_t * tok, int64_t tr,
+                    const float * bert, const float * hub, int64_t th) {
+        return gpt_sovits::t2s_session_compute_ref_emb(
+            session, model, tok, tr, bert, hub, th);
+    };
+
+    EXPECT_FALSE(call(nullptr, T_ref, ref_bert.data(), hubert.data(), T_hub));
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, nullptr, hubert.data(), T_hub));
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, ref_bert.data(), nullptr, T_hub));
+    EXPECT_FALSE(call(ref_tokens.data(), 0, ref_bert.data(), hubert.data(), T_hub));
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, ref_bert.data(), hubert.data(), 0));
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, ref_bert.data(), hubert.data(), 1));
+
+    // Absurd lengths must be rejected by the size checks, not by walking the
+    // token array or attempting an impossible allocation.
+    EXPECT_FALSE(call(ref_tokens.data(), INT64_MAX, ref_bert.data(), hubert.data(), T_hub));
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, ref_bert.data(), hubert.data(), INT64_MAX));
+
+    ref_tokens[0] = -1;
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, ref_bert.data(), hubert.data(), T_hub));
+
+    ref_tokens[0] = (int32_t) model.hparams.phoneme_vocab_size;
+    EXPECT_FALSE(call(ref_tokens.data(), T_ref, ref_bert.data(), hubert.data(), T_hub));
+
+    // An uninitialized session is rejected even with otherwise valid inputs.
+    {
+        gpt_sovits::t2s_session empty;
+        EXPECT_FALSE(gpt_sovits::t2s_session_compute_ref_emb(
+            empty, model, ref_tokens.data(), T_ref, ref_bert.data(), hubert.data(), T_hub));
+    }
+
+    // No failed call may leave a partial cache behind.
+    EXPECT_EQ(session.ctx_ref, nullptr);
+    EXPECT_EQ(session.buf_ref, nullptr);
+    EXPECT_EQ(session.ref_text_emb, nullptr);
+    EXPECT_EQ(session.ref_audio_emb, nullptr);
+    EXPECT_EQ(session.ref_T_ref, 0);
+    EXPECT_EQ(session.ref_T_prompt, 0);
+    EXPECT_EQ(session.ref_model, nullptr);
+
+    gpt_sovits::t2s_session_free(session);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SSession, ComputeRefEmbRejectsDuplicateAndPreservesCache) {
+    const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) GTEST_SKIP() << "Model file not found: " << path;
+    fclose(f);
+
+    ggml_backend_t backend = create_test_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_model model;
+    ASSERT_TRUE(gpt_sovits::t2s_model_load(path, model, backend));
+    if (model.weights.extract_latent.ssl_proj_w->ne[0] != 2) {
+        gpt_sovits::t2s_model_free(model);
+        ggml_backend_free(backend);
+        GTEST_SKIP() << "Model extract_latent weights have incompatible shape";
+    }
+
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, 1, 32));
+
+    const int64_t T_ref = 5;
+    const int64_t T_hub = 50;
+    std::vector<int32_t> ref_tokens(T_ref, 1);
+    std::vector<float>   ref_bert(1024 * T_ref, 0.1f);
+    std::vector<float>   hubert(768 * T_hub, 0.5f);
+
+    ASSERT_TRUE(gpt_sovits::t2s_session_compute_ref_emb(
+        session, model, ref_tokens.data(), T_ref,
+        ref_bert.data(), hubert.data(), T_hub));
+
+    auto * ctx_ref       = session.ctx_ref;
+    auto * buf_ref       = session.buf_ref;
+    auto * ref_text_emb  = session.ref_text_emb;
+    auto * ref_audio_emb = session.ref_audio_emb;
+    const int64_t T_prompt = session.ref_T_prompt;
+
+    // A second call is rejected and must not replace or free the cached state.
+    EXPECT_FALSE(gpt_sovits::t2s_session_compute_ref_emb(
+        session, model, ref_tokens.data(), 3,
+        ref_bert.data(), hubert.data(), 20));
+    EXPECT_EQ(session.ctx_ref, ctx_ref);
+    EXPECT_EQ(session.buf_ref, buf_ref);
+    EXPECT_EQ(session.ref_text_emb, ref_text_emb);
+    EXPECT_EQ(session.ref_audio_emb, ref_audio_emb);
+    EXPECT_EQ(session.ref_T_ref, T_ref);
+    EXPECT_EQ(session.ref_T_prompt, T_prompt);
+    EXPECT_EQ(session.ref_model, &model);
+
+    gpt_sovits::t2s_session_free(session);
+    gpt_sovits::t2s_model_free(model);
+    ggml_backend_free(backend);
+}
+
+TEST(T2SSession, ComputeRefEmbAllocationFailureLeavesStateClean) {
+    const std::string path = kTestDir + "models/s1v3-s2Gv2ProPlus-f16.gguf";
+    FILE * f = fopen(path.c_str(), "rb");
+    if (!f) GTEST_SKIP() << "Model file not found: " << path;
+    fclose(f);
+
+    ggml_backend_t backend = create_test_backend();
+    ASSERT_NE(backend, nullptr);
+
+    gpt_sovits::t2s_model model;
+    ASSERT_TRUE(gpt_sovits::t2s_model_load(path, model, backend));
+    if (model.weights.extract_latent.ssl_proj_w->ne[0] != 2) {
+        gpt_sovits::t2s_model_free(model);
+        ggml_backend_free(backend);
+        GTEST_SKIP() << "Model extract_latent weights have incompatible shape";
+    }
+
+    gpt_sovits::t2s_session session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.hparams, backend, 1, 32));
+
+    const int64_t T_ref = 4;
+    const int64_t T_hub = 16;
+    std::vector<int32_t> ref_tokens(T_ref, 1);
+    std::vector<float>   ref_bert(1024 * T_ref, 0.1f);
+    std::vector<float>   hubert(768 * T_hub, 0.5f);
+
+    {
+        // The first allocation belongs to the temporary graph allocator; the
+        // second is the persistent ref cache. Fail the latter.
+        FailNthAllocation failure(ggml_backend_get_default_buffer_type(backend), 2);
+        EXPECT_FALSE(gpt_sovits::t2s_session_compute_ref_emb(
+            session, model, ref_tokens.data(), T_ref,
+            ref_bert.data(), hubert.data(), T_hub));
+    }
+
+    EXPECT_EQ(session.ctx_ref, nullptr);
+    EXPECT_EQ(session.buf_ref, nullptr);
+    EXPECT_EQ(session.ref_text_emb, nullptr);
+    EXPECT_EQ(session.ref_audio_emb, nullptr);
+    EXPECT_EQ(session.ref_T_ref, 0);
+    EXPECT_EQ(session.ref_T_prompt, 0);
+    EXPECT_EQ(session.ref_model, nullptr);
+
+    // Failure must leave the session reusable.
+    EXPECT_TRUE(gpt_sovits::t2s_session_compute_ref_emb(
+        session, model, ref_tokens.data(), T_ref,
+        ref_bert.data(), hubert.data(), T_hub));
+
     gpt_sovits::t2s_session_free(session);
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
