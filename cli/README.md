@@ -78,7 +78,59 @@ sample; the known numeric relationship is documented in
 
 ## Tests
 
-`tests/cli/check_cli.cmake` plus the `cli_*` ctest entries cover the no-model
-paths: `--help`, missing required options, unreadable inputs, and a loader
+### No-model smoke tests
+
+`tests/cli/check_cli.cmake` plus the `cli_help`, `cli_missing_required_args`,
+`cli_bad_input_path` and `cli_loader_failure_keeps_output_absent` ctest entries
+cover `--help`, missing required options, unreadable inputs, and a loader
 failure that must not create the output file. They run with
 `-DGPTSOVITS_BUILD_TESTS=ON` and need no model assets.
+
+### Local CPU synthesis integration test
+
+`cli_synthesis_e2e` starts the real CLI with a v2Pro model pair and a local
+reference case. It checks successful exit, IEEE-float32/mono/32 kHz WAV format,
+complete finite non-degenerate samples, and agreement between the WAV and the
+CLI's code count, stop reason and sample count (`samples == codes * 1280`). It
+then repeats the command without `--overwrite`, requiring exit code 1, the
+existing-output diagnostic and byte-for-byte preservation of the first WAV.
+Only the first command performs synthesis.
+
+Place the same local models used by the pipeline integration tests at:
+
+- `tests/hubert/models/chinese-hubert-base-f32.gguf`
+- `tests/roberta/chinese-roberta-wwm-ext-large-f16.gguf`
+- `tests/t2s/models/s1v3-s2Gv2Pro-f16.gguf`
+- `tests/sovits/models/v2pro-sovits-f16.gguf`
+- `tests/sovits/models/sv-eres2netv2-f32.gguf`
+
+The case directory needs only `ref.wav`, `ref_frontend.json` and
+`target_frontend.json`; no Python process or `.npy` dumps are needed. Both JSONs
+must satisfy the CLI's v2 frontend contract, and the request must fit the
+1024-position budget with 100 new tokens. See the
+[pipeline local-case instructions](../tests/pipeline/README.md#local-matched-case)
+for preparing inputs. Keep private recordings, models and generated files out
+of Git.
+
+```sh
+cmake -S . -B build -DGPTSOVITS_BUILD_TESTS=ON -DGPTSOVITS_BUILD_CLI=ON \
+    -DGPTSOVITS_REFERENCE_CASE=/absolute/path/to/local-case
+# Also builds the CLI through an explicit target dependency.
+cmake --build build --target cli_synthesis_check -j 4
+ctest --test-dir build -R '^cli_synthesis_e2e$' --output-on-failure
+```
+
+The test uses greedy top-k 1, a 100-code limit, semantic seed 42, noise seed 7
+and noise scale 0.5. Either EOS or a correctly reported length limit is accepted;
+it does not require a fixed code count or Python waveform equality. These checks
+verify the user entry point and basic output validity, not listening quality,
+intelligibility or numerical parity with Python.
+
+An empty `GPTSOVITS_REFERENCE_CASE` reports **Skipped**. Once configured, missing
+or invalid assets fail the test rather than skipping. With CLI building disabled,
+the test and its checker target are not registered. The test has the `cpu` and
+`integration` labels and a 900-second timeout (600 seconds for synthesis).
+Each run uses its own directory under `build/tests/cli-synthesis/`, including an
+output filename with spaces. Successful runs clean up their directory; failed
+runs retain stdout/stderr logs and any output there, and report the directory
+in the failure message.

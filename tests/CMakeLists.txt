@@ -262,7 +262,7 @@ gtest_discover_tests(test_t2s_sovits_bridge
     PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
 )
 
-# CLI smoke tests (no model assets; argument and early-validation paths only).
+# CLI smoke tests and optional local CPU synthesis integration.
 if(TARGET gpt_sovits_cli)
     add_test(NAME cli_help COMMAND gpt_sovits_cli --help)
 
@@ -295,4 +295,23 @@ if(TARGET gpt_sovits_cli)
         --ref-frontend-json ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
         --target-frontend-json ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
         --output ${CMAKE_CURRENT_BINARY_DIR}/cli_loader_failure.wav)
+
+    add_executable(cli_synthesis_check cli/check_synthesis.cpp)
+    target_include_directories(cli_synthesis_check PRIVATE ${CMAKE_SOURCE_DIR}/third_party/dr_libs)
+    target_link_libraries(cli_synthesis_check PRIVATE gpt_sovits_cpp_static)
+    add_dependencies(cli_synthesis_check gpt_sovits_cli)
+
+    if("${GPTSOVITS_REFERENCE_CASE}" STREQUAL "")
+        add_test(NAME cli_synthesis_e2e COMMAND cli_synthesis_check --skip)
+        set_tests_properties(cli_synthesis_e2e PROPERTIES SKIP_RETURN_CODE 77)
+    else()
+        add_test(NAME cli_synthesis_e2e COMMAND ${CMAKE_COMMAND}
+            "-DCLI_BINARY=$<TARGET_FILE:gpt_sovits_cli>"
+            "-DWAV_CHECKER=$<TARGET_FILE:cli_synthesis_check>"
+            "-DREFERENCE_CASE=${GPTSOVITS_REFERENCE_CASE}"
+            "-DTEST_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DTEST_OUTPUT_DIR=${CMAKE_CURRENT_BINARY_DIR}/cli-synthesis"
+            -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_synthesis.cmake)
+    endif()
+    set_tests_properties(cli_synthesis_e2e PROPERTIES LABELS "cpu;integration" TIMEOUT 900)
 endif()
