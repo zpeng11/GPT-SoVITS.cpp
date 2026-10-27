@@ -69,3 +69,22 @@ The real-model tests are explicitly skipped without the variables or PyTorch.
 An explicitly configured but missing/invalid checkpoint fails the test rather
 than skipping. These checks compare loader outputs, not full real-model GGUF
 conversion; only the tiny synthetic models are converted in the default suite.
+
+## T2S decode reference exporter
+
+```sh
+python3 -m unittest discover -s python/tests -p test_t2s_reference_export.py -v
+```
+
+The exporter tests cover precomputed-input validation, the versioned manifest,
+file integrity, output protection and failure cleanup using NumPy and the
+standard library. `--help` and `--validate` are tested with PyTorch imports and
+network access blocked. With PyTorch installed, tiny deterministic models also
+compare incremental teacher-forced logits against a full causal forward and
+exercise checkpoint loading through the actual export CLI. Without PyTorch,
+only these numerical/CLI-export tests skip. No pretrained model or upstream
+checkout is needed by this suite.
+
+See [the T2S reference documentation](../../tests/t2s/README.md) for the explicit
+local-upstream export command and output layout. This is an offline reference
+tool; it does not add PyTorch to production inference or claim C++ parity.
