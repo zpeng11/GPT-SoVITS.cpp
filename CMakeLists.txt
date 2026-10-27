@@ -20,6 +20,7 @@ endforeach()
 # --- Project options ---
 option(GPTSOVITS_BUILD_SHARED "Build shared library" ON)
 option(GPTSOVITS_BUILD_STATIC "Build static library" ON)
+option(GPTSOVITS_BUILD_CLI    "Build CLI executable" ON)
 option(GPTSOVITS_BUILD_TESTS  "Build tests"          OFF)
 
 # --- ggml submodule ---
@@ -35,6 +36,11 @@ add_subdirectory(third_party/ggml)
 
 # --- Project sources ---
 add_subdirectory(src)
+
+# --- CLI executable ---
+if(GPTSOVITS_BUILD_CLI)
+    add_subdirectory(cli)
+endif()
 
 # --- Tests ---
 if(GPTSOVITS_BUILD_TESTS)

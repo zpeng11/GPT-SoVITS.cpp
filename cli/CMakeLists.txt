@@ -1,2 +1,3 @@
-# CLI executable — to be implemented.
-# Will link against gpt_sovits_cpp_static and provide the main inference loop.
+# CLI executable: single-request offline CPU synthesis over the public API.
+add_executable(gpt_sovits_cli main.cpp)
+target_link_libraries(gpt_sovits_cli PRIVATE gpt_sovits_cpp_static)

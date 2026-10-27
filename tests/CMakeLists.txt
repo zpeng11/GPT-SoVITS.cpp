@@ -261,3 +261,38 @@ target_compile_definitions(test_t2s_sovits_bridge PRIVATE
 gtest_discover_tests(test_t2s_sovits_bridge
     PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
 )
+
+# CLI smoke tests (no model assets; argument and early-validation paths only).
+if(TARGET gpt_sovits_cli)
+    add_test(NAME cli_help COMMAND gpt_sovits_cli --help)
+
+    add_test(NAME cli_missing_required_args COMMAND gpt_sovits_cli)
+    set_tests_properties(cli_missing_required_args PROPERTIES WILL_FAIL TRUE)
+
+    add_test(NAME cli_bad_input_path COMMAND gpt_sovits_cli
+        --hubert /nonexistent/hubert.gguf
+        --t2s /nonexistent/t2s.gguf
+        --sovits /nonexistent/sovits.gguf
+        --sv /nonexistent/sv.gguf
+        --ref-audio /nonexistent/ref.wav
+        --ref-frontend-json /nonexistent/ref.json
+        --target-frontend-json /nonexistent/target.json
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_bad_input_path.wav)
+    set_tests_properties(cli_bad_input_path PROPERTIES WILL_FAIL TRUE)
+
+    # A non-GGUF --hubert passes the early path checks and fails inside
+    # hubert_model_load after the CPU backend is up: the CLI must exit 1
+    # without creating the output file.
+    add_test(NAME cli_loader_failure_keeps_output_absent
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_cli.cmake
+        1 ${CMAKE_CURRENT_BINARY_DIR}/cli_loader_failure.wav
+        $<TARGET_FILE:gpt_sovits_cli>
+        --hubert ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
+        --t2s ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
+        --sovits ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
+        --sv ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
+        --ref-audio ${CMAKE_CURRENT_SOURCE_DIR}/hubert/Narsil.asr_dummy.4.flac
+        --ref-frontend-json ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
+        --target-frontend-json ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_loader_failure.wav)
+endif()

@@ -1,5 +1,6 @@
 # Build
 build/
+build-cli/
 cmake-build-*/
 
 # Compiled
