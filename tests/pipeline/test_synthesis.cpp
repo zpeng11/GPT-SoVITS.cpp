@@ -1,8 +1,9 @@
 // tests/pipeline/test_synthesis.cpp
 //
 // Contract tests for src/pipeline/synthesis_internal.h.  Covers the slot
-// budget, config and codebook validators without any model weights, plus the
-// generate/decode immediate-EOS and pre-compute input rejection paths.
+// budget, config, codebook and models validators without any model weights,
+// plus the generate/decode immediate-EOS and pre-compute input rejection
+// paths.
 //
 // A real SoVITS graph is never built.  Max-length success, SoVITS failure and
 // the public synthesize_cpu failure-injection ordering are left to the
@@ -12,8 +13,11 @@
 
 #include <gtest/gtest.h>
 
+#include "gpt_sovits/hubert.h"
 #include "gpt_sovits/pipeline.h"
+#include "gpt_sovits/roberta.h"
 #include "gpt_sovits/sovits.h"
+#include "gpt_sovits/sv.h"
 #include "gpt_sovits/t2s.h"
 
 #include "../../src/pipeline/synthesis_internal.h"
@@ -252,6 +256,301 @@ TEST_F(CodebookValidation, TypeShapeContiguityAndNullRejected) {
     rejects(GGML_TYPE_F32, GGML_TYPE_F16, kCodeDim - 1, kCodeCount, false);
     rejects(GGML_TYPE_F32, GGML_TYPE_F16, kCodeDim, kCodeCount - 1, false);
     rejects(GGML_TYPE_F32, GGML_TYPE_F16, kCodeDim, kCodeCount, true);  // strides
+}
+
+// ===========================================================================
+// validate_synthesis_models
+// ===========================================================================
+
+// Minimal loaded-model stand-in: a ggml context with one tensor allocated
+// onto a backend buffer, so ctx_w/buf_w satisfy the loaded-on checks.
+static bool init_weight_slot(ggml_context *& ctx, ggml_backend_buffer_t & buf,
+                             ggml_backend_t backend) {
+    ggml_init_params p = {ggml_tensor_overhead() * 2, nullptr, true};
+    ctx = ggml_init(p);
+    if (!ctx) return false;
+    ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 1);
+    buf = ggml_backend_alloc_ctx_tensors(ctx, backend);
+    return buf != nullptr;
+}
+
+static void fill_matched_tensors(ggml_tensor * f32_t, ggml_tensor * f16_t) {
+    const size_t n = (size_t) (kCodeDim * kCodeCount);
+    std::vector<float> values(n);
+    std::vector<ggml_fp16_t> half(n);
+    for (size_t i = 0; i < n; ++i) {
+        values[i] = (float) ((int) (i % 2001) - 1000) * 0.001f;
+        half[i] = ggml_fp32_to_fp16(values[i]);
+    }
+    ggml_backend_tensor_set(f32_t, values.data(), 0, n * sizeof(float));
+    ggml_backend_tensor_set(f16_t, half.data(), 0, n * sizeof(ggml_fp16_t));
+}
+
+class ModelsValidation : public ::testing::Test {
+protected:
+    void SetUp() override {
+        backend = ggml_backend_cpu_init();
+        ASSERT_NE(backend, nullptr);
+        other_backend = ggml_backend_cpu_init();
+        ASSERT_NE(other_backend, nullptr);
+
+        ASSERT_TRUE(init_weight_slot(hubert_state.ctx_w, hubert_state.buf_w, backend));
+        hubert_state.backend = backend;
+        ASSERT_TRUE(init_weight_slot(roberta_state.ctx_w, roberta_state.buf_w, backend));
+        roberta_state.backend = backend;
+
+        // T2S hparams defaults already carry the v2 vocabulary
+        // (phoneme 732 / eos 1024 / semantic 1025).
+        t2s_state.backend = backend;
+        ggml_init_params tp = {ggml_tensor_overhead() * 12, nullptr, true};
+        t2s_state.ctx_w = ggml_init(tp);
+        ASSERT_NE(t2s_state.ctx_w, nullptr);
+        ggml_context * tc = t2s_state.ctx_w;
+        auto & el = t2s_state.weights.extract_latent;
+        el.ssl_proj_w  = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 2, 768, 768);
+        ssl_bad_kernel = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 3, 768, 768);
+        ssl_bad_in     = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 2, 767, 768);
+        ssl_bad_out    = ggml_new_tensor_3d(tc, GGML_TYPE_F32, 2, 768, 767);
+        el.ssl_proj_b  = ggml_new_tensor_1d(tc, GGML_TYPE_F32, 768);
+        ssl_bias_bad   = ggml_new_tensor_1d(tc, GGML_TYPE_F32, 767);
+        auto & em = t2s_state.weights.embed;
+        em.text_embedding = ggml_new_tensor_2d(tc, GGML_TYPE_F32, 4, 732);
+        t2s_text_bad      = ggml_new_tensor_2d(tc, GGML_TYPE_F32, 4, 731);
+        el.codebook       = ggml_new_tensor_2d(tc, GGML_TYPE_F32, kCodeDim, kCodeCount);
+        t2s_state.buf_w = ggml_backend_alloc_ctx_tensors(tc, backend);
+        ASSERT_NE(t2s_state.buf_w, nullptr);
+
+        sovits_state.backend = backend;
+        sovits_state.hparams.is_v2pro = true;
+        sovits_state.hparams.semantic_frame_rate_25hz = true;
+        sovits_state.hparams.gin_channels = 1024;
+        ggml_init_params sp = {ggml_tensor_overhead() * 8, nullptr, true};
+        sovits_state.ctx_w = ggml_init(sp);
+        ASSERT_NE(sovits_state.ctx_w, nullptr);
+        ggml_context * sc = sovits_state.ctx_w;
+        sovits_state.generator.conv_pre.w =
+            ggml_new_tensor_3d(sc, GGML_TYPE_F32, 1, 512, 1);
+        conv_pre_bad = ggml_new_tensor_3d(sc, GGML_TYPE_F32, 1, 511, 1);
+        sovits_state.text_encoder.text.text_embedding =
+            ggml_new_tensor_2d(sc, GGML_TYPE_F32, 192, 732);
+        sovits_text_bad = ggml_new_tensor_2d(sc, GGML_TYPE_F32, 192, 731);
+        sovits_state.quantizer.codebook =
+            ggml_new_tensor_2d(sc, GGML_TYPE_F16, kCodeDim, kCodeCount);
+        sovits_state.buf_w = ggml_backend_alloc_ctx_tensors(sc, backend);
+        ASSERT_NE(sovits_state.buf_w, nullptr);
+
+        sv_state.backend = backend;
+        ASSERT_TRUE(init_weight_slot(sv_state.ctx_w, sv_state.buf_w, backend));
+        ASSERT_TRUE(init_weight_slot(sv_state.ctx_bn, sv_state.buf_bn, backend));
+
+        fill_matched_tensors(t2s_state.weights.extract_latent.codebook,
+                             sovits_state.quantizer.codebook);
+    }
+
+    void TearDown() override {
+        free_slot(sv_state.ctx_bn, sv_state.buf_bn);
+        free_slot(sv_state.ctx_w, sv_state.buf_w);
+        free_slot(sovits_state.ctx_w, sovits_state.buf_w);
+        free_slot(t2s_state.ctx_w, t2s_state.buf_w);
+        free_slot(roberta_state.ctx_w, roberta_state.buf_w);
+        free_slot(hubert_state.ctx_w, hubert_state.buf_w);
+        if (other_backend) ggml_backend_free(other_backend);
+        if (backend) ggml_backend_free(backend);
+    }
+
+    gs::synthesis_models models() {
+        gs::synthesis_models m;
+        m.hubert = &hubert_state;
+        m.roberta = &roberta_state;
+        m.t2s = &t2s_state;
+        m.sovits = &sovits_state;
+        m.sv = &sv_state;
+        return m;
+    }
+
+    // Validates the current fixture state and asserts a diagnostic substring.
+    void rejects(const char * expect) {
+        std::string err = "stale";
+        EXPECT_FALSE(gs::pipeline_detail::validate_synthesis_models(models(), &err));
+        EXPECT_NE(err.find(expect), std::string::npos) << err;
+    }
+
+    ggml_backend_t backend = nullptr;
+    ggml_backend_t other_backend = nullptr;
+    gs::hubert_model hubert_state{};
+    gs::roberta_model roberta_state{};
+    gs::t2s_model t2s_state{};
+    gs::sovits_model sovits_state{};
+    gs::sv_model sv_state{};
+
+    // Rejected tensor variants kept alive for pointer swaps.
+    ggml_tensor * ssl_bad_kernel = nullptr;
+    ggml_tensor * ssl_bad_in = nullptr;
+    ggml_tensor * ssl_bad_out = nullptr;
+    ggml_tensor * ssl_bias_bad = nullptr;
+    ggml_tensor * t2s_text_bad = nullptr;
+    ggml_tensor * conv_pre_bad = nullptr;
+    ggml_tensor * sovits_text_bad = nullptr;
+
+private:
+    static void free_slot(ggml_context *& ctx, ggml_backend_buffer_t & buf) {
+        if (buf) ggml_backend_buffer_free(buf);
+        if (ctx) ggml_free(ctx);
+        buf = nullptr;
+        ctx = nullptr;
+    }
+};
+
+TEST_F(ModelsValidation, AcceptsFullyLoadedV2ProSet) {
+    std::string err = "stale";
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_models(models(), &err));
+    EXPECT_TRUE(err.empty());
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_models(models(), nullptr));
+
+    gs::synthesis_models m = models();
+    m.roberta = nullptr;  // pure-English requests need no RoBERTa
+    err = "stale";
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_models(m, &err));
+    EXPECT_TRUE(err.empty());
+}
+
+TEST_F(ModelsValidation, MissingModelsRejected) {
+    gs::synthesis_models m = models();
+    auto rejects_null = [&](const char * expect) {
+        std::string err = "stale";
+        EXPECT_FALSE(gs::pipeline_detail::validate_synthesis_models(m, &err));
+        EXPECT_NE(err.find(expect), std::string::npos) << err;
+    };
+    const char * const kMessage = "requires HuBERT, T2S, SoVITS and SV";
+
+    m.hubert = nullptr;
+    rejects_null(kMessage);
+    m = models();
+    m.t2s = nullptr;
+    rejects_null(kMessage);
+    m = models();
+    m.sovits = nullptr;
+    rejects_null(kMessage);
+    m = models();
+    m.sv = nullptr;
+    rejects_null(kMessage);
+}
+
+TEST_F(ModelsValidation, PartialLoadsAndMixedBackendsRejected) {
+    ggml_context * ctx = t2s_state.ctx_w;
+    t2s_state.ctx_w = nullptr;
+    rejects("one CPU backend");
+    t2s_state.ctx_w = ctx;
+
+    ggml_backend_buffer_t buf = sovits_state.buf_w;
+    sovits_state.buf_w = nullptr;
+    rejects("one CPU backend");
+    sovits_state.buf_w = buf;
+
+    ggml_backend_t hb = hubert_state.backend;
+    hubert_state.backend = nullptr;
+    rejects("one CPU backend");
+    hubert_state.backend = hb;
+
+    ggml_context * bn = sv_state.ctx_bn;
+    sv_state.ctx_bn = nullptr;
+    rejects("one CPU backend");
+    sv_state.ctx_bn = bn;
+
+    ggml_backend_buffer_t bnb = sv_state.buf_bn;
+    sv_state.buf_bn = nullptr;
+    rejects("one CPU backend");
+    sv_state.buf_bn = bnb;
+
+    // A second CPU backend instance is still a foreign backend.
+    sovits_state.backend = other_backend;
+    rejects("one CPU backend");
+    sovits_state.backend = backend;
+
+    roberta_state.backend = other_backend;
+    rejects("one CPU backend");
+    roberta_state.backend = backend;
+}
+
+TEST_F(ModelsValidation, WrongSovitsProfileRejected) {
+    sovits_state.hparams.is_v2pro = false;
+    rejects("v2Pro 25 Hz");
+    sovits_state.hparams.is_v2pro = true;
+
+    sovits_state.hparams.semantic_frame_rate_25hz = false;
+    rejects("v2Pro 25 Hz");
+    sovits_state.hparams.semantic_frame_rate_25hz = true;
+
+    sovits_state.hparams.gin_channels = 512;
+    rejects("v2Pro 25 Hz");
+    sovits_state.hparams.gin_channels = 1024;
+
+    ggml_tensor * conv = sovits_state.generator.conv_pre.w;
+    sovits_state.generator.conv_pre.w = nullptr;
+    rejects("v2Pro 25 Hz");
+    sovits_state.generator.conv_pre.w = conv_pre_bad;  // in_channels 511
+    rejects("v2Pro 25 Hz");
+    sovits_state.generator.conv_pre.w = conv;
+}
+
+TEST_F(ModelsValidation, WrongT2SVocabularyRejected) {
+    t2s_state.hparams.phoneme_vocab_size = 731;
+    rejects("v2 vocabulary 732");
+    t2s_state.hparams.phoneme_vocab_size = 732;
+
+    t2s_state.hparams.eos = 1023;
+    rejects("v2 vocabulary 732");
+    t2s_state.hparams.eos = 1024;
+
+    t2s_state.hparams.vocab_size = 1024;
+    rejects("v2 vocabulary 732");
+    t2s_state.hparams.vocab_size = 1025;
+}
+
+TEST_F(ModelsValidation, TextEmbeddingMismatchRejected) {
+    ggml_tensor * t2s_text = t2s_state.weights.embed.text_embedding;
+    ggml_tensor * sovits_text = sovits_state.text_encoder.text.text_embedding;
+
+    t2s_state.weights.embed.text_embedding = nullptr;
+    rejects("text embeddings");
+    t2s_state.weights.embed.text_embedding = t2s_text_bad;  // 731 entries
+    rejects("text embeddings");
+    t2s_state.weights.embed.text_embedding = t2s_text;
+
+    sovits_state.text_encoder.text.text_embedding = nullptr;
+    rejects("text embeddings");
+    sovits_state.text_encoder.text.text_embedding = sovits_text_bad;  // 731
+    rejects("text embeddings");
+    sovits_state.text_encoder.text.text_embedding = sovits_text;
+}
+
+TEST_F(ModelsValidation, BadSslProjRejected) {
+    auto & el = t2s_state.weights.extract_latent;
+    ggml_tensor * w = el.ssl_proj_w;
+    ggml_tensor * b = el.ssl_proj_b;
+
+    el.ssl_proj_w = nullptr;
+    rejects("ssl_proj");
+    el.ssl_proj_w = ssl_bad_kernel;  // kernel 3
+    rejects("ssl_proj");
+    el.ssl_proj_w = ssl_bad_in;      // 767 input channels
+    rejects("ssl_proj");
+    el.ssl_proj_w = ssl_bad_out;     // 767 output channels
+    rejects("ssl_proj");
+    el.ssl_proj_w = w;
+
+    el.ssl_proj_b = nullptr;
+    rejects("ssl_proj");
+    el.ssl_proj_b = ssl_bias_bad;    // 767 elements
+    rejects("ssl_proj");
+    el.ssl_proj_b = b;
+}
+
+TEST_F(ModelsValidation, CodebookRejectionPropagates) {
+    ggml_tensor * book = t2s_state.weights.extract_latent.codebook;
+    t2s_state.weights.extract_latent.codebook = nullptr;
+    rejects("T2S and SoVITS codebooks");
+    t2s_state.weights.extract_latent.codebook = book;
 }
 
 TEST(SynthesizeCpuPublic, InvalidRequestsPreserveResult) {
