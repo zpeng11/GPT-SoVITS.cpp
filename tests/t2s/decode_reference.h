@@ -164,7 +164,7 @@ struct npy_header {
     uint64_t count = 0;
 };
 
-inline npy_header parse_npy_header(const fs::path & path, uint64_t file_size) {
+inline npy_header parse_npy_header(const fs::path & path, uint64_t file_size, bool allow_zero = false) {
     const std::string where = path.string();
     std::ifstream in(path, std::ios::binary);
     if (!in) fail(where, "cannot open file");
@@ -250,7 +250,11 @@ inline npy_header parse_npy_header(const fs::path & path, uint64_t file_size) {
 
     uint64_t count = 1;
     for (uint64_t dim : shape) {
-        if (dim == 0) fail(where, "zero-sized arrays are not supported");
+        if (dim == 0) {
+            if (!allow_zero) fail(where, "zero-sized arrays are not supported");
+            count = 0;
+            continue;
+        }
         if (count > (kMaxArrayBytes / 4) / dim) fail(where, "array is too large");
         count *= dim;
     }
@@ -268,7 +272,7 @@ inline void require_regular(const fs::path & path, const std::string & where) {
 
 template <typename T>
 inline void load_npy(const fs::path & path, bool want_float, const std::vector<int64_t> & expected_shape,
-                     std::vector<T> & out) {
+                     std::vector<T> & out, bool allow_zero = false) {
     const std::string where = path.string();
     require_regular(path, where);
     std::error_code ec;
@@ -276,7 +280,7 @@ inline void load_npy(const fs::path & path, bool want_float, const std::vector<i
     if (ec) fail(where, "cannot read file size: " + ec.message());
     if (size > kMaxArrayBytes + kMaxHeaderBytes + 12) fail(where, "file is too large");
     const uint64_t file_size = static_cast<uint64_t>(size);
-    const npy_header header = parse_npy_header(path, file_size);
+    const npy_header header = parse_npy_header(path, file_size, allow_zero);
 
     if (header.float32 != want_float) {
         fail(where, "dtype '" + header.descr + "' does not match expected " +
@@ -297,11 +301,13 @@ inline void load_npy(const fs::path & path, bool want_float, const std::vector<i
     if (sizeof(T) != 4) fail(where, "unsupported element size");
 
     out.resize(static_cast<size_t>(header.count));
-    std::ifstream in(path, std::ios::binary);
-    if (!in) fail(where, "cannot open file");
-    in.seekg(static_cast<std::streamoff>(header.data_offset));
-    in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(bytes));
-    if (!in || static_cast<uint64_t>(in.gcount()) != bytes) fail(where, "failed to read array data");
+    if (bytes != 0) {
+        std::ifstream in(path, std::ios::binary);
+        if (!in) fail(where, "cannot open file");
+        in.seekg(static_cast<std::streamoff>(header.data_offset));
+        in.read(reinterpret_cast<char *>(out.data()), static_cast<std::streamsize>(bytes));
+        if (!in || static_cast<uint64_t>(in.gcount()) != bytes) fail(where, "failed to read array data");
+    }
     if constexpr (std::is_same<T, float>::value) {
         for (size_t i = 0; i < out.size(); ++i) {
             if (!std::isfinite(out[i])) fail(where, "contains a non-finite float at index " + std::to_string(i));
@@ -507,6 +513,7 @@ struct array_spec {
     std::string name;
     bool float32 = false;
     std::vector<int64_t> shape;
+    bool allow_zero = false;
 };
 
 inline std::vector<array_spec> make_specs(const dimensions & dims, const gpt_sovits::t2s_hparams & hparams) {
@@ -585,7 +592,13 @@ inline void check_budget(const std::vector<array_spec> & specs) {
     for (const array_spec & spec : specs) {
         uint64_t count = 1;
         for (int64_t dim : spec.shape) {
-            if (dim <= 0) fail("manifest.arrays." + spec.name + ".npy", "shape dimensions must be positive");
+            if (dim < 0 || (dim == 0 && !spec.allow_zero)) {
+                fail("manifest.arrays." + spec.name + ".npy", "shape dimensions must be positive");
+            }
+            if (dim == 0) {
+                count = 0;
+                continue;
+            }
             const uint64_t d = static_cast<uint64_t>(dim);
             if (count > (kMaxArrayBytes / 4) / d) fail("manifest.arrays." + spec.name + ".npy", "array is too large");
             count *= d;

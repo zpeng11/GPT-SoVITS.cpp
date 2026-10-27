@@ -188,7 +188,9 @@ skip if PyTorch is unavailable.
 The exporter and its own tests do not establish C++ numerical parity. The
 optional C++ comparison below supplies that separate check. Neither suite claims
 sampled-sequence equality, waveform parity, intelligibility, or listening quality.
-Existing tracked `ref/*.npy` files are not overwritten.
+Existing tracked `ref/*.npy` files are not overwritten. The separate matched-policy
+generation regression at the end of this document checks closed-loop semantic
+codes under an explicitly restricted policy, not the upstream UI's defaults.
 
 ## Optional C++ CPU decode comparison
 
@@ -260,3 +262,117 @@ logit gap was about `0.114`, well above the observed numerical error; the tests
 assert exact argmax agreement and print the gap on failure. Thresholds are
 component-specific CPU F32 budgets, not tolerances for F16/quantized weights,
 quantized KV, other backends or arbitrary model architectures.
+
+## Matched-policy closed-loop generation
+
+`--generate` exports a **separate** `gpt-sovits-t2s-generation-reference/v1`
+reference using the same trusted upstream model and CPU/F32 execution. The
+forward is upstream code; the small outer loop explicitly implements the C++
+policy rather than calling `infer_panel` or replaying a UI-generated sequence.
+It does not read `generated_codes.npy`.
+
+The restricted policy is top-k 1, top-p 1, temperature 1, with a finite positive
+F32 repetition penalty. Seen tokens are a binary set of **accepted generated
+codes only**, excluding the prompt. A seen negative logit is multiplied by the
+penalty; a nonnegative logit is scaled by its F32 reciprocal. The maximum
+adjusted logit supplies the candidate. EOS is never masked and is tested before
+acceptance; a length-limit stop retains the last accepted code. Top-k 1 removes
+cross-language random-number differences; exact ties are not a portable sampling
+oracle and should be avoided when preparing cases.
+
+This deliberately differs from the upstream UI: its early EOS suppression,
+prompt-inclusive repetition history and raw-logit EOS test are not reproduced.
+Changing the production sampler's defaults or establishing stochastic sampling
+parity is outside this regression's scope.
+
+### Export and run
+
+Use the same checkpoint/upstream/precomputed inputs as above. `--reference-phones`
+is the number of reference phones at the start of all-phones; the rest must be
+nonempty target text. There is no automatic split inferred from text or filenames.
+Both modes require `N + max_new_tokens - 1 <= 1024`.
+
+```sh
+python3 tests/t2s/generate_reference.py --generate \
+  --checkpoint /path/to/s1v3.ckpt --upstream-root /path/to/GPT-SoVITS \
+  --inputs-dir /path/to/precomputed-case --reference-phones 44 \
+  --max-new-tokens 200 --repetition-penalty 1.0 \
+  --output-dir tests/t2s/out/generation-reference/rp1
+python3 tests/t2s/generate_reference.py --generate \
+  --checkpoint /path/to/s1v3.ckpt --upstream-root /path/to/GPT-SoVITS \
+  --inputs-dir /path/to/precomputed-case --reference-phones 44 \
+  --max-new-tokens 200 --repetition-penalty 1.35 \
+  --output-dir tests/t2s/out/generation-reference/rp135
+python3 tests/t2s/generate_reference.py --validate tests/t2s/out/generation-reference/rp1
+python3 tests/t2s/generate_reference.py --validate tests/t2s/out/generation-reference/rp135
+
+cmake -S . -B build -DGPTSOVITS_BUILD_TESTS=ON \
+  -DGPTSOVITS_T2S_GENERATION_REFERENCE="$PWD/tests/t2s/out/generation-reference" \
+  -DGPTSOVITS_T2S_DECODE_MODEL="$PWD/tests/t2s/out/t2s-f32.gguf"
+cmake --build build --target test_t2s_generation_reference_contract test_t2s_generation_reference -j 4
+ctest --test-dir build -R '^T2SGenerationReference' --output-on-failure
+python3 -m unittest discover -s python/tests -p test_t2s_generation_reference.py -v
+```
+
+Use the isolated environment described above for exporting if needed; `--validate`
+and NumPy-only tool tests need neither torch nor upstream imports. `--generate`
+cannot be combined with `--steps`; generation policy flags are rejected without
+`--generate`. Existing teacher-forced commands and schema remain unchanged.
+
+`GPTSOVITS_T2S_GENERATION_REFERENCE` defaults to empty (two numerical tests skip).
+Once configured, missing/invalid `rp1` or `rp135` cases, incompatible/F16 model
+weights or a missing model fail. CTest never runs Python, installs dependencies or
+downloads models. Numerical tests are CPU/F32, labeled `cpu;integration`, with a
+300-second timeout. The same-source-model requirement and separate Python hash
+validation apply as for the teacher-forced comparison.
+
+### Generation artifact contract
+
+The manifest adds `policy` and `stop_reason` instead of the teacher-forced
+`semantics` field. Dimensions record total/reference/target text, prompt,
+prefill N, accepted codes C, and decisions D. Source hashes identify only the
+three actual input files (all-phones, all-BERT and prompt), in addition to the
+checkpoint, exporter, loader and upstream sources. No private text, absolute
+paths or timestamps are recorded in the manifest.
+
+| Array | C-order shape | Dtype |
+| --- | --- | --- |
+| `phones.npy`, `bert.npy`, `prompt.npy` | `[T]`, `[T,1024]`, `[P]` | int32 / float32 / int32 |
+| `prefill_input.npy` | `[N,H]` | float32 |
+| `codes.npy` | `[C]` (possibly empty) | int32 |
+| `logits.npy` | `[D,V]` before penalties/filtering | float32 |
+| `selected.npy`, `context_lengths.npy` | `[D]`, `[D]` | int32 |
+
+EOS stops have `D=C+1`, with one final unaccepted EOS selection. Length-limit
+stops have `C=D=max_new_tokens`, with no EOS decision. Context lengths are
+`N..N+D-1`. The validator recomputes every selection from raw logits and the
+binary generated-only history; it also checks codes/decision/stop consistency,
+layout, IDs, finite values and file hashes. Empty codes are valid only for
+immediate EOS; the C++ NPY reader permits zero length explicitly for that array,
+not for ordinary decode inputs.
+
+The C++ integration test installs exported reference-text and prompt embeddings
+in a session-owned reference cache. It sends **target** phones/BERT to public
+`t2s_session_generate`, covering real target embedding, host concatenation,
+prefill, persistent decode, sampler state and stopping. It asserts exact codes
+and stop reason, then verifies a short-budget prefix retains every accepted code
+and a second seed reproduces the full result using the same decode graph. Slot
+release and byte-identical reference caches are checked after every call.
+Reference audio encoding, the text frontend, HuBERT, SV, SoVITS and WAV output are
+not run here; this is not an audio-quality or raw-text-to-speech test.
+
+### Observed generation baseline
+
+On the same local CPU/F32 case (44 reference phones, 22 target phones, 136 prompt
+codes, maximum 200), independent exports were byte-identical for both policies:
+
+| Repetition penalty | Accepted codes | Decisions | Stop reason | Smallest adjusted top-2 gap |
+| --- | ---: | ---: | --- | ---: |
+| 1.0 | 200 | 200 | `max_new_tokens` | `0.0403` |
+| 1.35 | 74 | 75 | `eos` | `0.00820` |
+
+Both public API tests matched the full sequence and stop exactly, including
+short-budget and same-session repeat checks. The no-penalty limit is reported
+as a limit, not as successful natural termination. These observations do not
+imply other inputs will stop at the same lengths or that the UI's different
+policy will generate the same sequence.

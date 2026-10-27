@@ -88,3 +88,15 @@ checkout is needed by this suite.
 See [the T2S reference documentation](../../tests/t2s/README.md) for the explicit
 local-upstream export command and output layout. This is an offline reference
 tool; it does not add PyTorch to production inference or claim C++ parity.
+
+The matched-policy closed-loop mode has a separate test suite:
+
+```sh
+python3 -m unittest discover -s python/tests -p test_t2s_generation_reference.py -v
+```
+
+It reuses the tiny model fixtures to check self-feedback, generated-only binary
+repetition history, EOS/length-limit behavior, independent full-forward logits,
+manifest validation and cross-process export identity. NumPy-only validation and
+CLI rejection tests still run without PyTorch; model computation tests skip when
+it is absent. This is not a comparison with the upstream UI's sampling defaults.

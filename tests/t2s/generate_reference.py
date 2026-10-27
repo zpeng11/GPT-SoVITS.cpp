@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export local upstream CPU/F32 T2S teacher-forced decode references.
+"""Export local upstream CPU/F32 T2S decode or matched-policy greedy references.
 
 No sampling, audio processing, downloads or production-runtime changes. Export
 requires PyTorch and a trusted upstream GPT-SoVITS checkout and its dependencies;
@@ -24,6 +24,7 @@ import tempfile
 import numpy as np
 
 SCHEMA = "gpt-sovits-t2s-decode-reference/v1"
+GEN_SCHEMA = "gpt-sovits-t2s-generation-reference/v1"
 CONTEXT_LIMIT = 1024
 INPUT_FILES = (
     "t2s_all_phones.npy", "t2s_all_bert.npy", "t2s_prompt.npy", "generated_codes.npy",
@@ -92,10 +93,8 @@ def token_vector(array, name, *, generated=False):
     return np.ascontiguousarray(array, dtype="<i4")
 
 
-def load_inputs(directory, steps, hparams):
+def text_inputs(directory, hparams):
     validate_hparams(hparams)
-    positive_int(steps, "steps")
-    require(steps < CONTEXT_LIMIT, "steps exceeds the 1024-position context budget")
     directory = Path(directory)
     phones = token_vector(load_npy(directory / INPUT_FILES[0]), "phones")
     bert = load_npy(directory / INPUT_FILES[1])
@@ -105,19 +104,32 @@ def load_inputs(directory, steps, hparams):
     require(bert.shape == (1024, phones.size), "BERT must have shape [1024,T] or [1,1024,T]")
     require(np.isfinite(bert).all(), "BERT contains non-finite values")
     prompt = token_vector(load_npy(directory / INPUT_FILES[2]), "prompt")
-    codes = token_vector(load_npy(directory / INPUT_FILES[3]), "generated_codes", generated=True)
-    require(codes.size >= steps, "generated_codes contains fewer tokens than --steps")
     require(np.all(phones < hparams["phoneme_vocab_size"]), "phones exceed the phoneme vocabulary")
-    for name, tokens in (("prompt", prompt), ("generated_codes", codes)):
-        require(np.all(tokens < hparams["EOS"]), f"{name} must contain semantic IDs below EOS")
-    require(phones.size + prompt.size + steps <= CONTEXT_LIMIT,
+    require(np.all(prompt < hparams["EOS"]), "prompt must contain semantic IDs below EOS")
+    return {"phones": phones, "bert": np.ascontiguousarray(bert.T, dtype="<f4"), "prompt": prompt}
+
+
+def load_inputs(directory, steps, hparams):
+    positive_int(steps, "steps")
+    require(steps < CONTEXT_LIMIT, "steps exceeds the 1024-position context budget")
+    inputs = text_inputs(directory, hparams)
+    codes = token_vector(load_npy(Path(directory) / INPUT_FILES[3]), "generated_codes", generated=True)
+    require(codes.size >= steps, "generated_codes contains fewer tokens than --steps")
+    require(np.all(codes < hparams["EOS"]), "generated_codes must contain semantic IDs below EOS")
+    require(len(inputs["phones"]) + len(inputs["prompt"]) + steps <= CONTEXT_LIMIT,
             "prefill + teacher-forced steps exceeds the 1024-position context budget")
-    return {
-        "phones": phones,
-        "bert": np.ascontiguousarray(bert.T, dtype="<f4"),
-        "prompt": prompt,
-        "forced_tokens": codes[:steps].copy(),
-    }
+    inputs["forced_tokens"] = codes[:steps].copy()
+    return inputs
+
+
+def generation_inputs(directory, reference_phones, max_new_tokens, hparams):
+    positive_int(reference_phones, "reference_phones")
+    positive_int(max_new_tokens, "max_new_tokens")
+    inputs = text_inputs(directory, hparams)
+    require(reference_phones < len(inputs["phones"]), "reference/target text split must leave nonempty target phones")
+    require(len(inputs["phones"]) + len(inputs["prompt"]) + max_new_tokens - 1 <= CONTEXT_LIMIT,
+            "generation exceeds the 1024-position context budget")
+    return inputs
 
 
 def run_teacher_forced(model, inputs):
@@ -180,14 +192,14 @@ def validate_digest(value, name):
             f"{name} must be a SHA-256 digest")
 
 
-def validate_provenance(sources):
+def validate_provenance(sources, input_files=INPUT_FILES):
     require(isinstance(sources, dict) and set(sources) == {
         "checkpoint_sha256", "exporter_sha256", "checkpoint_loader_sha256", "inputs", "upstream",
     }, "unexpected sources fields")
     for name in ("checkpoint_sha256", "exporter_sha256", "checkpoint_loader_sha256"):
         validate_digest(sources.get(name), f"sources.{name}")
-    require(isinstance(sources.get("inputs"), dict) and set(sources["inputs"]) == set(INPUT_FILES),
-            "sources.inputs must list the four original input files")
+    require(isinstance(sources.get("inputs"), dict) and set(sources["inputs"]) == set(input_files),
+            "sources.inputs must list the original input files")
     upstream = sources.get("upstream")
     require(isinstance(upstream, dict) and "AR/models/t2s_model.py" in upstream,
             "sources.upstream must include AR/models/t2s_model.py")
@@ -242,6 +254,21 @@ def validate_reference(directory):
     require(manifest.get("semantics") == "raw-logits; no-sampling; no-EOS-suppression; no-early-stop",
             "unexpected reference semantics")
     specs = array_specs(hparams, dimensions)
+    arrays = validate_arrays(directory, manifest, specs)
+    require(np.all((arrays["phones"] >= 0) & (arrays["phones"] < hparams["phoneme_vocab_size"])),
+            "phones exceed the phoneme vocabulary")
+    for name in ("prompt", "forced_tokens"):
+        require(np.all((arrays[name] >= 0) & (arrays[name] < hparams["EOS"])), f"invalid semantic IDs in {name}")
+    require(np.array_equal(arrays["argmax"], arrays["logits"].argmax(axis=1)), "argmax disagrees with logits")
+    require(np.array_equal(arrays["context_lengths"], np.arange(n, final + 1)), "invalid context_lengths")
+    require(np.array_equal(arrays["audio_positions"], np.arange(p, p + s)), "invalid audio_positions")
+    for cache in ("k", "v"):
+        require(np.array_equal(arrays[f"prefill_{cache}"], arrays[f"final_{cache}"][:, :n]),
+                f"final {cache} cache does not preserve prefill prefix")
+    return manifest
+
+
+def validate_arrays(directory, manifest, specs):
     entries = manifest.get("arrays")
     require(isinstance(entries, dict) and set(entries) == {name + ".npy" for name in specs},
             "unexpected array file list")
@@ -262,17 +289,7 @@ def validate_reference(directory):
                 and a.flags.c_contiguous, f"invalid dtype/shape/order for {filename}")
         require(np.isfinite(a).all(), f"non-finite values in {filename}")
         arrays[name] = a
-    require(np.all((arrays["phones"] >= 0) & (arrays["phones"] < hparams["phoneme_vocab_size"])),
-            "phones exceed the phoneme vocabulary")
-    for name in ("prompt", "forced_tokens"):
-        require(np.all((arrays[name] >= 0) & (arrays[name] < hparams["EOS"])), f"invalid semantic IDs in {name}")
-    require(np.array_equal(arrays["argmax"], arrays["logits"].argmax(axis=1)), "argmax disagrees with logits")
-    require(np.array_equal(arrays["context_lengths"], np.arange(n, final + 1)), "invalid context_lengths")
-    require(np.array_equal(arrays["audio_positions"], np.arange(p, p + s)), "invalid audio_positions")
-    for cache in ("k", "v"):
-        require(np.array_equal(arrays[f"prefill_{cache}"], arrays[f"final_{cache}"][:, :n]),
-                f"final {cache} cache does not preserve prefill prefix")
-    return manifest
+    return arrays
 
 
 def write_reference(output_dir, arrays, hparams, provenance, execution):
@@ -284,12 +301,18 @@ def write_reference(output_dir, arrays, hparams, provenance, execution):
     dimensions["prefill"] = dimensions["text"] + dimensions["prompt"]
     dimensions["final"] = dimensions["prefill"] + dimensions["steps"]
     specs = array_specs(hparams, dimensions)
-    require(set(arrays) == set(specs), "unexpected array keys")
     manifest = {
         "schema": SCHEMA, "status": "complete", "hparams": hparams, "dimensions": dimensions,
         "semantics": "raw-logits; no-sampling; no-EOS-suppression; no-early-stop",
         "sources": provenance, "execution": execution, "arrays": {},
     }
+    return publish_reference(output, arrays, specs, manifest, validate_reference)
+
+
+def publish_reference(output, arrays, specs, manifest, validate):
+    output = Path(output).absolute()
+    require(not os.path.lexists(output), f"output already exists; refusing to overwrite: {output}")
+    require(set(arrays) == set(specs), "unexpected array keys")
     output.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix=f".{output.name}-", dir=output.parent) as temp:
         stage = Path(temp)
@@ -303,7 +326,7 @@ def write_reference(output_dir, arrays, hparams, provenance, execution):
                 "ggml_ne": list(reversed(a.shape)), "sha256": sha256(path),
             }
         (stage / "manifest.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-        validate_reference(stage)
+        validate(stage)
         # mkdir reserves the destination without replacing even an empty directory
         # created by another process. The completion marker is published last.
         output.mkdir()
@@ -324,6 +347,143 @@ def write_reference(output_dir, arrays, hparams, provenance, execution):
                 pass
             raise
     return manifest
+
+
+def generation_policy(max_new_tokens, repetition_penalty):
+    positive_int(max_new_tokens, "max_new_tokens")
+    require(type(repetition_penalty) in (int, float) and np.isfinite(repetition_penalty)
+            and repetition_penalty > 0, "repetition_penalty must be finite and positive")
+    with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
+        penalty = np.float32(repetition_penalty)
+        reciprocal = np.float32(1.0) / penalty
+    require(np.isfinite(penalty) and penalty > 0 and np.isfinite(reciprocal),
+            "repetition_penalty and its reciprocal must be finite and positive in float32")
+    return {"top_k": 1, "top_p": 1.0, "temperature": 1.0,
+            "repetition_penalty": float(repetition_penalty), "max_new_tokens": max_new_tokens,
+            "history": "generated-only-binary", "eos": "unmasked-before-accept"}
+
+
+def adjusted_logits(logits, codes, repetition_penalty):
+    adjusted = np.array(logits, dtype=np.float32, copy=True)
+    ids = np.asarray(sorted(set(codes)), dtype=np.int64)
+    values = adjusted[ids]
+    penalty = np.float32(repetition_penalty)
+    # C++ applies a precomputed reciprocal to nonnegative logits.
+    with np.errstate(over="ignore", invalid="ignore", divide="ignore"):
+        adjusted[ids] = np.where(values < 0, values * penalty, values * np.float32(1.0 / penalty))
+    require(np.isfinite(adjusted).all(), "non-finite repetition-adjusted logits")
+    return adjusted
+
+
+def run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penalty):
+    import torch
+
+    generation_policy(max_new_tokens, repetition_penalty)
+    positive_int(reference_phones, "reference_phones")
+    require(reference_phones < len(inputs["phones"]), "reference/target text split must leave nonempty target phones")
+    t, p = len(inputs["phones"]), len(inputs["prompt"])
+    require(t + p + max_new_tokens - 1 <= CONTEXT_LIMIT, "generation exceeds the 1024-position context budget")
+    model.cpu().float().eval()
+    phones = torch.from_numpy(inputs["phones"].astype(np.int64))[None]
+    bert = torch.from_numpy(inputs["bert"])[None]
+    prompt = torch.from_numpy(inputs["prompt"].astype(np.int64))[None]
+    codes, rows, selected = [], [], []
+    reason = "max_new_tokens"
+    with torch.inference_mode():
+        text = model.ar_text_position(model.ar_text_embedding(phones) + model.bert_proj(bert))
+        audio = model.ar_audio_position(model.ar_audio_embedding(prompt))
+        prefill = torch.cat((text, audio), dim=1)
+        mask = torch.zeros((t + p, t + p), dtype=torch.bool)
+        mask[:t, t:] = True
+        mask[t:, t:] = torch.triu(torch.ones((p, p), dtype=torch.bool), 1)
+        hidden, k, v = model.t2s_transformer.process_prompt(prefill, mask[None, None], None, False)
+        for step in range(max_new_tokens):
+            logits = model.ar_predict_layer(hidden[:, -1])[0].cpu().numpy().copy()
+            require(np.isfinite(logits).all(), f"non-finite generation logits at step {step}")
+            token = int(adjusted_logits(logits, codes, repetition_penalty).argmax())
+            rows.append(logits)
+            selected.append(token)
+            if token == model.EOS:
+                reason = "eos"
+                break
+            codes.append(token)
+            if len(codes) == max_new_tokens:
+                break
+            history = torch.tensor([list(inputs["prompt"]) + codes], dtype=torch.int64)
+            positioned = model.ar_audio_position(model.ar_audio_embedding(history))[:, -1:]
+            hidden, k, v = model.t2s_transformer.decode_next_token(positioned, k, v, None, False)
+        result = dict(inputs)
+        result.update(prefill_input=np.array(prefill[0].cpu().numpy(), dtype="<f4", order="C", copy=True),
+                      codes=np.asarray(codes, dtype="<i4"), logits=np.asarray(rows, dtype="<f4"),
+                      selected=np.asarray(selected, dtype="<i4"),
+                      context_lengths=np.arange(t + p, t + p + len(rows), dtype="<i4"))
+    return result, reason
+
+
+def generation_specs(hparams, dimensions):
+    t, p, n, c, d = (dimensions[k] for k in ("text", "prompt", "prefill", "codes", "decisions"))
+    return {"phones": ("int32", (t,)), "bert": ("float32", (t, 1024)),
+            "prompt": ("int32", (p,)), "prefill_input": ("float32", (n, hparams["hidden_dim"])),
+            "codes": ("int32", (c,)), "logits": ("float32", (d, hparams["vocab_size"])),
+            "selected": ("int32", (d,)), "context_lengths": ("int32", (d,))}
+
+
+def validate_generation_reference(directory):
+    directory = Path(directory)
+    require(not directory.is_symlink() and directory.is_dir(), "reference must be a regular directory")
+    manifest = json.loads(regular_file(directory / "manifest.json").read_text(encoding="utf-8"))
+    require(isinstance(manifest, dict) and set(manifest) == {
+        "schema", "status", "hparams", "dimensions", "policy", "stop_reason", "sources", "execution", "arrays",
+    }, "unexpected generation manifest fields")
+    require(manifest["schema"] == GEN_SCHEMA and manifest["status"] == "complete", "unexpected generation schema/status")
+    hp, dims, policy = (manifest[k] for k in ("hparams", "dimensions", "policy"))
+    validate_hparams(hp)
+    require(set(hp) == set(HPARAM_KEYS), "unexpected hparams keys")
+    require(isinstance(dims, dict) and set(dims) == {
+        "text", "reference_text", "target_text", "prompt", "prefill", "codes", "decisions",
+    }, "unexpected generation dimensions")
+    for key, value in dims.items():
+        require(type(value) is int and 0 <= value <= CONTEXT_LIMIT and (key == "codes" or value > 0),
+                f"invalid dimensions.{key}")
+    t, r, target, p, n, c, d = (dims[k] for k in ("text", "reference_text", "target_text", "prompt", "prefill", "codes", "decisions"))
+    require(t == r + target and n == t + p, "inconsistent text split/prefill dimensions")
+    require(isinstance(policy, dict) and set(policy) == {
+        "top_k", "top_p", "temperature", "repetition_penalty", "max_new_tokens", "history", "eos",
+    }, "unexpected generation policy fields")
+    expected = generation_policy(policy["max_new_tokens"], policy["repetition_penalty"])
+    require(type(policy["top_k"]) is int and all(type(policy[k]) in (int, float) for k in ("top_p", "temperature"))
+            and policy == expected, "unsupported generation policy")
+    maximum = policy["max_new_tokens"]
+    require(n + maximum - 1 <= CONTEXT_LIMIT, "generation exceeds the 1024-position context budget")
+    reason = manifest["stop_reason"]
+    require((reason == "eos" and d == c + 1 and d <= maximum)
+            or (reason == "max_new_tokens" and c == d == maximum), "inconsistent stop reason/codes/decisions")
+    validate_provenance(manifest["sources"], INPUT_FILES[:3])
+    validate_execution(manifest["execution"])
+    arrays = validate_arrays(directory, manifest, generation_specs(hp, dims))
+    require(np.all((arrays["phones"] >= 0) & (arrays["phones"] < hp["phoneme_vocab_size"])), "invalid phones")
+    for name in ("prompt", "codes"):
+        require(np.all((arrays[name] >= 0) & (arrays[name] < hp["EOS"])), f"invalid semantic IDs in {name}")
+    require(np.array_equal(arrays["context_lengths"], np.arange(n, n + d)), "invalid context_lengths")
+    require(np.array_equal(arrays["selected"][:c], arrays["codes"]), "selected candidates disagree with codes")
+    if reason == "eos":
+        require(arrays["selected"][-1] == hp["EOS"], "EOS stop must include an unaccepted EOS decision")
+    for step, row in enumerate(arrays["logits"]):
+        expected_token = int(adjusted_logits(row, arrays["codes"][:step], policy["repetition_penalty"]).argmax())
+        require(expected_token == arrays["selected"][step], f"selected token disagrees with policy at step {step}")
+    return manifest
+
+
+def write_generation_reference(output_dir, arrays, hparams, provenance, execution,
+                               reference_phones, max_new_tokens, repetition_penalty, stop_reason):
+    policy = generation_policy(max_new_tokens, repetition_penalty)
+    dimensions = {"text": len(arrays["phones"]), "reference_text": reference_phones,
+                  "target_text": len(arrays["phones"]) - reference_phones, "prompt": len(arrays["prompt"]),
+                  "prefill": len(arrays["phones"]) + len(arrays["prompt"]),
+                  "codes": len(arrays["codes"]), "decisions": len(arrays["selected"])}
+    manifest = {"schema": GEN_SCHEMA, "status": "complete", "hparams": hparams, "dimensions": dimensions,
+                "policy": policy, "stop_reason": stop_reason, "sources": provenance, "execution": execution, "arrays": {}}
+    return publish_reference(output_dir, arrays, generation_specs(hparams, dimensions), manifest, validate_generation_reference)
 
 
 class SourceOnlyLoader(importlib.machinery.SourceFileLoader):
@@ -394,15 +554,21 @@ def configure_torch():
     }
 
 
-def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8):
+def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8, *,
+                     generation=False, reference_phones=None, max_new_tokens=200, repetition_penalty=1.0):
     require(not os.path.lexists(output_dir), f"output already exists; refusing to overwrite: {output_dir}")
-    positive_int(steps, "steps")
+    if generation:
+        positive_int(reference_phones, "reference_phones")
+        generation_policy(max_new_tokens, repetition_penalty)
+    else:
+        positive_int(steps, "steps")
+    input_files = INPUT_FILES[:3] if generation else INPUT_FILES
     checkpoint = regular_file(checkpoint)
     inputs_dir = Path(inputs_dir)
     loader_path = REPO_ROOT / "python/torch_ckpt_utils.py"
     exporter_hash, loader_hash = sha256(__file__), sha256(loader_path)
     checkpoint_hash = sha256(checkpoint)
-    input_hashes = {name: sha256(regular_file(inputs_dir / name)) for name in INPUT_FILES}
+    input_hashes = {name: sha256(regular_file(inputs_dir / name)) for name in input_files}
     loader_name = "t2s_reference_checkpoint_loader"
     spec = importlib.util.spec_from_file_location(loader_name, loader_path,
                                                 loader=SourceOnlyLoader(loader_name, str(loader_path)))
@@ -413,7 +579,8 @@ def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8)
     require(isinstance(config, dict) and isinstance(config.get("model"), dict), "checkpoint is missing model config")
     hparams = {key: config["model"].get(key) for key in HPARAM_KEYS}
     validate_hparams(hparams)
-    inputs = load_inputs(inputs_dir, steps, hparams)
+    inputs = (generation_inputs(inputs_dir, reference_phones, max_new_tokens, hparams) if generation
+              else load_inputs(inputs_dir, steps, hparams))
     require(weights and all(name.startswith("model.") for name in weights), "expected model.* checkpoint weights")
     execution = configure_torch()
     import torch
@@ -424,7 +591,10 @@ def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8)
     state = {name[len("model."):]: torch.from_numpy(value) for name, value in weights.items()}
     model.load_state_dict(state, strict=True)
     del state, weights
-    arrays = run_teacher_forced(model, inputs)
+    if generation:
+        arrays, reason = run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penalty)
+    else:
+        arrays = run_teacher_forced(model, inputs)
     require(sha256(checkpoint) == checkpoint_hash, "checkpoint changed during export")
     require(all(sha256(inputs_dir / name) == digest for name, digest in input_hashes.items()),
             "inputs changed during export")
@@ -436,6 +606,9 @@ def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8)
         "checkpoint_sha256": checkpoint_hash, "inputs": input_hashes, "upstream": upstream,
         "exporter_sha256": exporter_hash, "checkpoint_loader_sha256": loader_hash,
     }
+    if generation:
+        return write_generation_reference(output_dir, arrays, hparams, provenance, execution,
+                                          reference_phones, max_new_tokens, repetition_penalty, reason)
     return write_reference(output_dir, arrays, hparams, provenance, execution)
 
 
@@ -447,21 +620,42 @@ def main(argv=None):
     parser.add_argument("--inputs-dir", help="directory containing four precomputed inference-dump .npy inputs")
     parser.add_argument("--output-dir", help="new output directory; existing paths are never overwritten")
     parser.add_argument("--steps", type=int, default=None, help="teacher-forced decode inputs (default: 8)")
+    parser.add_argument("--generate", action="store_true", help="export closed-loop top-k 1 under the C++ generation policy")
+    parser.add_argument("--reference-phones", type=int, help="reference phone count in concatenated all-phones input")
+    parser.add_argument("--max-new-tokens", type=int, help="generation budget (default: 200)")
+    parser.add_argument("--repetition-penalty", type=float, help="generated-only repetition penalty (default: 1.0)")
     args = parser.parse_args(argv)
-    exporting = (args.checkpoint, args.upstream_root, args.inputs_dir, args.output_dir, args.steps)
+    exporting = (args.checkpoint, args.upstream_root, args.inputs_dir, args.output_dir, args.steps,
+                 args.reference_phones, args.max_new_tokens, args.repetition_penalty)
     if args.validate:
-        if any(value is not None for value in exporting):
+        if args.generate or any(value is not None for value in exporting):
             parser.error("--validate cannot be combined with export arguments")
     elif not all(value is not None for value in exporting[:4]):
         parser.error("export requires --checkpoint, --upstream-root, --inputs-dir and --output-dir")
+    elif args.generate:
+        if args.steps is not None or args.reference_phones is None:
+            parser.error("--generate requires --reference-phones and cannot use --steps")
+    elif any(value is not None for value in exporting[5:]):
+        parser.error("generation policy arguments require --generate")
     try:
         if args.validate:
-            manifest = validate_reference(args.validate)
+            path = regular_file(Path(args.validate) / "manifest.json")
+            header = json.loads(path.read_text(encoding="utf-8"))
+            require(isinstance(header, dict), "reference manifest must be an object")
+            schema = header.get("schema")
+            manifest = (validate_generation_reference(args.validate) if schema == GEN_SCHEMA
+                        else validate_reference(args.validate))
         else:
             manifest = export_reference(args.checkpoint, args.upstream_root, args.inputs_dir,
-                                        args.output_dir, 8 if args.steps is None else args.steps)
+                                        args.output_dir, 8 if args.steps is None else args.steps,
+                                        generation=args.generate, reference_phones=args.reference_phones,
+                                        max_new_tokens=200 if args.max_new_tokens is None else args.max_new_tokens,
+                                        repetition_penalty=1.0 if args.repetition_penalty is None else args.repetition_penalty)
         d = manifest["dimensions"]
-        print(f"Validated {SCHEMA}: prefill={d['prefill']}, decode_steps={d['steps']}, final={d['final']}")
+        if manifest["schema"] == GEN_SCHEMA:
+            print(f"Validated {GEN_SCHEMA}: codes={d['codes']}, decisions={d['decisions']}, stop={manifest['stop_reason']}")
+        else:
+            print(f"Validated {SCHEMA}: prefill={d['prefill']}, decode_steps={d['steps']}, final={d['final']}")
         return 0
     except (OSError, ValueError, RuntimeError, ImportError, KeyError, TypeError) as exc:
         print(f"t2s reference export: {exc}", file=sys.stderr)

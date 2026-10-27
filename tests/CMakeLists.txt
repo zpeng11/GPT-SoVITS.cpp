@@ -168,6 +168,28 @@ gtest_discover_tests(test_t2s_decode_reference
     PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
 )
 
+set(GPTSOVITS_T2S_GENERATION_REFERENCE "" CACHE PATH "Matched-policy T2S generation references with rp1/rp135 cases")
+
+add_executable(test_t2s_generation_reference_contract t2s/test_t2s_generation_reference_contract.cpp)
+target_include_directories(test_t2s_generation_reference_contract PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/nlohmann/include
+)
+target_link_libraries(test_t2s_generation_reference_contract PRIVATE gpt_sovits_cpp_static GTest::gtest_main)
+gtest_discover_tests(test_t2s_generation_reference_contract)
+
+add_executable(test_t2s_generation_reference t2s/test_t2s_generation_reference.cpp)
+target_include_directories(test_t2s_generation_reference PRIVATE
+    ${CMAKE_SOURCE_DIR}/third_party/nlohmann/include
+)
+target_link_libraries(test_t2s_generation_reference PRIVATE gpt_sovits_cpp_static GTest::gtest_main)
+target_compile_definitions(test_t2s_generation_reference PRIVATE
+    T2S_GENERATION_REFERENCE_DIR="${GPTSOVITS_T2S_GENERATION_REFERENCE}"
+    T2S_DECODE_MODEL_PATH="${GPTSOVITS_T2S_DECODE_MODEL}"
+)
+gtest_discover_tests(test_t2s_generation_reference
+    PROPERTIES LABELS "cpu\\;integration" TIMEOUT 300
+)
+
 add_executable(test_text_frontend_json frontend/test_text_frontend_json.cpp)
 target_include_directories(test_text_frontend_json PRIVATE
     ${CMAKE_SOURCE_DIR}/third_party/nlohmann/include
