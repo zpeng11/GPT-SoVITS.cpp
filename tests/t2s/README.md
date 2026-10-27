@@ -61,6 +61,21 @@ source token array is range-checked, even beyond this prefix. The final context
 `T + P + S` must fit 1024 positions. This is a decode-reference limit, not a
 change to the public generation budget `N + max_new_tokens - 1`.
 
+For a separate local export environment that reuses an existing PyTorch install
+without modifying it, create a venv in the ignored output directory:
+
+```sh
+/path/to/python-with-torch -m venv --system-site-packages tests/t2s/out/reference-env
+tests/t2s/out/reference-env/bin/python -m pip install 'torchmetrics==1.5.0'
+# Use this venv's Python for the export command above.
+```
+
+This is an explicit developer setup step, not something the exporter or CTest
+runs automatically. It may need network access to install packages. The local
+validation used Python 3.11.15, PyTorch 2.11.0, NumPy 1.26.4, torchmetrics 1.5.0
+and tqdm 4.67.3. Torchmetrics' NumPy constraint was resolved inside this venv;
+the existing Python environment was not changed.
+
 The output path must **not exist**, even as an empty directory, file, or broken
 symlink. Arrays are staged and validated before publishing to a newly reserved
 directory; `manifest.json` is published last. Recoverable publication failures
@@ -170,7 +185,78 @@ checkpoint through a temporary upstream test double. These tests write only to
 temporary directories and do not download resources. PyTorch tests explicitly
 skip if PyTorch is unavailable.
 
-This commit supplies the oracle exporter and its own tests. It does **not** yet
-assert C++ decode numerical parity, sampled-sequence equality, waveform parity,
-intelligibility, or listening quality. Existing tracked `ref/*.npy` files are not
-overwritten. Independent C++ multi-step comparison is a separate change.
+The exporter and its own tests do not establish C++ numerical parity. The
+optional C++ comparison below supplies that separate check. Neither suite claims
+sampled-sequence equality, waveform parity, intelligibility, or listening quality.
+Existing tracked `ref/*.npy` files are not overwritten.
+
+## Optional C++ CPU decode comparison
+
+Use the export above and an F32 GGUF converted from the **same T2S checkpoint**:
+
+```sh
+python3 python/convert_t2s_to_gguf.py /path/to/s1v3.ckpt /path/to/s2Gv2Pro.pth \
+  --type f32 --output tests/t2s/out/t2s-f32.gguf
+python3 tests/t2s/generate_reference.py --validate tests/t2s/out/decode-reference-1
+
+cmake -S . -B build -DGPTSOVITS_BUILD_TESTS=ON \
+  -DGPTSOVITS_T2S_DECODE_REFERENCE="$PWD/tests/t2s/out/decode-reference-1" \
+  -DGPTSOVITS_T2S_DECODE_MODEL="$PWD/tests/t2s/out/t2s-f32.gguf"
+cmake --build build --target test_t2s_decode_reference_contract test_t2s_decode_reference -j 4
+ctest --test-dir build -R '^T2SDecodeReference' --output-on-failure
+```
+
+Both cache variables default to empty. Without a reference directory the two
+numerical tests report **Skipped**. Once a reference is configured, missing or
+invalid reference/model files fail, as do incompatible model dimensions or
+non-F32 weights. Contract tests do not need a reference directory or model and
+always run. Numerical tests force CPU, batch 1 and F32 KV, have the `cpu` and
+`integration` labels, and a 300-second timeout.
+
+`GPTSOVITS_T2S_DECODE_MODEL` must name a model converted from the checkpoint
+whose SHA-256 is in the manifest. Matching dimensions alone do not prove model
+identity: the GGUF format currently does not retain the source checkpoint hash.
+The converter also requires a SoVITS checkpoint to package extract-latent weights;
+these tests do not execute HuBERT or extract-latent inference.
+
+The C++ reader checks the consumed manifest/NPY layout, finite values, token
+ranges, positions, lengths and cache-prefix consistency. It does not recompute
+SHA-256 or import Python. Run the independent `--validate` command first to check
+file digests. Neither reader executes arbitrary NumPy pickle data. The C++ reader
+accepts only NPY v1/v2 `<f4`/`<i4` on little-endian hosts, with up to 1024 context
+positions, hidden/embedding dimensions 4096, 128 layers, 512 heads, vocabularies
+65536, 512 MiB per array and 1 GiB total; larger inputs fail before allocation.
+
+The numerical checks isolate the transformer from reference/text/audio
+preparation by uploading the exported `prefill_input` directly. The flex path
+checks full prefill hidden states, prefill/final layer caches and raw next-token
+logits at all S+1 steps. Logits are independently projected in the test from the
+returned hidden states and F32 LM-head weights, not inferred from sampled IDs.
+The persistent path uses a fresh session and reuses one persistent decode graph;
+it checks every input position, context length, raw greedy choice (repetition
+penalty disabled), and layer caches. Both paths feed the same recorded tokens,
+not their own predictions, and never stop on a predicted EOS. This does not test
+sampler parity, automatic generation stopping or the upstream audio resamplers.
+
+### Observed CPU F32 baseline
+
+The local matched case used 66 text phones, 136 prompt codes, eight forced
+inputs, 24 layers, hidden dimension 512 and vocabulary 1025. Both numerical tests
+actually ran (not skipped). Two independent upstream exports were byte-identical,
+and all 295 T2S tensors in the F32 GGUF exactly matched the source checkpoint's
+F32 values through the converter mapping. This establishes the local model/input
+pairing; it does not make the private case a distributed fixture.
+
+| Compared output | Observed maximum absolute error | Worst RMSE | Asserted max / RMSE |
+| --- | --- | --- | --- |
+| Full prefill hidden | `9.25e-5` | `1.31e-6` | `2e-4` / `1e-5` |
+| Flex raw logits, all 9 rows | `2.77e-5` | `5.79e-6` | `1e-4` / `2e-5` |
+| Per-layer prefill/final K | `2.39e-5` | `1.32e-6` | `1e-4` / `1e-5` |
+| Per-layer prefill/final V | `1.60e-5` | `7.22e-7` | `1e-4` / `1e-5` |
+| New decode K/V rows, both paths | `6.14e-6` | `1.45e-6` | `1e-4` / `1e-5` |
+
+Greedy IDs agreed at every compared step. The smallest reference top-1/top-2
+logit gap was about `0.114`, well above the observed numerical error; the tests
+assert exact argmax agreement and print the gap on failure. Thresholds are
+component-specific CPU F32 budgets, not tolerances for F16/quantized weights,
+quantized KV, other backends or arbitrary model architectures.
