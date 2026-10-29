@@ -721,6 +721,7 @@ static void install_ref(gs::t2s_session & s, const gs::t2s_model & m,
     put(s.ref_audio_emb, audio);
     s.ref_T_ref = 2;
     s.ref_T_prompt = 2;
+    s.ref_prompt_tokens = {0, 0};
     s.ref_model = &m;
 }
 

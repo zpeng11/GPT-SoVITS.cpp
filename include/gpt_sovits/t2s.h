@@ -368,6 +368,7 @@ struct t2s_session {
     struct ggml_tensor   * ref_audio_emb  = nullptr;  // cached {d_model, T_prompt}
     int64_t                ref_T_ref      = 0;        // ref text token count (input pos offset)
     int64_t                ref_T_prompt   = 0;        // ref prompt audio token count
+    std::vector<int32_t>    ref_prompt_tokens;        // cached {T_prompt}, ids in [0, eos)
     const t2s_model      * ref_model      = nullptr;  // borrowed; must not move or reload
 
     // Shared allocator for flexible computation graphs (owned).
@@ -441,7 +442,8 @@ int t2s_session_get_n_kv(const t2s_session & session);
 // Compute and cache the reference embedding in the session.
 //
 // Accepts raw host data pointers for all inputs. Internally builds a temporary
-// graph, executes it, and copies the result to a session-owned persistent tensor.
+// graph, executes it, and caches the embeddings plus prompt semantic token ids
+// in session-owned storage.
 // Call once after session init; one session = one ref. A second call after a
 // successful computation is rejected with false and leaves the cache untouched;
 // free and re-init the session to use a different reference. For subsequent
@@ -635,8 +637,9 @@ struct t2s_generate_result {
 // Either sampled or greedy EOS stops generation BEFORE accepting that step's
 // candidate. The result contains neither prompt tokens nor EOS; immediate EOS
 // succeeds with empty codes. At the length limit all accepted codes are kept.
-// Unlike Python infer_panel, there is no early-step EOS suppression and the
-// repetition mask covers only accepted tokens from this request, not the prompt.
+// The repetition mask is a binary set of reference prompt ids plus codes accepted
+// in this call, reset for each call. Unlike Python infer_panel, there is no
+// early-step EOS suppression.
 // RNG is reset per call; reproducibility is limited to the same build/backend.
 //
 // Returns false with diagnostics on invalid input or recoverable compute/allocation

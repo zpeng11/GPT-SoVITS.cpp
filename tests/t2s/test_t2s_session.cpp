@@ -652,6 +652,11 @@ TEST(T2SSession, ComputeRefEmbWithModel) {
     EXPECT_EQ(ref_text_emb->ne[1], T_ref);
     EXPECT_EQ(ref_audio_emb->ne[1], T_prompt);
     EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_prompt(session), T_prompt);
+    ASSERT_EQ(session.ref_prompt_tokens.size(), (size_t) T_prompt);
+    for (int32_t token : session.ref_prompt_tokens) {
+        EXPECT_GE(token, 0);
+        EXPECT_LT((uint32_t) token, model.hparams.eos);
+    }
 
     // Verify data is non-zero after computation.
     auto check_nonzero = [](struct ggml_tensor * t, const char * name) {
@@ -727,6 +732,7 @@ TEST(T2SSession, ComputeRefEmbRejectsInvalidInput) {
     EXPECT_EQ(session.ref_audio_emb, nullptr);
     EXPECT_EQ(session.ref_T_ref, 0);
     EXPECT_EQ(session.ref_T_prompt, 0);
+    EXPECT_TRUE(session.ref_prompt_tokens.empty());
     EXPECT_EQ(session.ref_model, nullptr);
 
     gpt_sovits::t2s_session_free(session);
@@ -768,6 +774,7 @@ TEST(T2SSession, ComputeRefEmbRejectsDuplicateAndPreservesCache) {
     auto * ref_text_emb  = session.ref_text_emb;
     auto * ref_audio_emb = session.ref_audio_emb;
     const int64_t T_prompt = session.ref_T_prompt;
+    const auto prompt_tokens = session.ref_prompt_tokens;
 
     // A second call is rejected and must not replace or free the cached state.
     EXPECT_FALSE(gpt_sovits::t2s_session_compute_ref_emb(
@@ -779,9 +786,11 @@ TEST(T2SSession, ComputeRefEmbRejectsDuplicateAndPreservesCache) {
     EXPECT_EQ(session.ref_audio_emb, ref_audio_emb);
     EXPECT_EQ(session.ref_T_ref, T_ref);
     EXPECT_EQ(session.ref_T_prompt, T_prompt);
+    EXPECT_EQ(session.ref_prompt_tokens, prompt_tokens);
     EXPECT_EQ(session.ref_model, &model);
 
     gpt_sovits::t2s_session_free(session);
+    EXPECT_TRUE(session.ref_prompt_tokens.empty());
     gpt_sovits::t2s_model_free(model);
     ggml_backend_free(backend);
 }
@@ -827,6 +836,7 @@ TEST(T2SSession, ComputeRefEmbAllocationFailureLeavesStateClean) {
     EXPECT_EQ(session.ref_audio_emb, nullptr);
     EXPECT_EQ(session.ref_T_ref, 0);
     EXPECT_EQ(session.ref_T_prompt, 0);
+    EXPECT_TRUE(session.ref_prompt_tokens.empty());
     EXPECT_EQ(session.ref_model, nullptr);
 
     // Failure must leave the session reusable.

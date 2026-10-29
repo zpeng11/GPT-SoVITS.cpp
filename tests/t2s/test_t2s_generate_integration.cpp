@@ -236,6 +236,11 @@ static bool manual_generate(gpt_sovits::t2s_session & session,
     std::exponential_distribution<float> dist(1.0f);
     std::vector<float> noise((size_t) vocab);
     std::vector<float> seen((size_t) vocab, 0.0f);
+    if (session.ref_prompt_tokens.size() != (size_t) T_prompt) return false;
+    for (int32_t token : session.ref_prompt_tokens) {
+        if (token < 0 || token >= eos) return false;
+        seen[(size_t) token] = 1.0f;
+    }
 
     int32_t current = -1;
 
@@ -377,6 +382,8 @@ static void run_generate_integration(ggml_backend_t backend, bool stochastic = f
 
     const std::vector<uint8_t> ref_text_before = read_tensor_bytes(session.ref_text_emb);
     const std::vector<uint8_t> ref_audio_before = read_tensor_bytes(session.ref_audio_emb);
+    const auto ref_prompt_before = session.ref_prompt_tokens;
+    ASSERT_EQ(ref_prompt_before.size(), (size_t) session.ref_T_prompt);
     ggml_tensor * ref_text_ptr = session.ref_text_emb;
     ggml_tensor * ref_audio_ptr = session.ref_audio_emb;
 
@@ -407,6 +414,7 @@ static void run_generate_integration(ggml_backend_t backend, bool stochastic = f
     EXPECT_EQ(session.ref_audio_emb, ref_audio_ptr);
     EXPECT_EQ(read_tensor_bytes(session.ref_text_emb), ref_text_before);
     EXPECT_EQ(read_tensor_bytes(session.ref_audio_emb), ref_audio_before);
+    EXPECT_EQ(session.ref_prompt_tokens, ref_prompt_before);
 
     EXPECT_NE(session.gf_dec, nullptr);
     EXPECT_EQ(session.decode_model, &model);
@@ -429,6 +437,7 @@ static void run_generate_integration(ggml_backend_t backend, bool stochastic = f
     EXPECT_EQ(session.ref_audio_emb, ref_audio_ptr);
     EXPECT_EQ(read_tensor_bytes(session.ref_text_emb), ref_text_before);
     EXPECT_EQ(read_tensor_bytes(session.ref_audio_emb), ref_audio_before);
+    EXPECT_EQ(session.ref_prompt_tokens, ref_prompt_before);
 
     session_guard manual_holder;
     auto & manual_session = manual_holder.s;
@@ -473,6 +482,7 @@ static void run_generate_integration(ggml_backend_t backend, bool stochastic = f
     EXPECT_EQ(session.ref_audio_emb, ref_audio_ptr);
     EXPECT_EQ(read_tensor_bytes(session.ref_text_emb), ref_text_before);
     EXPECT_EQ(read_tensor_bytes(session.ref_audio_emb), ref_audio_before);
+    EXPECT_EQ(session.ref_prompt_tokens, ref_prompt_before);
 }
 
 } // namespace

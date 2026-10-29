@@ -139,8 +139,12 @@ struct Fixture {
             codes = {4, 5};
             selected = {4, 5, static_cast<int32_t>(kEOS)};
             logits[4] = 2.0f;
+            // Competitor for the prompt-inclusion rejection case: raw 1.8 loses
+            // to token 4, but wins once prompt token 4 is penalized.
+            logits[6] = 1.8f;
             logits[kV + 4] = 2.1f;
-            logits[kV + 5] = 2.0f;
+            // 5 is a prompt token; 2.5 / 1.35 still beats 4 / 1.35 at step 1.
+            logits[kV + 5] = 2.5f;
             logits[2 * kV + 4] = 1.0f;
             logits[2 * kV + 5] = 1.0f;
             logits[2 * kV + kEOS] = 2.0f;
@@ -149,7 +153,8 @@ struct Fixture {
             selected = codes;
             logits[4] = 2.0f;
             logits[kV + 4] = 2.1f;
-            logits[kV + 5] = 2.0f;
+            // 5 is a prompt token; 2.5 / 1.35 still beats 4 / 1.35 at step 1.
+            logits[kV + 5] = 2.5f;
             logits[2 * kV + 4] = 1.0f;
             logits[2 * kV + 5] = 1.0f;
             logits[2 * kV + 6] = 2.0f;
@@ -180,7 +185,7 @@ struct Fixture {
             {"dimensions", {{"text", kT}, {"reference_text", kR}, {"target_text", kTarget}, {"prompt", kP},
                             {"prefill", kN}, {"codes", codes_count}, {"decisions", decisions}}},
             {"policy", {{"top_k", 1}, {"top_p", 1.0}, {"temperature", 1.0}, {"repetition_penalty", 1.35},
-                        {"max_new_tokens", tokens}, {"history", "generated-only-binary"},
+                        {"max_new_tokens", tokens}, {"history", "prompt+generated-binary"},
                         {"eos", "unmasked-before-accept"}}},
             {"stop_reason", mode == Mode::Limit ? "max_new_tokens" : "eos"},
             {"sources", {{"checkpoint_sha256", kDigest}, {"exporter_sha256", kDigest},
@@ -255,6 +260,19 @@ TEST(T2SGenerationReferenceContract, LoadsAndValidatesEosExport) {
     EXPECT_THROW(t2s_generation_reference::require_model(reference, model), std::runtime_error);
 }
 
+TEST(T2SGenerationReferenceContract, DuplicatePromptHistoryPenalizesOnce) {
+    // {5, 5} must behave exactly like a single prompt token: at step 1 the
+    // accepted 4 is penalized to 2.1/1.35 while 5 is penalized once to
+    // 2.5/1.35. A second application would drop 5 below 4 and reject the
+    // selection, so this fixture fails if repeated IDs are penalized twice.
+    Fixture fixture;
+    PutI32(fixture.arrays.at("prompt.npy").data, 0, 5);
+    fixture.Write();
+    const auto reference = t2s_generation_reference::load(fixture.temp.path());
+    EXPECT_EQ(reference.input.prompt_tokens, (std::vector<int32_t>{5, 5}));
+    EXPECT_EQ(reference.selected, (std::vector<int32_t>{4, 5, 11}));
+}
+
 TEST(T2SGenerationReferenceContract, LoadsImmediateEosWithEmptyCodes) {
     Fixture fixture(Mode::ImmediateEos);
     fixture.Write();
@@ -299,6 +317,8 @@ TEST(T2SGenerationReferenceContract, RejectsInvalidExportsTableDriven) {
         {"policy-top-k", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["top_k"] = 2; }, "top_k"},
         {"policy-top-k-float", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["top_k"] = 1.0; }, "top_k"},
         {"policy-history", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["history"] = "all"; }, "history"},
+        {"policy-history-old", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"]["history"] = "generated-only-binary"; }, "history"},
         {"policy-eos", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["eos"] = "masked"; }, "policy.eos"},
         {"policy-penalty", Mode::Eos,
          [](Fixture & f) { f.manifest["policy"]["repetition_penalty"] = 0.0; }, "repetition_penalty"},
@@ -333,7 +353,9 @@ TEST(T2SGenerationReferenceContract, RejectsInvalidExportsTableDriven) {
         {"first-eos", Mode::Eos, [](Fixture & f) { PutI32(f.arrays.at("selected.npy").data, 2, 5); }, "EOS"},
         {"limit-eos", Mode::Limit, [](Fixture & f) { PutI32(f.arrays.at("selected.npy").data, 2, kEOS); }, "EOS"},
         {"limit-last", Mode::Limit, [](Fixture & f) { PutI32(f.arrays.at("selected.npy").data, 2, 5); }, "selected"},
-        {"seenprompt", Mode::Eos,
+        {"prompt-history", Mode::Eos, [](Fixture & f) { PutI32(f.arrays.at("prompt.npy").data, 1, 4); },
+         "selected"},
+        {"seen-accepted", Mode::Eos,
          [](Fixture & f) {
              PutI32(f.arrays.at("codes.npy").data, 1, 4);
              PutI32(f.arrays.at("selected.npy").data, 1, 4);

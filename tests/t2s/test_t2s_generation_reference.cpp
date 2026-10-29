@@ -1,5 +1,6 @@
-// Only reference embeddings are installed by the test; target embedding and
-// closed-loop generation use the public API. Policy and scope are in README.md.
+// Only the reference embeddings and prompt tokens are installed by the test;
+// target embedding and closed-loop generation use the public API. Policy and
+// scope are in README.md.
 
 #include <gtest/gtest.h>
 
@@ -91,10 +92,12 @@ static bool require_f32_weights(const gpt_sovits::t2s_model & model, std::string
 static bool install_ref(gpt_sovits::t2s_session & session,
                         const gpt_sovits::t2s_model & model,
                         int64_t T_ref, int64_t T_prompt,
+                        const std::vector<int32_t> & prompt_tokens,
                         const std::vector<float> & text,
                         const std::vector<float> & audio, std::string & error) {
     const int64_t d = model.hparams.hidden_dim;
     if (T_ref <= 0 || T_prompt <= 0 ||
+        static_cast<int64_t>(prompt_tokens.size()) != T_prompt ||
         static_cast<int64_t>(text.size()) != d * T_ref ||
         static_cast<int64_t>(audio.size()) != d * T_prompt) {
         error = "cached reference embedding shape mismatch";
@@ -119,6 +122,9 @@ static bool install_ref(gpt_sovits::t2s_session & session,
     session.ref_audio_emb = audio_t;
     session.ref_T_ref = T_ref;
     session.ref_T_prompt = T_prompt;
+    // The prompt tokens travel with the cached embeddings so generation can
+    // seed the repetition history from the original prompt.
+    session.ref_prompt_tokens = prompt_tokens;
     session.ref_model = &model;
     return true;
 }
@@ -134,11 +140,14 @@ static const char * stop_name(t2s_stop_reason r) {
 
 struct PenaltyChoice { int32_t argmax = -1; double gap = 0.0; };
 
-// Reconstruct the greedy token from raw logits plus the generated-only
-// repetition mask.  Diagnostics only.
+// Reconstruct the greedy token from raw logits plus the binary repetition
+// history, which starts from the original prompt.  Diagnostics only.
 static PenaltyChoice penalty_choice(const t2s_generation_reference::Reference & ref,
                                     size_t step, int64_t vocab, float rp) {
     std::vector<unsigned char> seen(static_cast<size_t>(vocab), 0);
+    for (int32_t id : ref.input.prompt_tokens)
+        if (id >= 0 && id < vocab)
+            seen[static_cast<size_t>(id)] = 1;
     for (size_t i = 0; i < step && i < ref.codes.size(); ++i)
         if (ref.codes[i] >= 0 && ref.codes[i] < vocab)
             seen[static_cast<size_t>(ref.codes[i])] = 1;
@@ -304,15 +313,17 @@ protected:
             in.prefill_input.begin() + static_cast<size_t>(R_ + T_) * H_,
             in.prefill_input.begin() + static_cast<size_t>(R_ + T_ + P_) * H_);
         std::string error;
-        ASSERT_TRUE(install_ref(session_.session, model_.model, R_, P_, text,
-                                audio, error)) << error;
+        ASSERT_TRUE(install_ref(session_.session, model_.model, R_, P_,
+                                in.prompt_tokens, text, audio, error)) << error;
         ASSERT_EQ(session_.session.ref_T_ref, R_);
         ASSERT_EQ(session_.session.ref_T_prompt, P_);
+        ASSERT_EQ(session_.session.ref_prompt_tokens, in.prompt_tokens);
         ASSERT_EQ(session_.session.ref_model, &model_.model);
         ref_text_ptr_ = session_.session.ref_text_emb;
         ref_audio_ptr_ = session_.session.ref_audio_emb;
         ref_text_bytes_ = bytes_of(ref_text_ptr_);
         ref_audio_bytes_ = bytes_of(ref_audio_ptr_);
+        ref_prompt_tokens_ = session_.session.ref_prompt_tokens;
     }
 
     void generate(int64_t budget, uint32_t seed, const std::string & label,
@@ -337,6 +348,8 @@ protected:
         ASSERT_EQ(session_.session.ref_audio_emb, ref_audio_ptr_);
         ASSERT_EQ(session_.session.ref_T_ref, R_);
         ASSERT_EQ(session_.session.ref_T_prompt, P_);
+        EXPECT_EQ(session_.session.ref_prompt_tokens, ref_prompt_tokens_)
+            << label << ": ref_prompt_tokens changed";
         EXPECT_EQ(session_.session.ref_model, &model_.model);
         size_t diff = 0;
         EXPECT_TRUE(bytes_equal(ref_text_ptr_, ref_text_bytes_, diff))
@@ -416,6 +429,7 @@ protected:
     uint32_t slot_size_ = 0;
     std::vector<int32_t> target_phones_;
     std::vector<float> target_bert_;
+    std::vector<int32_t> ref_prompt_tokens_;
     ggml_tensor * ref_text_ptr_ = nullptr;
     ggml_tensor * ref_audio_ptr_ = nullptr;
     std::vector<unsigned char> ref_text_bytes_, ref_audio_bytes_;

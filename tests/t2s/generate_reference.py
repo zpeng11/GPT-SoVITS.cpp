@@ -360,12 +360,15 @@ def generation_policy(max_new_tokens, repetition_penalty):
             "repetition_penalty and its reciprocal must be finite and positive in float32")
     return {"top_k": 1, "top_p": 1.0, "temperature": 1.0,
             "repetition_penalty": float(repetition_penalty), "max_new_tokens": max_new_tokens,
-            "history": "generated-only-binary", "eos": "unmasked-before-accept"}
+            "history": "prompt+generated-binary", "eos": "unmasked-before-accept"}
 
 
-def adjusted_logits(logits, codes, repetition_penalty):
+def adjusted_logits(logits, codes, repetition_penalty, prompt=()):
+    """Penalize the binary history of the original prompt plus accepted codes."""
     adjusted = np.array(logits, dtype=np.float32, copy=True)
-    ids = np.asarray(sorted(set(codes)), dtype=np.int64)
+    history = [int(token) for token in prompt]
+    history.extend(int(token) for token in codes)
+    ids = np.asarray(sorted(set(history)), dtype=np.int64)
     values = adjusted[ids]
     penalty = np.float32(repetition_penalty)
     # C++ applies a precomputed reciprocal to nonnegative logits.
@@ -400,7 +403,8 @@ def run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penal
         for step in range(max_new_tokens):
             logits = model.ar_predict_layer(hidden[:, -1])[0].cpu().numpy().copy()
             require(np.isfinite(logits).all(), f"non-finite generation logits at step {step}")
-            token = int(adjusted_logits(logits, codes, repetition_penalty).argmax())
+            token = int(adjusted_logits(
+                logits, codes, repetition_penalty, inputs["prompt"]).argmax())
             rows.append(logits)
             selected.append(token)
             if token == model.EOS:
@@ -469,7 +473,9 @@ def validate_generation_reference(directory):
     if reason == "eos":
         require(arrays["selected"][-1] == hp["EOS"], "EOS stop must include an unaccepted EOS decision")
     for step, row in enumerate(arrays["logits"]):
-        expected_token = int(adjusted_logits(row, arrays["codes"][:step], policy["repetition_penalty"]).argmax())
+        expected_token = int(adjusted_logits(
+            row, arrays["codes"][:step], policy["repetition_penalty"],
+            arrays["prompt"]).argmax())
         require(expected_token == arrays["selected"][step], f"selected token disagrees with policy at step {step}")
     return manifest
 
@@ -623,7 +629,7 @@ def main(argv=None):
     parser.add_argument("--generate", action="store_true", help="export closed-loop top-k 1 under the C++ generation policy")
     parser.add_argument("--reference-phones", type=int, help="reference phone count in concatenated all-phones input")
     parser.add_argument("--max-new-tokens", type=int, help="generation budget (default: 200)")
-    parser.add_argument("--repetition-penalty", type=float, help="generated-only repetition penalty (default: 1.0)")
+    parser.add_argument("--repetition-penalty", type=float, help="prompt+generated repetition penalty (default: 1.0)")
     args = parser.parse_args(argv)
     exporting = (args.checkpoint, args.upstream_root, args.inputs_dir, args.output_dir, args.steps,
                  args.reference_phones, args.max_new_tokens, args.repetition_penalty)

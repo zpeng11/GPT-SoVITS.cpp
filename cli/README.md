@@ -5,10 +5,11 @@
 five v2Pro GGUF models onto one CPU backend, reads the reference audio and two
 text-frontend JSON files, and writes the raw 32 kHz mono F32 result as an
 IEEE-float WAV. The full synthesis contract (single reference, no streaming,
-sampler semantics that deliberately differ from the Python `infer_panel`, no
-output normalization) is the library's contract; see
-[tests/pipeline/README.md](../tests/pipeline/README.md) for its verified
-boundaries.
+no output normalization) is the library's contract. Repetition history includes
+reference prompt codes plus accepted generated codes; repeated IDs are penalized
+once. Python's early EOS suppression, duration-based stopping and RNG remain
+different. See [tests/pipeline/README.md](../tests/pipeline/README.md) for the
+verified boundaries.
 
 Build (independent, without tests):
 

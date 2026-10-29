@@ -587,6 +587,7 @@ TEST_F(ReferenceIntegration, DumpComponentsMatchReference) {
         LoadNpyI32(case_.dir + "ref_prompt_codes.npy", &ok, &npy_error);
     ASSERT_TRUE(ok) << npy_error;
     ASSERT_EQ(prompt_codes.size(), static_cast<size_t>(case_.T_prompt));
+    EXPECT_EQ(resources_.t2s_state.ref_prompt_tokens, prompt_codes);
 
     struct ggml_tensor * audio_weight = resources_.t2s.weights.embed.audio_embedding;
     struct ggml_tensor * alpha_tensor = resources_.t2s.weights.embed.audio_pos_alpha;
@@ -641,6 +642,7 @@ struct CacheSnapshot {
     struct ggml_tensor * ge_enc = nullptr;
     int64_t T_ref = 0;
     int64_t T_prompt = 0;
+    std::vector<int32_t> prompt_tokens;
     std::vector<float> text_values;
     std::vector<float> audio_values;
     std::vector<float> ge_values;
@@ -650,7 +652,7 @@ struct CacheSnapshot {
 CacheSnapshot CaptureCache(const gpt_sovits::t2s_session & ts,
                            const gpt_sovits::sovits_session & ss) {
     return {ts.ref_text_emb, ts.ref_audio_emb, ss.ge, ss.ge_enc,
-            ts.ref_T_ref, ts.ref_T_prompt,
+            ts.ref_T_ref, ts.ref_T_prompt, ts.ref_prompt_tokens,
             ReadTensorF32(ts.ref_text_emb), ReadTensorF32(ts.ref_audio_emb),
             ReadTensorF32(ss.ge), ReadTensorF32(ss.ge_enc)};
 }
@@ -664,6 +666,7 @@ void ExpectCacheUnchanged(const gpt_sovits::t2s_session & ts,
     EXPECT_EQ(ss.ge_enc, snap.ge_enc);
     EXPECT_EQ(ts.ref_T_ref, snap.T_ref);
     EXPECT_EQ(ts.ref_T_prompt, snap.T_prompt);
+    EXPECT_EQ(ts.ref_prompt_tokens, snap.prompt_tokens);
     EXPECT_EQ(ComputeErrors(ReadTensorF32(ts.ref_text_emb), snap.text_values).max_abs, 0.0);
     EXPECT_EQ(ComputeErrors(ReadTensorF32(ts.ref_audio_emb), snap.audio_values).max_abs, 0.0);
     EXPECT_EQ(ComputeErrors(ReadTensorF32(ss.ge), snap.ge_values).max_abs, 0.0);
@@ -812,6 +815,7 @@ TEST_F(ReferenceIntegration, PrepareAndEncodeReferenceFromWav) {
                   resources_.t2s_manual)), text_values).max_abs, 0.0);
     EXPECT_EQ(ComputeErrors(ReadTensorF32(gpt_sovits::t2s_session_get_ref_audio_emb(
                   resources_.t2s_manual)), audio_values).max_abs, 0.0);
+    EXPECT_EQ(resources_.t2s_state.ref_prompt_tokens, resources_.t2s_manual.ref_prompt_tokens);
     EXPECT_EQ(ComputeErrors(ReadTensorF32(gpt_sovits::sovits_session_get_ge(
                   resources_.sovits_manual)), ge_values).max_abs, 0.0);
     EXPECT_EQ(ComputeErrors(ReadTensorF32(gpt_sovits::sovits_session_get_ge_enc(

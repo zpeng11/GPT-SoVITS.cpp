@@ -212,6 +212,17 @@ static bool validate_request(const t2s_session       & session,
         fprintf(stderr, "%s: cached reference embeddings are missing or incompatible\n", __func__);
         return false;
     }
+    if (session.ref_prompt_tokens.size() != (uint64_t) T_prompt) {
+        fprintf(stderr, "%s: cached reference prompt token count does not match embeddings\n", __func__);
+        return false;
+    }
+    for (int32_t token : session.ref_prompt_tokens) {
+        if (token < 0 || (uint32_t) token >= hp.eos) {
+            fprintf(stderr, "%s: cached reference prompt token %d outside [0, %u)\n",
+                    __func__, token, hp.eos);
+            return false;
+        }
+    }
 
     if (session.gf_dec != nullptr && session.decode_model != &model) {
         fprintf(stderr, "%s: existing decode graph was built for another model\n", __func__);
@@ -443,6 +454,9 @@ bool t2s_session_generate(t2s_session               & session,
         std::exponential_distribution<float> dist(1.0f);
         std::vector<float> noise((size_t) vocab);
         std::vector<float> seen((size_t) vocab, 0.0f);
+        for (int32_t token : session.ref_prompt_tokens) {
+            seen[(size_t) token] = 1.0f;
+        }
         std::vector<int32_t> codes;
         codes.reserve((size_t) M);
 
@@ -468,8 +482,6 @@ bool t2s_session_generate(t2s_session               & session,
             ggml_backend_tensor_set(flex.g.x_prefill, x_host.data(), 0,
                                     (size_t) (d_model * N * (int64_t) sizeof(float)));
 
-            // The repetition mask starts empty: it covers only tokens accepted
-            // in this call, never the prompt or reference audio.
             if (flex.g.seen_mask != nullptr) {
                 ggml_backend_tensor_set(flex.g.seen_mask, seen.data(), 0,
                                         (size_t) (vocab * (int64_t) sizeof(float)));

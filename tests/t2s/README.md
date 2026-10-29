@@ -272,18 +272,23 @@ policy rather than calling `infer_panel` or replaying a UI-generated sequence.
 It does not read `generated_codes.npy`.
 
 The restricted policy is top-k 1, top-p 1, temperature 1, with a finite positive
-F32 repetition penalty. Seen tokens are a binary set of **accepted generated
-codes only**, excluding the prompt. A seen negative logit is multiplied by the
-penalty; a nonnegative logit is scaled by its F32 reciprocal. The maximum
+F32 repetition penalty. Seen tokens are a binary set of **reference prompt codes
+plus accepted generated codes**, initialized from the prompt before the first
+prediction and reset for each request. Repeated IDs are penalized once, not once
+per occurrence. A seen negative logit is multiplied by the penalty; a nonnegative
+logit is scaled by its F32 reciprocal. The maximum
 adjusted logit supplies the candidate. EOS is never masked and is tested before
 acceptance; a length-limit stop retains the last accepted code. Top-k 1 removes
 cross-language random-number differences; exact ties are not a portable sampling
 oracle and should be avoided when preparing cases.
 
-This deliberately differs from the upstream UI: its early EOS suppression,
-prompt-inclusive repetition history and raw-logit EOS test are not reproduced.
-Changing the production sampler's defaults or establishing stochastic sampling
-parity is outside this regression's scope.
+The repetition history scope now matches upstream's prompt-plus-generated
+history. Early EOS suppression, duration-based stopping and cross-language RNG
+remain different; nonnegative logits still use C++'s precomputed F32 reciprocal.
+The EOS check remains on the adjusted greedy token or sampled token before
+acceptance. This is not full `infer_panel` or stochastic sampling parity, and
+sampling defaults are unchanged. With the default repetition penalty of 1.35,
+generated sequences can change; a penalty of 1.0 disables the history effect.
 
 ### Export and run
 
@@ -318,6 +323,9 @@ Use the isolated environment described above for exporting if needed; `--validat
 and NumPy-only tool tests need neither torch nor upstream imports. `--generate`
 cannot be combined with `--steps`; generation policy flags are rejected without
 `--generate`. Existing teacher-forced commands and schema remain unchanged.
+Generation manifests now require `policy.history == "prompt+generated-binary"`;
+older `"generated-only-binary"` exports are rejected and must be re-exported to
+a new directory. Changing the manifest string alone is not a valid migration.
 
 `GPTSOVITS_T2S_GENERATION_REFERENCE` defaults to empty (two numerical tests skip).
 Once configured, missing/invalid `rp1` or `rp135` cases, incompatible/F16 model
@@ -346,14 +354,14 @@ paths or timestamps are recorded in the manifest.
 EOS stops have `D=C+1`, with one final unaccepted EOS selection. Length-limit
 stops have `C=D=max_new_tokens`, with no EOS decision. Context lengths are
 `N..N+D-1`. The validator recomputes every selection from raw logits and the
-binary generated-only history; it also checks codes/decision/stop consistency,
-layout, IDs, finite values and file hashes. Empty codes are valid only for
+binary prompt-plus-generated history; it also checks codes/decision/stop
+consistency, layout, IDs, finite values and file hashes. Empty codes are valid only for
 immediate EOS; the C++ NPY reader permits zero length explicitly for that array,
 not for ordinary decode inputs.
 
 The C++ integration test installs exported reference-text and prompt embeddings
-in a session-owned reference cache. It sends **target** phones/BERT to public
-`t2s_session_generate`, covering real target embedding, host concatenation,
+plus prompt token IDs in a session-owned reference cache. It sends **target**
+phones/BERT to public `t2s_session_generate`, covering real target embedding, host concatenation,
 prefill, persistent decode, sampler state and stopping. It asserts exact codes
 and stop reason, then verifies a short-budget prefix retains every accepted code
 and a second seed reproduces the full result using the same decode graph. Slot
@@ -369,9 +377,11 @@ codes, maximum 200), independent exports were byte-identical for both policies:
 | Repetition penalty | Accepted codes | Decisions | Stop reason | Smallest adjusted top-2 gap |
 | --- | ---: | ---: | --- | ---: |
 | 1.0 | 200 | 200 | `max_new_tokens` | `0.0403` |
-| 1.35 | 74 | 75 | `eos` | `0.00820` |
+| 1.35 | 77 | 78 | `eos` | `0.00730` |
 
-Both public API tests matched the full sequence and stop exactly, including
+All eight no-penalty arrays remain byte-identical to the previous generated-only
+baseline. With penalty 1.35, the accepted sequence changes from 74 codes to 77.
+Both public API tests matched the new full sequence and stop exactly, including
 short-budget and same-session repeat checks. The no-penalty limit is reported
 as a limit, not as successful natural termination. These observations do not
 imply other inputs will stop at the same lengths or that the UI's different

@@ -143,7 +143,7 @@ bool encode_reference(const reference_features & f, const t2s_model & t2s,
                        t2s_session & ts, sovits_session & ss, std::string * error) {
     if (!validate_reference_features(f, error)) return false;
     if (ts.ctx_ref || ts.buf_ref || ts.ref_text_emb || ts.ref_audio_emb || ts.ref_model ||
-        ts.ref_T_ref || ts.ref_T_prompt || ts.ctx_graph || ts.decode_model ||
+        ts.ref_T_ref || ts.ref_T_prompt || !ts.ref_prompt_tokens.empty() || ts.ctx_graph || ts.decode_model ||
         ss.ctx_ge || ss.buf_ge || ss.ge || ss.ctx_ge_enc || ss.buf_ge_enc || ss.ge_enc) {
         return fail(error, "reference encoding requires fresh sessions without cached reference/decode state");
     }

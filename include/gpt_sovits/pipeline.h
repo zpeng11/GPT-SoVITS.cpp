@@ -53,7 +53,8 @@ struct synthesis_result {
 // normalization, clipping, appended silence, int16 conversion or file IO. Codes
 // exclude the reference prompt and EOS. Length-limit termination retains all
 // accepted codes and reports max_new_tokens. Immediate EOS is an error (no retry).
-// Sampler semantics are those of t2s_session_generate, not Python infer_panel.
+// Repetition history includes prompt ids plus accepted codes. EOS is not masked
+// in early steps; sampler semantics otherwise follow t2s_session_generate.
 // Seeds are reproducible only within the same build/backend, not across Python.
 //
 // Success replaces result and clears error; failure preserves result. Recoverable

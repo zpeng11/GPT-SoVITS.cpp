@@ -150,6 +150,15 @@ TEST(ReferenceEncoding, ExistingCacheIsRejectedBeforeModelsAreAccessed) {
     EXPECT_EQ(ts.ref_T_ref, 10);
     EXPECT_EQ(ts.ctx_ref, nullptr);
     EXPECT_EQ(ss.ge, nullptr);
+
+    ts.ref_T_ref = 0;
+    ts.ref_prompt_tokens = {1};
+    error.clear();
+    EXPECT_FALSE(pipeline::encode_reference(f, t2s, sovits, sv, ts, ss, &error));
+    EXPECT_NE(error.find("fresh sessions"), std::string::npos);
+    EXPECT_EQ(ts.ref_prompt_tokens, (std::vector<int32_t>{1}));
+    EXPECT_EQ(ts.ctx_ref, nullptr);
+    EXPECT_EQ(ss.ge, nullptr);
 }
 
 } // namespace

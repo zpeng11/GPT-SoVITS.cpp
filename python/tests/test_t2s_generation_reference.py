@@ -70,14 +70,13 @@ def generation_arrays(reference_text=2, target_text=3, prompt=2, codes=3, *,
                        "codes": codes, "decisions": decisions},
         "policy": dict(top_k=1, top_p=1.0, temperature=1.0,
                        repetition_penalty=float(penalty), max_new_tokens=budget,
-                       history="generated-only-binary", eos="unmasked-before-accept"),
+                       history="prompt+generated-binary", eos="unmasked-before-accept"),
         "stop_reason": "eos" if eos else "max_new_tokens", "sources": gen_provenance(),
         "execution": dict(old.EXECUTION), "arrays": {}}
     return arrays, manifest
 
-def write_generation(root, name="ref", **kwargs):
-    arrays, manifest = generation_arrays(**kwargs)
-    output = Path(root) / name
+def publish_generation(output, arrays, manifest):
+    output = Path(output)
     output.mkdir()
     for array_name, array in arrays.items():
         np.save(output / (array_name + ".npy"), array, allow_pickle=False)
@@ -90,6 +89,10 @@ def write_generation(root, name="ref", **kwargs):
     (output / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return output, manifest
+
+def write_generation(root, name="ref", **kwargs):
+    arrays, manifest = generation_arrays(**kwargs)
+    return publish_generation(Path(root) / name, arrays, manifest)
 
 def mutate(change):
     return lambda output: old.mutate_manifest(output, change)
@@ -174,8 +177,11 @@ class GreedyPolicyTests(unittest.TestCase):
             "negative multiply": ([1], [row({5: -2.0, 6: -2.5})] * 2, 2, 2.0, [5, 6]),
             # Binary history: the second sighting applies the same penalty.
             "penalty once": ([1], [row({5: 3.0, 6: 2.5})] * 3, 3, 2.0, [5, 6, 5]),
-            # Prompt IDs never enter the generated-only history.
-            "prompt excluded": ([5], [row({5: 3.0, 6: 2.5})], 1, 2.0, [5]),
+            # The original prompt is already in the history at step 0.
+            "prompt first step": ([5], [row({5: 3.0, 6: 2.5})], 1, 2.0, [6]),
+            # Prompt and accepted IDs share one binary history.
+            "prompt and generated": ([5], [row({5: 3.0, 6: 2.5})] * 3, 3, 2.0,
+                                     [6, 5, 5]),
             # EOS is unmasked and stops before being appended.
             "eos unmasked": ([1], [row({EOS: 5.0, 5: 4.0})], 3, 2.0, [EOS]),
             # At the budget the last accepted code is retained, no extra probe.
@@ -216,7 +222,7 @@ class GreedyPolicyTests(unittest.TestCase):
                     raw = model.ar_predict_layer(hidden[0, -1:])[0].numpy()
                 np.testing.assert_allclose(arrays["logits"][step], raw, rtol=1e-4, atol=1e-4)
                 expected = int(np.argmax(TOOL.adjusted_logits(
-                    raw, codes[:step].tolist(), 1.5)))
+                    raw, codes[:step].tolist(), 1.5, inputs["prompt"])))
                 self.assertEqual(int(arrays["selected"][step]), expected)
                 if step == 0:
                     np.testing.assert_allclose(arrays["prefill_input"],
@@ -246,6 +252,38 @@ class ManifestTests(unittest.TestCase):
                     name: "float32" if name in {"bert", "prefill_input", "logits"}
                     else "int32" for name in ARRAY_KEYS})
 
+    def test_prompt_history_starts_at_first_decision(self):
+        # Under prompt+generated history the prompt token is penalized at step
+        # 0, so the raw runner-up (2.2 / 2 = 1.1) no longer wins and the
+        # recorded selected token 1 stays valid.  A generated-only reader
+        # would reject this export.
+        with tempfile.TemporaryDirectory() as directory:
+            arrays, manifest = generation_arrays(prompt=1, codes=2, penalty=2.0)
+            arrays["prompt"] = np.asarray([6], dtype=np.int32)
+            logits = arrays["logits"].copy()
+            logits[0] = -0.5
+            logits[0, 1] = 2.0  # chosen[0]
+            logits[0, 6] = 2.2  # prompt token, penalized to 1.1
+            arrays["logits"] = logits
+            output, manifest = publish_generation(
+                Path(directory) / "ref", arrays, manifest)
+            self.assertEqual(TOOL.validate_generation_reference(output), manifest)
+
+    def test_history_is_binary_and_penalty_one_is_identity(self):
+        row = np.full(VOCAB, -10.0, dtype=np.float32)
+        row[5], row[6] = -1.0, -1.5
+        once = TOOL.adjusted_logits(row, [], 2.0, [5])
+        duplicate = TOOL.adjusted_logits(row, [], 2.0, [5, 5])
+        np.testing.assert_array_equal(once, duplicate)
+        self.assertAlmostEqual(float(once[5]), -2.0, places=6)
+        self.assertAlmostEqual(float(once[6]), -1.5, places=6)
+        # Accepted codes join the same binary history as the prompt.
+        joined = TOOL.adjusted_logits(row, [6], 2.0, [5])
+        self.assertAlmostEqual(float(joined[6]), -3.0, places=6)
+        # penalty=1.0 leaves every logit unchanged.
+        np.testing.assert_array_equal(
+            TOOL.adjusted_logits(row, [5, 6], 1.0, [5, 6]), row)
+
     def test_tampering_and_policy_violations_are_rejected(self):
         cases = {
             "stop eos on limit": ({}, mutate(lambda m: m.update(stop_reason="eos"))),
@@ -257,6 +295,8 @@ class ManifestTests(unittest.TestCase):
             "reference zero": ({}, mutate(lambda m: m["dimensions"].update(
                 reference_text=0, target_text=5))),
             "top_k": ({}, mutate(lambda m: m["policy"].update(top_k=2))),
+            "old history": ({}, mutate(lambda m: m["policy"].update(
+                history="generated-only-binary"))),
             "penalty zero": ({}, mutate(lambda m: m["policy"].update(repetition_penalty=0.0))),
             "penalty nan": ({}, mutate(
                 lambda m: m["policy"].update(repetition_penalty=float("nan")))),
@@ -445,7 +485,7 @@ class GenerationCliTests(unittest.TestCase):
             self.assertEqual(manifest["policy"],
                              {"top_k": 1, "top_p": 1.0, "temperature": 1.0,
                               "repetition_penalty": 1.35, "max_new_tokens": 3,
-                              "history": "generated-only-binary",
+                              "history": "prompt+generated-binary",
                               "eos": "unmasked-before-accept"})
             self.assertEqual(manifest["stop_reason"], reason)
             self.assertEqual(manifest["execution"], old.EXECUTION)

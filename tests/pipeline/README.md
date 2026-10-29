@@ -44,8 +44,10 @@ with an initial total limit of 1024. Over-budget requests fail without truncatio
 An immediate EOS is an error and never calls SoVITS or retries. Length-limit
 termination retains all accepted codes and reports `max_new_tokens` through
 `result.stop_reason`. No normalization, clipping, trailing silence or int16
-conversion is applied. The runner preserves the existing C++ T2S sampling rules;
-it does not reproduce Python's early EOS suppression or prompt repetition mask.
+conversion is applied. The T2S repetition mask is a binary set of reference prompt
+codes plus codes accepted in this request, matching upstream's history scope.
+Repeated IDs are penalized once, and history is reset for every call. Python's
+early EOS suppression, duration-based stopping and RNG are not reproduced.
 Same-seed reproducibility is restricted to the same build/backend.
 
 Build and run the runner tests using the same explicit local case setting as the
@@ -76,9 +78,10 @@ For the matched local CPU case, fixed codes/conditioning/noise produced 87,040
 samples with peak absolute error `1.45e-2`, RMSE `1.95e-3` and correlation
 `0.999923` against the Python raw waveform. The asserted limits are `3e-2`,
 `5e-3` and correlation above `0.999`. The full runner with greedy top-k 1,
-semantic seed 42 and noise seed 7 generated 73 codes, stopped at EOS and returned
-93,440 samples (2.92 seconds). Python's separate stochastic run generated 68
-codes; that difference is not treated as a decoding mismatch.
+semantic seed 42 and noise seed 7 generated 72 codes, stopped at EOS and returned
+92,160 samples (2.88 seconds) with prompt-plus-generated repetition history.
+Python's separate stochastic run generated 68 codes; that difference is not
+treated as a decoding mismatch.
 
 ## Reference conditioning
 

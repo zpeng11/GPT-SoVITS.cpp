@@ -9,6 +9,7 @@
 #include <cstdio>
 #include <new>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 namespace gpt_sovits {
@@ -181,6 +182,7 @@ void t2s_session_free(t2s_session & session) {
     session.ref_audio_emb = nullptr;
     session.ref_T_ref     = 0;
     session.ref_T_prompt  = 0;
+    session.ref_prompt_tokens.clear();
     session.ref_model     = nullptr;
 
     if (session.alloc_dec) {
@@ -998,7 +1000,7 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
     // One session = one reference. Reject duplicates before touching any state
     // so a second call cannot overwrite (and leak) the cached tensors.
     if (session.ctx_ref || session.buf_ref || session.ref_text_emb ||
-        session.ref_audio_emb || session.ref_model) {
+        session.ref_audio_emb || session.ref_model || !session.ref_prompt_tokens.empty()) {
         fprintf(stderr, "%s: reference embedding already computed\n", __func__);
         return false;
     }
@@ -1148,12 +1150,31 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
         int64_t audio_elems = 0;
         size_t  text_bytes  = 0;
         size_t  audio_bytes = 0;
+        size_t  prompt_bytes = 0;
         if (!mul_ok(out_d, T_ref, text_elems) ||
             !bytes_ok(text_elems, sizeof(float), text_bytes) ||
             !mul_ok(out_d, T_prompt, audio_elems) ||
-            !bytes_ok(audio_elems, sizeof(float), audio_bytes)) {
+            !bytes_ok(audio_elems, sizeof(float), audio_bytes) ||
+            !bytes_ok(T_prompt, sizeof(int32_t), prompt_bytes)) {
             fprintf(stderr, "%s: output size overflow\n", __func__);
             return false;
+        }
+
+        struct ggml_tensor * prompt = ggml_graph_get_tensor(gf, "ref_prompt_tokens");
+        if (!prompt || prompt->type != GGML_TYPE_I32 || prompt->ne[0] != T_prompt ||
+            prompt->ne[1] != 1 || prompt->ne[2] != 1 || prompt->ne[3] != 1 ||
+            !ggml_is_contiguous(prompt)) {
+            fprintf(stderr, "%s: invalid reference prompt token layout\n", __func__);
+            return false;
+        }
+        std::vector<int32_t> prompt_tokens((size_t) T_prompt);
+        ggml_backend_tensor_get(prompt, prompt_tokens.data(), 0, prompt_bytes);
+        for (int32_t token : prompt_tokens) {
+            if (token < 0 || (uint32_t) token >= model.hparams.eos) {
+                fprintf(stderr, "%s: reference prompt token %d outside [0, %u)\n",
+                        __func__, token, model.hparams.eos);
+                return false;
+            }
         }
 
         // --- Create (but do not yet publish) the persistent tensors ---
@@ -1195,13 +1216,14 @@ bool t2s_session_compute_ref_emb(t2s_session       & session,
         }
 
         // --- All steps succeeded: atomically publish the cache. Everything
-        //     past this point is a non-throwing pointer move. ---
+        //     past this point is a non-throwing move. ---
         session.ctx_ref       = cache.ctx;
         session.buf_ref       = cache.buf;
         session.ref_text_emb  = new_text;
         session.ref_audio_emb = new_audio;
         session.ref_T_ref     = T_ref;
         session.ref_T_prompt  = T_prompt;
+        session.ref_prompt_tokens = std::move(prompt_tokens);
         session.ref_model     = &model;
         cache.ctx = nullptr;
         cache.buf = nullptr;

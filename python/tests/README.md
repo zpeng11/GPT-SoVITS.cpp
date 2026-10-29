@@ -95,8 +95,8 @@ The matched-policy closed-loop mode has a separate test suite:
 python3 -m unittest discover -s python/tests -p test_t2s_generation_reference.py -v
 ```
 
-It reuses the tiny model fixtures to check self-feedback, generated-only binary
-repetition history, EOS/length-limit behavior, independent full-forward logits,
-manifest validation and cross-process export identity. NumPy-only validation and
+It reuses the tiny model fixtures to check self-feedback, prompt-plus-generated
+binary repetition history, EOS/length-limit behavior, independent full-forward
+logits, manifest validation and cross-process export identity. NumPy-only validation and
 CLI rejection tests still run without PyTorch; model computation tests skip when
 it is absent. This is not a comparison with the upstream UI's sampling defaults.

@@ -7,7 +7,7 @@
 // writes the raw 32 kHz mono F32 result as an IEEE-float WAV. This is a thin
 // shell over the public library API: text processing, resampling, clipping,
 // streaming and GPU paths do not live here. The synthesis contract, including
-// its deliberate non-parity with the Python sampler, is documented in
+// its remaining differences from Python inference, is documented in
 // include/gpt_sovits/pipeline.h.
 //
 // Exit codes: 0 success, 1 runtime failure, 2 usage error.

@@ -483,6 +483,8 @@ static ::ggml_tensor * t2s_audio_embed_block_forward(
     // 2. Extract prompt semantic tokens from HuBERT.
     ::ggml_tensor * prompt_tokens = sovits_extract_latent_block_forward(
         ctx, hubert_feature, extract_latent_weights);
+    ggml_set_name(prompt_tokens, "ref_prompt_tokens");
+    ggml_set_output(prompt_tokens);
 
     // 3. Audio embed prompt tokens + PE from position 0.
     GGML_ASSERT(embed_weights.audio_embedding != nullptr);

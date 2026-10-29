@@ -101,7 +101,7 @@ inline policy validate_policy(const json & value) {
         !std::isfinite(1.0f / out.repetition_penalty)) {
         fail(where + ".repetition_penalty", "penalty and reciprocal must be positive finite float32");
     }
-    d::require_string(d::field(value, "history", where), "generated-only-binary", where + ".history");
+    d::require_string(d::field(value, "history", where), "prompt+generated-binary", where + ".history");
     d::require_string(d::field(value, "eos", where), "unmasked-before-accept", where + ".eos");
     return out;
 }
@@ -226,7 +226,15 @@ inline void validate_selection(const Reference & reference, const gpt_sovits::t2
     }
 
     const int64_t vocab = hparams.vocab_size;
+    // Binary history: the original prompt is seen from the first decision;
+    // accepted generated codes join it, and repeated IDs are penalized once.
     std::vector<unsigned char> seen(static_cast<size_t>(vocab), 0);
+    for (int32_t id : reference.input.prompt_tokens) {
+        if (id < 0 || static_cast<uint64_t>(id) >= static_cast<uint64_t>(vocab)) {
+            fail("prompt.npy", "token ID out of range");
+        }
+        seen[static_cast<size_t>(id)] = 1;
+    }
     for (int64_t step = 0; step < decisions; ++step) {
         const size_t base = static_cast<size_t>(step * vocab);
         int64_t best = 0;

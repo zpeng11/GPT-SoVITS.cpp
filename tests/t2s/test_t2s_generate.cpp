@@ -285,6 +285,7 @@ static void install_cached_ref(gpt_sovits::t2s_session & session,
 
     session.ref_T_ref    = T_ref;
     session.ref_T_prompt = T_prompt;
+    session.ref_prompt_tokens.assign((size_t) T_prompt, 0);
     session.ref_model    = &model;
 }
 
@@ -594,6 +595,43 @@ TEST(T2SGenerateSynthetic, ExactMaxAndSlotBoundary) {
         expect_result_unchanged(result);
         EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(rig.session, 0), 0);
         EXPECT_EQ(gpt_sovits::t2s_session_find_free_slot(rig.session), 0);
+    }
+}
+
+TEST(T2SGenerateSynthetic, PromptHistoryAppliesFromPrefillAndResetsPerCall) {
+    const SynthSpec spec;
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    const std::vector<int32_t> tokens = {0, 1};
+    const auto bert = make_zeros(2048);
+
+    for (float penalty : {1.0f, 1.35f}) {
+        SCOPED_TRACE(penalty);
+        Rig rig;
+        init_rig(rig, spec, 16, make_sampler_config(1, penalty));
+        setup_constant_token(rig.model, 0);
+        set_tensor_column(rig.model.weights.lm_head_w, 1, scale_vec(u, 0.8f));
+        install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+        ASSERT_EQ(rig.session.ref_prompt_tokens, (std::vector<int32_t>{0, 0}));
+
+        // A has score 1 and B 0.8. Penalizing A once makes B the first choice;
+        // after accepting B, A wins again. Counting repeated A twice would not.
+        const std::vector<int32_t> expected = penalty == 1.0f
+            ? std::vector<int32_t>{0, 0, 0, 0}
+            : std::vector<int32_t>{1, 0, 0, 0};
+        ggml_cgraph * decode = nullptr;
+        for (int32_t budget : {4, 1, 4}) {
+            gpt_sovits::t2s_generate_result result;
+            ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+                rig.session, rig.model, tokens.data(), tokens.size(), bert.data(),
+                result, gen_cfg(budget)));
+            EXPECT_EQ(result.codes, (std::vector<int32_t>(
+                expected.begin(), expected.begin() + budget)));
+            EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::max_new_tokens);
+            EXPECT_EQ(rig.session.ref_prompt_tokens, (std::vector<int32_t>{0, 0}));
+            EXPECT_EQ(rig.session.slots[0].n_pos, 0);
+            if (!decode) decode = rig.session.gf_dec;
+            EXPECT_EQ(rig.session.gf_dec, decode);
+        }
     }
 }
 
@@ -930,6 +968,42 @@ TEST(T2SGenerateSynthetic, RequestContractRejections) {
     }
 }
 
+TEST(T2SGenerateSynthetic, InvalidPromptHistoryRejectedBeforeCompute) {
+    const SynthSpec spec;
+    Rig rig;
+    init_rig(rig, spec, 16, make_sampler_config(1, 1.35f));
+    setup_constant_token(rig.model, 0);
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+    const auto mask_before = rig.session.mask_host;
+    const std::vector<int32_t> tokens = {0, 1};
+    const auto bert = make_zeros(2048);
+
+    const std::vector<std::vector<int32_t>> invalid = {
+        {}, {0}, {0, 0, 0}, {-1, 0}, {0, (int32_t) rig.model.hparams.eos},
+        {0, std::numeric_limits<int32_t>::max()},
+    };
+    for (const auto & prompt : invalid) {
+        SCOPED_TRACE(::testing::PrintToString(prompt));
+        rig.session.ref_prompt_tokens = prompt;
+        auto result = make_sentinel_result();
+        EXPECT_FALSE(gpt_sovits::t2s_session_generate(
+            rig.session, rig.model, tokens.data(), tokens.size(), bert.data(),
+            result, gen_cfg(2)));
+        expect_result_unchanged(result);
+        EXPECT_EQ(rig.session.ref_prompt_tokens, prompt);
+        EXPECT_EQ(rig.session.mask_host, mask_before);
+        EXPECT_EQ(rig.session.slots[0].n_pos, 0);
+        EXPECT_EQ(rig.session.alloc_flex, nullptr);
+        EXPECT_EQ(rig.session.gf_dec, nullptr);
+    }
+    rig.session.ref_prompt_tokens = {0, 0};
+    gpt_sovits::t2s_generate_result result;
+    EXPECT_TRUE(gpt_sovits::t2s_session_generate(
+        rig.session, rig.model, tokens.data(), tokens.size(), bert.data(),
+        result, gen_cfg(2)));
+}
+
 TEST(T2SGenerateSynthetic, SessionVocabularyMismatchRejectedBeforePrefill) {
     BackendGuard backend;
     backend.backend = ggml_backend_cpu_init();
@@ -1113,40 +1187,55 @@ TEST(T2SGenerateSynthetic, LongThenShortIsPrefixAndResetsSlot) {
 
 TEST(T2SGenerateSynthetic, ComputeRefEmbThenGenerate) {
     const SynthSpec spec;
-    Rig rig;
-    init_rig(rig, spec, 16, make_sampler_config(1));
-
-    setup_constant_token(rig.model, 0);
-
     const int64_t T_ref = 3;
     const int64_t T_hub = 8;
     const int64_t T_prompt = (T_hub - 2) / 2 + 1;  // kernel 2, stride 2
-
-    std::vector<int32_t> ref_tokens((size_t) T_ref, 1);
-    std::vector<float> ref_bert((size_t) (1024 * T_ref), 0.25f);
-    std::vector<float> hubert((size_t) (768 * T_hub), 0.5f);
-
-    ASSERT_TRUE(gpt_sovits::t2s_session_compute_ref_emb(
-        rig.session, rig.model, ref_tokens.data(), T_ref,
-        ref_bert.data(), hubert.data(), T_hub));
-
-    EXPECT_EQ(rig.session.ref_model, &rig.model);
-    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_ref(rig.session), T_ref);
-    EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_prompt(rig.session), T_prompt);
-    ASSERT_NE(gpt_sovits::t2s_session_get_ref_text_emb(rig.session), nullptr);
-    ASSERT_NE(gpt_sovits::t2s_session_get_ref_audio_emb(rig.session), nullptr);
-
+    const std::vector<int32_t> ref_tokens((size_t) T_ref, 1);
+    const std::vector<float> ref_bert((size_t) (1024 * T_ref), 0.25f);
+    const std::vector<float> hubert((size_t) (768 * T_hub), 0.5f);
     const std::vector<int32_t> tokens = {1, 2};
     const std::vector<float> target_bert((size_t) (1024 * tokens.size()), 0.1f);
 
-    gpt_sovits::t2s_generate_result result;
-    ASSERT_TRUE(gpt_sovits::t2s_session_generate(
-        rig.session, rig.model, tokens.data(), (int64_t) tokens.size(),
-        target_bert.data(), result, gen_cfg(3)));
+    for (float penalty : {1.0f, 1.35f}) {
+        SCOPED_TRACE(penalty);
+        Rig rig;
+        init_rig(rig, spec, 16, make_sampler_config(1, penalty));
+        setup_constant_token(rig.model, 1);
+        const auto u = zero_mean_dir(spec.d_model, 0);
+        set_tensor_column(rig.model.weights.lm_head_w, 0, scale_vec(u, 0.8f));
+        // SSL projection is zero, so code 1 is the unique nearest codebook row.
+        for (int64_t code : {0, 2}) {
+            set_tensor_column(rig.model.weights.extract_latent.codebook, code,
+                              std::vector<float>((size_t) kHubertDim, 1.0f));
+        }
+        ASSERT_TRUE(gpt_sovits::t2s_session_compute_ref_emb(
+            rig.session, rig.model, ref_tokens.data(), T_ref,
+            ref_bert.data(), hubert.data(), T_hub));
 
-    EXPECT_EQ(result.codes, (std::vector<int32_t>(3, 0)));
-    EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::max_new_tokens);
-    EXPECT_NE(rig.session.gf_dec, nullptr);
+        EXPECT_EQ(rig.session.ref_model, &rig.model);
+        EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_ref(rig.session), T_ref);
+        EXPECT_EQ(gpt_sovits::t2s_session_get_ref_T_prompt(rig.session), T_prompt);
+        ASSERT_NE(gpt_sovits::t2s_session_get_ref_text_emb(rig.session), nullptr);
+        ASSERT_NE(gpt_sovits::t2s_session_get_ref_audio_emb(rig.session), nullptr);
+        EXPECT_EQ(rig.session.ref_prompt_tokens, (std::vector<int32_t>(T_prompt, 1)));
+
+        gpt_sovits::t2s_generate_result result;
+        ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+            rig.session, rig.model, tokens.data(), tokens.size(),
+            target_bert.data(), result, gen_cfg(3)));
+        EXPECT_EQ(result.codes, (penalty == 1.0f
+            ? std::vector<int32_t>{1, 1, 1} : std::vector<int32_t>{0, 1, 1}));
+        EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::max_new_tokens);
+        EXPECT_NE(rig.session.gf_dec, nullptr);
+        EXPECT_EQ(rig.session.ref_prompt_tokens, (std::vector<int32_t>(T_prompt, 1)));
+
+        EXPECT_FALSE(gpt_sovits::t2s_session_compute_ref_emb(
+            rig.session, rig.model, ref_tokens.data(), T_ref,
+            ref_bert.data(), hubert.data(), T_hub));
+        EXPECT_EQ(rig.session.ref_prompt_tokens, (std::vector<int32_t>(T_prompt, 1)));
+        gpt_sovits::t2s_session_free(rig.session);
+        EXPECT_TRUE(rig.session.ref_prompt_tokens.empty());
+    }
 }
 
 // ===========================================================================
@@ -1171,10 +1260,11 @@ TEST(T2SGenerateSynthetic, ComputeFailureReleasesSlotAndRetries) {
 
     SessionGuard session;
     init_one_slot_session(session.session, model.model, 16,
-                          make_sampler_config(1));
+                          make_sampler_config(1, 1.35f));
 
     const int64_t d = model.model.hparams.hidden_dim;
     const std::vector<float> u = zero_mean_dir(d, 0);
+    set_tensor_column(model.model.weights.lm_head_w, 1, scale_vec(u, 0.8f));
     install_cached_ref(session.session, model.model, 2, 2,
                        make_zeros((size_t) (d * 2)),
                        ref_audio_ending_in(d, 2, u));
@@ -1194,6 +1284,7 @@ TEST(T2SGenerateSynthetic, ComputeFailureReleasesSlotAndRetries) {
             << "fail_at=" << fail_at;
 
         expect_result_unchanged(failed);
+        EXPECT_EQ(session.session.ref_prompt_tokens, (std::vector<int32_t>{0, 0}));
         EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session.session, 0), 0)
             << "fail_at=" << fail_at;
         EXPECT_EQ(gpt_sovits::t2s_session_find_free_slot(session.session), 0)
@@ -1208,8 +1299,9 @@ TEST(T2SGenerateSynthetic, ComputeFailureReleasesSlotAndRetries) {
             session.session, model.model, tokens.data(),
             (int64_t) tokens.size(), bert.data(), ok, gen_cfg(4)))
             << "retry after fail_at=" << fail_at;
-        EXPECT_EQ(ok.codes, (std::vector<int32_t>(4, 0)))
+        EXPECT_EQ(ok.codes, (std::vector<int32_t>{1, 0, 0, 0}))
             << "retry after fail_at=" << fail_at;
+        EXPECT_EQ(session.session.ref_prompt_tokens, (std::vector<int32_t>{0, 0}));
         EXPECT_EQ(ok.stop_reason, gpt_sovits::t2s_stop_reason::max_new_tokens)
             << "retry after fail_at=" << fail_at;
         EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(session.session, 0), 0);
