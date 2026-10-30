@@ -96,7 +96,9 @@ python3 -m unittest discover -s python/tests -p test_t2s_generation_reference.py
 ```
 
 It reuses the tiny model fixtures to check self-feedback, prompt-plus-generated
-binary repetition history, EOS/length-limit behavior, independent full-forward
-logits, manifest validation and cross-process export identity. NumPy-only validation and
-CLI rejection tests still run without PyTorch; model computation tests skip when
+binary repetition history, the configurable initial EOS suppression window,
+length-limit behavior, independent full-forward logits, v2 generation manifest
+validation (including rejection of old unmasked exports) and cross-process export
+identity. NumPy-only validation and CLI rejection tests still run without PyTorch;
+model computation tests skip when
 it is absent. This is not a comparison with the upstream UI's sampling defaults.

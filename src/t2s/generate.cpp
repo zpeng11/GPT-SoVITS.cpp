@@ -200,6 +200,13 @@ static bool validate_request(const t2s_session       & session,
         }
     }
 
+    if (session.suppress_eos == nullptr || session.suppress_eos->type != GGML_TYPE_I32 ||
+        session.suppress_eos->ne[0] != session.n_batch ||
+        !ggml_is_vector(session.suppress_eos) || !ggml_is_contiguous(session.suppress_eos)) {
+        fprintf(stderr, "%s: session EOS suppression input is invalid\n", __func__);
+        return false;
+    }
+
     const int64_t T_ref    = session.ref_T_ref;
     const int64_t T_prompt = session.ref_T_prompt;
     if (session.ref_model != &model ||
@@ -266,6 +273,10 @@ static bool validate_request(const t2s_session       & session,
         return false;
     }
 
+    if (config.min_new_tokens < 0) {
+        fprintf(stderr, "%s: min_new_tokens must be nonnegative\n", __func__);
+        return false;
+    }
     const int64_t M = (int64_t) config.max_new_tokens;
     if (M <= 0) {
         fprintf(stderr, "%s: max_new_tokens must be > 0\n", __func__);
@@ -474,7 +485,8 @@ bool t2s_session_generate(t2s_session               & session,
                 fprintf(stderr, "%s: prefill graph build failed\n", __func__);
                 return false;
             }
-            if (flex.g.x_prefill == nullptr || flex.g.n_active != 1) {
+            if (flex.g.x_prefill == nullptr || flex.g.suppress_eos == nullptr ||
+                flex.g.n_active != 1) {
                 fprintf(stderr, "%s: prefill graph has an unexpected layout\n", __func__);
                 return false;
             }
@@ -487,6 +499,8 @@ bool t2s_session_generate(t2s_session               & session,
                                         (size_t) (vocab * (int64_t) sizeof(float)));
             }
 
+            const int32_t suppress_eos = config.min_new_tokens > 0 ? 1 : 0;
+            ggml_backend_tensor_set(flex.g.suppress_eos, &suppress_eos, 0, sizeof(suppress_eos));
             fill_exp_noise(noise, rng, dist);
             ggml_backend_tensor_set(flex.g.exp_noise, noise.data(), 0,
                                     (size_t) (vocab * (int64_t) sizeof(float)));
@@ -529,7 +543,8 @@ bool t2s_session_generate(t2s_session               & session,
             if (session.gf_dec == nullptr || session.decode_model != &model ||
                 session.token_id == nullptr || session.position == nullptr ||
                 session.seen_mask == nullptr || session.exp_noise == nullptr ||
-                session.sampled == nullptr || session.greedy == nullptr) {
+                session.suppress_eos == nullptr || session.sampled == nullptr ||
+                session.greedy == nullptr) {
                 fprintf(stderr, "%s: decode graph is incomplete or belongs to another model\n",
                         __func__);
                 return false;
@@ -545,6 +560,8 @@ bool t2s_session_generate(t2s_session               & session,
                 ggml_backend_tensor_set(session.token_id, &current_token, 0,
                                         sizeof(int32_t));
 
+                const int32_t suppress_eos = codes.size() < (size_t) config.min_new_tokens ? 1 : 0;
+                ggml_backend_tensor_set(session.suppress_eos, &suppress_eos, 0, sizeof(suppress_eos));
                 fill_exp_noise(noise, rng, dist);
                 ggml_backend_tensor_set(session.exp_noise, noise.data(), 0,
                                         (size_t) (vocab * (int64_t) sizeof(float)));

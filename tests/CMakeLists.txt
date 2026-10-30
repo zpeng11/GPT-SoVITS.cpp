@@ -341,6 +341,59 @@ if(TARGET gpt_sovits_cli)
         --target-frontend-json ${CMAKE_CURRENT_SOURCE_DIR}/frontend/fixtures/valid_mixed.json
         --output ${CMAKE_CURRENT_BINARY_DIR}/cli_loader_failure.wav)
 
+    # --min-new-tokens parsing without model assets. Accepted values pass parsing
+    # and reach the early input-path check (exit 1); rejected values are usage
+    # errors (exit 2). No case may create the output file.
+    set(CLI_EOS_WINDOW_INPUTS
+        --hubert /nonexistent/hubert.gguf
+        --t2s /nonexistent/t2s.gguf
+        --sovits /nonexistent/sovits.gguf
+        --sv /nonexistent/sv.gguf
+        --ref-audio /nonexistent/ref.wav
+        --ref-frontend-json /nonexistent/ref.json
+        --target-frontend-json /nonexistent/target.json)
+
+    add_test(NAME cli_min_new_tokens_zero_accepted
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_cli.cmake
+        1 ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_zero.wav
+        $<TARGET_FILE:gpt_sovits_cli>
+        ${CLI_EOS_WINDOW_INPUTS}
+        --min-new-tokens 0
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_zero.wav)
+
+    add_test(NAME cli_min_new_tokens_above_max_accepted
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_cli.cmake
+        1 ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_above_max.wav
+        $<TARGET_FILE:gpt_sovits_cli>
+        ${CLI_EOS_WINDOW_INPUTS}
+        --max-new-tokens 1
+        --min-new-tokens 11
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_above_max.wav)
+
+    add_test(NAME cli_min_new_tokens_negative_rejected
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_cli.cmake
+        2 ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_negative.wav
+        $<TARGET_FILE:gpt_sovits_cli>
+        ${CLI_EOS_WINDOW_INPUTS}
+        --min-new-tokens -1
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_negative.wav)
+
+    add_test(NAME cli_min_new_tokens_noninteger_rejected
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_cli.cmake
+        2 ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_noninteger.wav
+        $<TARGET_FILE:gpt_sovits_cli>
+        ${CLI_EOS_WINDOW_INPUTS}
+        --min-new-tokens 11x
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_noninteger.wav)
+
+    add_test(NAME cli_min_new_tokens_overflow_rejected
+        COMMAND ${CMAKE_COMMAND} -P ${CMAKE_CURRENT_SOURCE_DIR}/cli/check_cli.cmake
+        2 ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_overflow.wav
+        $<TARGET_FILE:gpt_sovits_cli>
+        ${CLI_EOS_WINDOW_INPUTS}
+        --min-new-tokens 2147483648
+        --output ${CMAKE_CURRENT_BINARY_DIR}/cli_min_new_tokens_overflow.wav)
+
     add_executable(cli_synthesis_check cli/check_synthesis.cpp)
     target_include_directories(cli_synthesis_check PRIVATE ${CMAKE_SOURCE_DIR}/third_party/dr_libs)
     target_link_libraries(cli_synthesis_check PRIVATE gpt_sovits_cpp_static)

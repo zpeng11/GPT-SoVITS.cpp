@@ -26,6 +26,9 @@ namespace gpt_sovits {
 //   repetition_penalty - 1.0 disables repetition penalty
 //   exp_noise          - optional Exp(1) noise samples          {vocab, n_batch} or nullptr
 //                        When null, this falls back to greedy argmax.
+//   suppress_eos       - optional I32 flags {n_batch}: 0 uses all logits, 1 excludes
+//                        the last vocabulary entry from both sampled and greedy.
+//                        Requires vocab > 1; nullptr preserves unmasked sampling.
 //
 // Returns:
 //   t2s_sampler_result with per-slot token ids, each {n_batch} (i32).
@@ -47,7 +50,8 @@ struct t2s_sampler_result t2s_sampler_block_forward(
     float                 top_p,
     float                 temperature,
     float                 repetition_penalty,
-    struct ggml_tensor  * exp_noise);
+    struct ggml_tensor  * exp_noise,
+    struct ggml_tensor  * suppress_eos = nullptr);
 
 // Tensor shapes use ggml convention throughout: ne[0] is the innermost dim.
 // PyTorch Linear(in, out).weight has shape [out, in] → ggml {in, out}.
@@ -356,6 +360,7 @@ struct t2s_session {
     // Sampler graph inputs (caller fills per decode step)
     struct ggml_tensor  * seen_mask  = nullptr;  // {vocab, n_batch} F32
     struct ggml_tensor  * exp_noise  = nullptr;  // {vocab, n_batch} F32
+    struct ggml_tensor  * suppress_eos = nullptr;  // {n_batch} I32, 0/1; initialized to 0
 
     // Sampler graph outputs
     struct ggml_tensor  * sampled    = nullptr;  // {n_batch} I32 — sampled token ids
@@ -510,6 +515,7 @@ struct ggml_tensor * t2s_session_get_sampled(const t2s_session & session);
 struct ggml_tensor * t2s_session_get_greedy(const t2s_session & session);
 struct ggml_tensor * t2s_session_get_seen_mask(const t2s_session & session);
 struct ggml_tensor * t2s_session_get_exp_noise(const t2s_session & session);
+struct ggml_tensor * t2s_session_get_suppress_eos(const t2s_session & session);
 
 // ---------------------------------------------------------------------------
 // Flexible computation graph for mixed prefill/decode batch steps
@@ -556,6 +562,7 @@ struct t2s_flex_graph {
     // Sampler inputs/outputs (caller fills seen_mask/exp_noise, reads sampled/greedy)
     struct ggml_tensor * seen_mask = nullptr;  // {vocab, n_active} F32 input (optional)
     struct ggml_tensor * exp_noise = nullptr;  // {vocab, n_active} F32 input (optional)
+    struct ggml_tensor * suppress_eos = nullptr;  // {n_active} I32 input, 0/1; initialized to 0
     struct ggml_tensor * sampled   = nullptr;  // {n_active} I32 output
     struct ggml_tensor * greedy    = nullptr;  // {n_active} I32 output
 
@@ -576,6 +583,7 @@ struct t2s_flex_graph {
 //   - decode_token_ids: {n_decode} I32           — decode token IDs
 //   - decode_positions: {n_decode} I32            — auto-filled by flex_advance
 //   - kv_pos, mask:                               — filled by flex_advance
+//   - suppress_eos:     {n_active} I32 0/1         — defaults to 0; excludes EOS when 1
 //
 // Token ordering: slot 0's tokens first, then slot 1's, etc.
 // Idle slots (n_query == 0) contribute zero tokens.
@@ -612,6 +620,7 @@ void t2s_session_flex_advance(t2s_session & session, const t2s_batch_plan & plan
 struct t2s_generate_config {
     int32_t  max_new_tokens = 200;
     uint32_t seed = 42;
+    int32_t  min_new_tokens = 11;
 };
 
 enum class t2s_stop_reason {
@@ -634,12 +643,15 @@ struct t2s_generate_result {
 // max_new_tokens > 0 includes the first prediction from prefill. With
 // N = T_ref + T_in + T_prompt, N + max_new_tokens - 1 must fit slot_size.
 //
-// Either sampled or greedy EOS stops generation BEFORE accepting that step's
-// candidate. The result contains neither prompt tokens nor EOS; immediate EOS
-// succeeds with empty codes. At the length limit all accepted codes are kept.
+// EOS is excluded from both sampled and greedy choices for the first
+// min_new_tokens predictions (default 11, including prefill). This value must be
+// nonnegative; 0 restores unmasked sampling and allows immediate EOS with empty
+// codes. max_new_tokens remains a hard limit, even when smaller than the minimum.
+// After the suppression window, either sampled or greedy EOS stops generation
+// BEFORE accepting that step's candidate. The result contains neither prompt
+// tokens nor EOS. At the length limit all accepted codes are kept.
 // The repetition mask is a binary set of reference prompt ids plus codes accepted
-// in this call, reset for each call. Unlike Python infer_panel, there is no
-// early-step EOS suppression.
+// in this call, reset along with the suppression counter for each call.
 // RNG is reset per call; reproducibility is limited to the same build/backend.
 //
 // Returns false with diagnostics on invalid input or recoverable compute/allocation

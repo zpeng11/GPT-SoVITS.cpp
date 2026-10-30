@@ -265,7 +265,7 @@ quantized KV, other backends or arbitrary model architectures.
 
 ## Matched-policy closed-loop generation
 
-`--generate` exports a **separate** `gpt-sovits-t2s-generation-reference/v1`
+`--generate` exports a **separate** `gpt-sovits-t2s-generation-reference/v2`
 reference using the same trusted upstream model and CPU/F32 execution. The
 forward is upstream code; the small outer loop explicitly implements the C++
 policy rather than calling `infer_panel` or replaying a UI-generated sequence.
@@ -277,18 +277,23 @@ plus accepted generated codes**, initialized from the prompt before the first
 prediction and reset for each request. Repeated IDs are penalized once, not once
 per occurrence. A seen negative logit is multiplied by the penalty; a nonnegative
 logit is scaled by its F32 reciprocal. The maximum
-adjusted logit supplies the candidate. EOS is never masked and is tested before
-acceptance; a length-limit stop retains the last accepted code. Top-k 1 removes
+adjusted logit supplies the candidate. For the first `min_new_tokens` predictions
+(default 11, including prefill as step 0), EOS is excluded before both greedy and
+sampled selection. Step 11 is the first possible EOS decision with the default.
+`--min-new-tokens 0` restores unmasked EOS. The value must be a nonnegative int32;
+it may exceed `max_new_tokens`, which remains the hard cap. An allowed EOS is
+tested before acceptance; a length-limit stop retains the last accepted code. Top-k 1 removes
 cross-language random-number differences; exact ties are not a portable sampling
 oracle and should be avoided when preparing cases.
 
-The repetition history scope now matches upstream's prompt-plus-generated
-history. Early EOS suppression, duration-based stopping and cross-language RNG
+Repetition history and the default first-11-prediction EOS suppression match
+upstream's corresponding policy. Duration-based stopping and cross-language RNG
 remain different; nonnegative logits still use C++'s precomputed F32 reciprocal.
 The EOS check remains on the adjusted greedy token or sampled token before
-acceptance. This is not full `infer_panel` or stochastic sampling parity, and
-sampling defaults are unchanged. With the default repetition penalty of 1.35,
-generated sequences can change; a penalty of 1.0 disables the history effect.
+acceptance. This is not full `infer_panel` or stochastic sampling parity. The new
+default can change sequences that previously stopped early; set the minimum to
+0 for the previous EOS policy. A repetition penalty of 1.0 disables the history
+effect, not EOS suppression.
 
 ### Export and run
 
@@ -301,12 +306,12 @@ Both modes require `N + max_new_tokens - 1 <= 1024`.
 python3 tests/t2s/generate_reference.py --generate \
   --checkpoint /path/to/s1v3.ckpt --upstream-root /path/to/GPT-SoVITS \
   --inputs-dir /path/to/precomputed-case --reference-phones 44 \
-  --max-new-tokens 200 --repetition-penalty 1.0 \
+  --max-new-tokens 200 --min-new-tokens 11 --repetition-penalty 1.0 \
   --output-dir tests/t2s/out/generation-reference/rp1
 python3 tests/t2s/generate_reference.py --generate \
   --checkpoint /path/to/s1v3.ckpt --upstream-root /path/to/GPT-SoVITS \
   --inputs-dir /path/to/precomputed-case --reference-phones 44 \
-  --max-new-tokens 200 --repetition-penalty 1.35 \
+  --max-new-tokens 200 --min-new-tokens 11 --repetition-penalty 1.35 \
   --output-dir tests/t2s/out/generation-reference/rp135
 python3 tests/t2s/generate_reference.py --validate tests/t2s/out/generation-reference/rp1
 python3 tests/t2s/generate_reference.py --validate tests/t2s/out/generation-reference/rp135
@@ -323,9 +328,12 @@ Use the isolated environment described above for exporting if needed; `--validat
 and NumPy-only tool tests need neither torch nor upstream imports. `--generate`
 cannot be combined with `--steps`; generation policy flags are rejected without
 `--generate`. Existing teacher-forced commands and schema remain unchanged.
-Generation manifests now require `policy.history == "prompt+generated-binary"`;
-older `"generated-only-binary"` exports are rejected and must be re-exported to
-a new directory. Changing the manifest string alone is not a valid migration.
+Generation v2 manifests require `policy.min_new_tokens`,
+`policy.eos == "suppressed-before-min-new-tokens"` and
+`policy.history == "prompt+generated-binary"`. Old v1/unmasked or generated-only
+exports are rejected and must be re-exported to a new directory. Changing schema
+or policy strings alone is not a valid migration. Teacher-forced v1 exports are
+unaffected.
 
 `GPTSOVITS_T2S_GENERATION_REFERENCE` defaults to empty (two numerical tests skip).
 Once configured, missing/invalid `rp1` or `rp135` cases, incompatible/F16 model
@@ -351,13 +359,15 @@ paths or timestamps are recorded in the manifest.
 | `logits.npy` | `[D,V]` before penalties/filtering | float32 |
 | `selected.npy`, `context_lengths.npy` | `[D]`, `[D]` | int32 |
 
-EOS stops have `D=C+1`, with one final unaccepted EOS selection. Length-limit
-stops have `C=D=max_new_tokens`, with no EOS decision. Context lengths are
-`N..N+D-1`. The validator recomputes every selection from raw logits and the
-binary prompt-plus-generated history; it also checks codes/decision/stop
-consistency, layout, IDs, finite values and file hashes. Empty codes are valid only for
-immediate EOS; the C++ NPY reader permits zero length explicitly for that array,
-not for ordinary decode inputs.
+EOS stops have `D=C+1`, with one final unaccepted EOS selection and
+`C >= min_new_tokens`. Length-limit stops have `C=D=max_new_tokens`, with no EOS
+decision, including when the minimum exceeds the maximum. Context lengths are
+`N..N+D-1`. Logits remain raw, finite and full-vocabulary, including EOS. The
+validator recomputes every selection from the binary prompt-plus-generated
+history, skipping EOS during the window; it also checks codes/decision/stop
+consistency, layout, IDs, finite values and file hashes. Empty codes are valid
+only for immediate EOS with minimum 0; the C++ NPY reader permits zero length
+explicitly for that array, not for ordinary decode inputs.
 
 The C++ integration test installs exported reference-text and prompt embeddings
 plus prompt token IDs in a session-owned reference cache. It sends **target**
@@ -372,17 +382,21 @@ not run here; this is not an audio-quality or raw-text-to-speech test.
 ### Observed generation baseline
 
 On the same local CPU/F32 case (44 reference phones, 22 target phones, 136 prompt
-codes, maximum 200), independent exports were byte-identical for both policies:
+codes, maximum 200, minimum 11), independent v2 exports were byte-identical for
+both repetition penalties:
 
 | Repetition penalty | Accepted codes | Decisions | Stop reason | Smallest adjusted top-2 gap |
 | --- | ---: | ---: | --- | ---: |
 | 1.0 | 200 | 200 | `max_new_tokens` | `0.0403` |
 | 1.35 | 77 | 78 | `eos` | `0.00730` |
 
-All eight no-penalty arrays remain byte-identical to the previous generated-only
-baseline. With penalty 1.35, the accepted sequence changes from 74 codes to 77.
-Both public API tests matched the new full sequence and stop exactly, including
-short-budget and same-session repeat checks. The no-penalty limit is reported
+All eight arrays for both policies remain byte-identical to the preceding
+prompt-history/unmasked baseline: this particular case did not choose early EOS.
+The default-window behavior is separately tested with synthetic models whose
+highest logit is always EOS, including stochastic sampling, the exact step-11
+boundary, a one-token non-EOS vocabulary, independent batch flags and graph reuse.
+The public API comparison also checks the full sequence, stop reason, short-budget
+prefix and same-session repeats. The no-penalty limit is reported
 as a limit, not as successful natural termination. These observations do not
 imply other inputs will stop at the same lengths or that the UI's different
 policy will generate the same sequence.

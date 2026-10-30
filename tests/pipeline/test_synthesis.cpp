@@ -35,10 +35,12 @@
 namespace gs = gpt_sovits;
 namespace {
 
-static gs::t2s_generate_config gen_cfg(int32_t max_new_tokens, uint32_t seed = 42) {
+static gs::t2s_generate_config gen_cfg(int32_t max_new_tokens, uint32_t seed = 42,
+                                      int32_t min_new_tokens = 0) {
     gs::t2s_generate_config c;
     c.max_new_tokens = max_new_tokens;
     c.seed = seed;
+    c.min_new_tokens = min_new_tokens;
     return c;
 }
 
@@ -124,6 +126,8 @@ TEST(SynthesisConfig, FinitenessAndRanges) {
     c = cfg; c.generate.max_new_tokens = 0; bad(c);
     c = cfg; c.generate.max_new_tokens = -1; bad(c);
     c = cfg; c.generate.max_new_tokens = 1025; bad(c);
+    c = cfg; c.generate.min_new_tokens = -1; bad(c);
+    c = cfg; c.generate.min_new_tokens = std::numeric_limits<int32_t>::min(); bad(c);
     c = cfg; c.noise_scale = 0.0f; bad(c);
     c = cfg; c.noise_scale = -0.5f; bad(c);
     c = cfg; c.noise_scale = std::numeric_limits<float>::quiet_NaN(); bad(c);
@@ -132,6 +136,17 @@ TEST(SynthesisConfig, FinitenessAndRanges) {
     c = cfg; c.generate.max_new_tokens = 1;
     EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_config(c, &err));
     c.generate.max_new_tokens = 1024;
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_config(c, &err));
+
+    // The EOS window is bounded below by 0 only; it may exceed the hard cap.
+    c = cfg; c.generate.min_new_tokens = 0;
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_config(c, &err));
+    c = cfg; c.generate.min_new_tokens = 11;
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_config(c, &err));
+    c = cfg; c.generate.min_new_tokens = std::numeric_limits<int32_t>::max();
+    EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_config(c, &err));
+    c = cfg; c.generate.max_new_tokens = 1;
+    c.generate.min_new_tokens = std::numeric_limits<int32_t>::max();
     EXPECT_TRUE(gs::pipeline_detail::validate_synthesis_config(c, &err));
 }
 
@@ -572,6 +587,16 @@ TEST(SynthesizeCpuPublic, InvalidRequestsPreserveResult) {
     rejects(nullptr, 16000, 16000, "non-null");
     rejects(&pcm, -1, 16000, "invalid audio");
     rejects(&pcm, INT64_MAX, 44100, "overflow");
+    config = gs::synthesis_config{};
+    config.generate.min_new_tokens = -1;
+    rejects(&pcm, 16000, 16000, "min_new_tokens");
+    // The EOS window may exceed the hard cap; the request then reaches the model
+    // check rather than failing configuration validation.
+    config = gs::synthesis_config{};
+    config.generate.max_new_tokens = 1;
+    config.generate.min_new_tokens = std::numeric_limits<int32_t>::max();
+    rejects(&pcm, 16000, 16000, "models");
+    config = gs::synthesis_config{};
     config.generate.max_new_tokens = 1024;
     rejects(&pcm, 16000, 16000, "slot budget");
     config.generate.max_new_tokens = 0;
@@ -755,9 +780,11 @@ TEST_F(GenerateAndDecodeEos, ImmediateEosPreservesResultAndReleasesSlot) {
 
     gs::synthesis_result result = sentinel_result();
     std::string err = "stale";
+    // min_new_tokens = 0 keeps the original immediate-EOS contract; the default
+    // window would suppress EOS and run to the length limit instead.
     EXPECT_FALSE(gs::pipeline_detail::generate_and_decode(
         session, model, sovits_state, sovits_model_state, phones, bert,
-        gen_cfg(4), result, &err));
+        gen_cfg(4, 42, 0), result, &err));
     expect_sentinel(result);
     // The zeroed SoVITS pair would report "SoVITS waveform decoding failed" if
     // it had been entered; the EOS diagnostic proves the hand-off was skipped.

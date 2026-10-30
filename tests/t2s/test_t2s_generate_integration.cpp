@@ -194,6 +194,7 @@ static bool manual_generate(gpt_sovits::t2s_session & session,
                             const float * input_bert,
                             int32_t max_new_tokens,
                             uint32_t seed,
+                            int32_t min_new_tokens,
                             std::vector<int32_t> & codes) {
     codes.clear();
 
@@ -262,6 +263,8 @@ static bool manual_generate(gpt_sovits::t2s_session & session,
             ggml_backend_tensor_set(graph.seen_mask, seen.data(), 0,
                                     (size_t) (vocab * (int64_t) sizeof(float)));
         }
+        const int32_t suppress_eos = min_new_tokens > 0 ? 1 : 0;
+        ggml_backend_tensor_set(graph.suppress_eos, &suppress_eos, 0, sizeof(suppress_eos));
         fill_exp_noise(noise, rng, dist);
         ggml_backend_tensor_set(graph.exp_noise, noise.data(), 0,
                                 (size_t) (vocab * (int64_t) sizeof(float)));
@@ -299,6 +302,8 @@ static bool manual_generate(gpt_sovits::t2s_session & session,
 
         ggml_backend_tensor_set(session.token_id, &current, 0, sizeof(int32_t));
 
+        const int32_t suppress_eos = codes.size() < (size_t) min_new_tokens ? 1 : 0;
+        ggml_backend_tensor_set(session.suppress_eos, &suppress_eos, 0, sizeof(suppress_eos));
         fill_exp_noise(noise, rng, dist);
         ggml_backend_tensor_set(session.exp_noise, noise.data(), 0,
                                 (size_t) (vocab * (int64_t) sizeof(float)));
@@ -449,7 +454,7 @@ static void run_generate_integration(ggml_backend_t backend, bool stochastic = f
     std::vector<int32_t> manual_codes;
     ASSERT_TRUE(manual_generate(manual_session, model, target_tokens.data(), T_in,
                                 target_bert.data(), gen_cfg.max_new_tokens,
-                                gen_cfg.seed, manual_codes));
+                                gen_cfg.seed, gen_cfg.min_new_tokens, manual_codes));
 
     EXPECT_EQ(manual_codes, first.codes)
         << "manual block-level runner and t2s_session_generate diverged";
@@ -469,8 +474,26 @@ static void run_generate_integration(ggml_backend_t backend, bool stochastic = f
             varied_bert.data(), actual, gen_cfg));
         ASSERT_TRUE(manual_generate(manual_session, model, varied_tokens.data(),
                                     target_length, varied_bert.data(),
-                                    gen_cfg.max_new_tokens, gen_cfg.seed, manual_codes));
+                                    gen_cfg.max_new_tokens, gen_cfg.seed,
+                                    gen_cfg.min_new_tokens, manual_codes));
         EXPECT_EQ(actual.codes, manual_codes);
+        EXPECT_EQ(session.gf_dec, first_graph);
+    }
+    for (int32_t minimum : {0, 1, 11}) {
+        SCOPED_TRACE(minimum);
+        gen_cfg.max_new_tokens = 13;
+        gen_cfg.min_new_tokens = minimum;
+        gpt_sovits::t2s_generate_result actual;
+        ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+            session, model, target_tokens.data(), T_in, target_bert.data(), actual, gen_cfg));
+        ASSERT_TRUE(manual_generate(manual_session, model, target_tokens.data(), T_in,
+                                    target_bert.data(), gen_cfg.max_new_tokens, gen_cfg.seed,
+                                    minimum, manual_codes));
+        EXPECT_EQ(actual.codes, manual_codes);
+        EXPECT_GE(actual.codes.size(), (size_t) minimum);
+        EXPECT_LE(actual.codes.size(), (size_t) gen_cfg.max_new_tokens);
+        EXPECT_EQ(actual.stop_reason, actual.codes.size() == (size_t) gen_cfg.max_new_tokens
+            ? gpt_sovits::t2s_stop_reason::max_new_tokens : gpt_sovits::t2s_stop_reason::eos);
         EXPECT_EQ(session.gf_dec, first_graph);
     }
 

@@ -152,9 +152,11 @@ static PenaltyChoice penalty_choice(const t2s_generation_reference::Reference & 
         if (ref.codes[i] >= 0 && ref.codes[i] < vocab)
             seen[static_cast<size_t>(ref.codes[i])] = 1;
     const float * row = ref.logits.data() + step * static_cast<size_t>(vocab);
+    const int64_t eos = static_cast<int64_t>(ref.input.hparams.eos);
+    const int64_t limit = static_cast<int64_t>(step) < ref.min_new_tokens ? eos : vocab;
     float top1 = -std::numeric_limits<float>::infinity(), top2 = top1;
     PenaltyChoice c;
-    for (int64_t v = 0; v < vocab; ++v) {
+    for (int64_t v = 0; v < limit; ++v) {
         float x = row[static_cast<size_t>(v)];
         if (seen[static_cast<size_t>(v)]) x = x < 0.0f ? x * rp : x * (1.0f / rp);
         if (x > top1) { top2 = top1; top1 = x; c.argmax = static_cast<int32_t>(v); }
@@ -267,6 +269,9 @@ protected:
         ASSERT_GT(ref_.max_new_tokens, 0);
         ASSERT_LE(ref_.max_new_tokens,
                   static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
+        ASSERT_GE(ref_.min_new_tokens, 0);
+        ASSERT_LE(ref_.min_new_tokens,
+                  static_cast<int64_t>(std::numeric_limits<int32_t>::max()));
         ASSERT_TRUE(std::isfinite(ref_.repetition_penalty));
         ASSERT_GT(ref_.repetition_penalty, 0.0f);
         EXPECT_FLOAT_EQ(ref_.repetition_penalty, expected_rp);
@@ -330,6 +335,7 @@ protected:
                   t2s_generate_result & result) {
         gpt_sovits::t2s_generate_config config;
         config.max_new_tokens = static_cast<int32_t>(budget);
+        config.min_new_tokens = static_cast<int32_t>(ref_.min_new_tokens);
         config.seed = seed;
         ASSERT_TRUE(gpt_sovits::t2s_session_generate(
             session_.session, model_.model, target_phones_.data(), T_,

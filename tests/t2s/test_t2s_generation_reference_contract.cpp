@@ -26,7 +26,8 @@ using Json = nlohmann::json;
 constexpr int64_t kT = 4, kR = 2, kTarget = 2, kP = 2, kN = 6, kC = 2, kD = 3, kM = 3;
 constexpr int64_t kH = 8, kL = 2, kV = 12, kPhoneVocab = 8, kEOS = 11;
 const std::string kDigest(64, 'a');
-const char * kSchema = "gpt-sovits-t2s-generation-reference/v1";
+const char * kSchema = "gpt-sovits-t2s-generation-reference/v2";
+const char * kSchemaV1 = "gpt-sovits-t2s-generation-reference/v1";
 
 class TempDir {
 public:
@@ -185,8 +186,9 @@ struct Fixture {
             {"dimensions", {{"text", kT}, {"reference_text", kR}, {"target_text", kTarget}, {"prompt", kP},
                             {"prefill", kN}, {"codes", codes_count}, {"decisions", decisions}}},
             {"policy", {{"top_k", 1}, {"top_p", 1.0}, {"temperature", 1.0}, {"repetition_penalty", 1.35},
-                        {"max_new_tokens", tokens}, {"history", "prompt+generated-binary"},
-                        {"eos", "unmasked-before-accept"}}},
+                        {"max_new_tokens", tokens}, {"min_new_tokens", 0},
+                        {"history", "prompt+generated-binary"},
+                        {"eos", "suppressed-before-min-new-tokens"}}},
             {"stop_reason", mode == Mode::Limit ? "max_new_tokens" : "eos"},
             {"sources", {{"checkpoint_sha256", kDigest}, {"exporter_sha256", kDigest},
                          {"checkpoint_loader_sha256", kDigest},
@@ -208,6 +210,17 @@ struct Fixture {
             manifest["arrays"][array.name] = Json{{"dtype", array.dtype}, {"shape", shape}, {"order", "C"},
                                                   {"ggml_ne", reversed}, {"sha256", kDigest}};
         }
+    }
+
+    // Replace an array and keep its manifest layout metadata in sync.
+    void SetArray(const std::string & name, Array array) {
+        arrays[name] = std::move(array);
+        const Array & stored = arrays.at(name);
+        Json shape = Json::array(), reversed = Json::array();
+        for (int64_t dim : stored.shape) shape.push_back(dim);
+        for (auto it = stored.shape.rbegin(); it != stored.shape.rend(); ++it) reversed.push_back(*it);
+        manifest["arrays"][name] = Json{{"dtype", stored.dtype}, {"shape", shape}, {"order", "C"},
+                                        {"ggml_ne", reversed}, {"sha256", kDigest}};
     }
 
     void Write() const {
@@ -243,6 +256,7 @@ TEST(T2SGenerationReferenceContract, LoadsAndValidatesEosExport) {
     EXPECT_EQ(reference.reference_text, kR);
     EXPECT_EQ(reference.target_text, kTarget);
     EXPECT_EQ(reference.max_new_tokens, kM);
+    EXPECT_EQ(reference.min_new_tokens, 0);
     EXPECT_FLOAT_EQ(reference.repetition_penalty, 1.35f);
     EXPECT_EQ(reference.stop_reason, "eos");
     EXPECT_EQ(reference.input.phones, (std::vector<int32_t>{0, 2, 7, 1}));
@@ -293,6 +307,101 @@ TEST(T2SGenerationReferenceContract, LoadsMaxNewTokensExport) {
     EXPECT_EQ(reference.selected, reference.codes);
     EXPECT_EQ(reference.context_lengths, (std::vector<int32_t>{6, 7, 8}));
 }
+
+// An EOS stop that only happens after a suppression window of the requested
+// size.  Raw EOS is the highest logit at every inside-window decision, so
+// accepting this export proves the reader excludes it from candidate selection.
+void ConfigureLongEos(Fixture & fixture, int64_t min_new_tokens) {
+    const int64_t codes_count = min_new_tokens;
+    const int64_t decisions = min_new_tokens + 1;
+    std::vector<int32_t> codes, selected, context_lengths;
+    std::vector<float> logits(static_cast<size_t>(decisions * kV), -1.0f);
+    for (int64_t step = 0; step < codes_count; ++step) {
+        const int32_t token = static_cast<int32_t>(step);
+        codes.push_back(token);
+        selected.push_back(token);
+        logits[static_cast<size_t>(step * kV + token)] = 2.0f;
+        logits[static_cast<size_t>(step * kV + kEOS)] = 5.0f;
+    }
+    selected.push_back(static_cast<int32_t>(kEOS));
+    logits[static_cast<size_t>(codes_count * kV + kEOS)] = 5.0f;
+    for (int64_t i = 0; i < decisions; ++i) context_lengths.push_back(static_cast<int32_t>(kN + i));
+    fixture.SetArray("codes.npy", MakeArray("codes.npy", "int32", {codes_count}, Raw(codes)));
+    fixture.SetArray("logits.npy", MakeArray("logits.npy", "float32", {decisions, kV}, Raw(logits)));
+    fixture.SetArray("selected.npy", MakeArray("selected.npy", "int32", {decisions}, Raw(selected)));
+    fixture.SetArray("context_lengths.npy",
+                     MakeArray("context_lengths.npy", "int32", {decisions}, Raw(context_lengths)));
+    fixture.manifest["dimensions"]["codes"] = codes_count;
+    fixture.manifest["dimensions"]["decisions"] = decisions;
+    fixture.manifest["policy"]["max_new_tokens"] = decisions;
+    fixture.manifest["policy"]["min_new_tokens"] = min_new_tokens;
+    fixture.manifest["stop_reason"] = "eos";
+}
+
+TEST(T2SGenerationReferenceContract, LoadsEosAfterOneStepSuppression) {
+    Fixture fixture(Mode::Limit);
+    ConfigureLongEos(fixture, 1);
+    fixture.Write();
+    const auto reference = t2s_generation_reference::load(fixture.temp.path());
+    EXPECT_EQ(reference.min_new_tokens, 1);
+    EXPECT_EQ(reference.max_new_tokens, 2);
+    EXPECT_EQ(reference.codes, (std::vector<int32_t>{0}));
+    // Raw EOS (5.0) beats the accepted token (2.0) at decision 0.
+    EXPECT_EQ(reference.selected, (std::vector<int32_t>{0, 11}));
+    EXPECT_EQ(reference.stop_reason, "eos");
+}
+
+TEST(T2SGenerationReferenceContract, LoadsEosAfterElevenStepSuppression) {
+    Fixture fixture(Mode::Limit);
+    ConfigureLongEos(fixture, 11);
+    fixture.Write();
+    const auto reference = t2s_generation_reference::load(fixture.temp.path());
+    EXPECT_EQ(reference.min_new_tokens, 11);
+    EXPECT_EQ(reference.max_new_tokens, 12);
+    EXPECT_EQ(reference.codes, (std::vector<int32_t>{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10}));
+    EXPECT_EQ(reference.selected.size(), 12u);
+    EXPECT_EQ(reference.selected.back(), 11);
+    EXPECT_EQ(reference.stop_reason, "eos");
+}
+
+TEST(T2SGenerationReferenceContract, LoadsMinGreaterThanMaxAsLengthStop) {
+    // min > max suppresses EOS for the whole request; the length limit still
+    // ends generation normally rather than rejecting a previously legal export.
+    Fixture fixture(Mode::Limit);
+    fixture.manifest["policy"]["min_new_tokens"] = 4;
+    fixture.Write();
+    const auto reference = t2s_generation_reference::load(fixture.temp.path());
+    EXPECT_EQ(reference.min_new_tokens, 4);
+    EXPECT_EQ(reference.max_new_tokens, 3);
+    EXPECT_EQ(reference.stop_reason, "max_new_tokens");
+    EXPECT_EQ(reference.codes, (std::vector<int32_t>{4, 5, 6}));
+}
+
+TEST(T2SGenerationReferenceContract, LoadsMaxOneWithSuppressedEos) {
+    // A one-decision request entirely inside the window: raw EOS is highest
+    // but the only accepted code is the best non-EOS token.
+    Fixture fixture(Mode::ImmediateEos);
+    std::vector<float> logits(static_cast<size_t>(kV), -1.0f);
+    logits[kEOS] = 5.0f;
+    logits[4] = 2.0f;
+    fixture.SetArray("codes.npy", MakeArray("codes.npy", "int32", {1}, Raw(std::vector<int32_t>{4})));
+    fixture.SetArray("logits.npy", MakeArray("logits.npy", "float32", {1, kV}, Raw(logits)));
+    fixture.SetArray("selected.npy", MakeArray("selected.npy", "int32", {1}, Raw(std::vector<int32_t>{4})));
+    fixture.SetArray("context_lengths.npy",
+                     MakeArray("context_lengths.npy", "int32", {1}, Raw(std::vector<int32_t>{kN})));
+    fixture.manifest["dimensions"]["codes"] = 1;
+    fixture.manifest["dimensions"]["decisions"] = 1;
+    fixture.manifest["policy"]["min_new_tokens"] = 11;
+    fixture.manifest["stop_reason"] = "max_new_tokens";
+    fixture.Write();
+    const auto reference = t2s_generation_reference::load(fixture.temp.path());
+    EXPECT_EQ(reference.min_new_tokens, 11);
+    EXPECT_EQ(reference.max_new_tokens, 1);
+    EXPECT_EQ(reference.codes, (std::vector<int32_t>{4}));
+    EXPECT_EQ(reference.selected, (std::vector<int32_t>{4}));
+    EXPECT_EQ(reference.stop_reason, "max_new_tokens");
+}
+
 TEST(T2SGenerationReferenceContract, NpyHelperAllowsZeroOnlyWhenRequested) {
     TempDir temp;
     WriteFile(temp.path() / "zero.npy", EncodeNpy(MakeArray("zero.npy", "int32", {0}, {})));
@@ -311,8 +420,7 @@ TEST(T2SGenerationReferenceContract, RejectsInvalidExportsTableDriven) {
         const char * needle;
     };
     const ErrorCase cases[] = {
-        {"schema", Mode::Eos, [](Fixture & f) { f.manifest["schema"] = "gpt-sovits-t2s-generation-reference/v2"; },
-         "manifest.schema"},
+        {"schema-v1", Mode::Eos, [](Fixture & f) { f.manifest["schema"] = kSchemaV1; }, "re-export"},
         {"status", Mode::Eos, [](Fixture & f) { f.manifest["status"] = "partial"; }, "manifest.status"},
         {"policy-top-k", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["top_k"] = 2; }, "top_k"},
         {"policy-top-k-float", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["top_k"] = 1.0; }, "top_k"},
@@ -320,11 +428,25 @@ TEST(T2SGenerationReferenceContract, RejectsInvalidExportsTableDriven) {
         {"policy-history-old", Mode::Eos,
          [](Fixture & f) { f.manifest["policy"]["history"] = "generated-only-binary"; }, "history"},
         {"policy-eos", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["eos"] = "masked"; }, "policy.eos"},
+        {"policy-eos-old", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"]["eos"] = "unmasked-before-accept"; }, "re-export"},
+        {"policy-min-missing", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"].erase("min_new_tokens"); }, "min_new_tokens"},
+        {"policy-min-bool", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["min_new_tokens"] = true; },
+         "nonnegative"},
+        {"policy-min-negative", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"]["min_new_tokens"] = -1; }, "nonnegative"},
+        {"policy-min-float", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"]["min_new_tokens"] = 1.0; }, "nonnegative"},
+        {"policy-min-huge", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"]["min_new_tokens"] = 2147483648LL; }, "2147483647"},
         {"policy-penalty", Mode::Eos,
          [](Fixture & f) { f.manifest["policy"]["repetition_penalty"] = 0.0; }, "repetition_penalty"},
         {"policy-reciprocal", Mode::Eos,
          [](Fixture & f) { f.manifest["policy"]["repetition_penalty"] = 1e-45; }, "repetition_penalty"},
         {"policy-budget", Mode::Eos, [](Fixture & f) { f.manifest["policy"]["max_new_tokens"] = 1024; }, "budget"},
+        {"eos-in-window", Mode::Eos,
+         [](Fixture & f) { f.manifest["policy"]["min_new_tokens"] = 3; }, "suppression window"},
         {"stop-reason", Mode::Eos, [](Fixture & f) { f.manifest["stop_reason"] = "other"; }, "stop_reason"},
         {"stop-eos-shape", Mode::Eos, [](Fixture & f) { f.manifest["dimensions"]["codes"] = 1; }, "codes"},
         {"stop-limit-shape", Mode::Limit, [](Fixture & f) { f.manifest["dimensions"]["codes"] = 2; }, "codes"},

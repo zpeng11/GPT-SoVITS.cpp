@@ -4,6 +4,7 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -88,8 +89,8 @@ bool t2s_session_init(t2s_session             & session,
 
     // Total tensors: n_layer * 2 (K/V) + 1 (kv_pos) + 1 (mask)
     //              + 1 (token_id) + 1 (position) + 1 (pe_table)
-    //              + 2 (seen_mask, exp_noise)
-    const size_t n_tensors = (size_t) n_layer * 2 + 7;
+    //              + 3 (seen_mask, exp_noise, suppress_eos)
+    const size_t n_tensors = (size_t) n_layer * 2 + 8;
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_tensors + 1),
@@ -125,6 +126,7 @@ bool t2s_session_init(t2s_session             & session,
     // Sampler graph inputs: {vocab, n_batch}
     session.seen_mask = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, vocab, n_batch);
     session.exp_noise = ggml_new_tensor_2d(session.ctx_kv, GGML_TYPE_F32, vocab, n_batch);
+    session.suppress_eos = ggml_new_tensor_1d(session.ctx_kv, GGML_TYPE_I32, n_batch);
 
     // Allocate backend buffer.
     session.backend = backend;
@@ -135,10 +137,11 @@ bool t2s_session_init(t2s_session             & session,
         return false;
     }
 
-    // Zero-initialize kv_pos.
+    // Low-level session callers retain unmasked sampling unless explicitly enabled.
     {
         std::vector<int32_t> zeros(n_batch, 0);
         ggml_backend_tensor_set(session.kv_pos, zeros.data(), 0, n_batch * sizeof(int32_t));
+        ggml_backend_tensor_set(session.suppress_eos, zeros.data(), 0, n_batch * sizeof(int32_t));
     }
 
     // Initialize mask_host to all -inf and upload.
@@ -203,6 +206,7 @@ void t2s_session_free(t2s_session & session) {
     session.greedy   = nullptr;
     session.seen_mask = nullptr;
     session.exp_noise = nullptr;
+    session.suppress_eos = nullptr;
 
     if (session.buf_kv) {
         ggml_backend_buffer_free(session.buf_kv);
@@ -225,6 +229,7 @@ void t2s_session_free(t2s_session & session) {
     session.pe_table  = nullptr;
     session.seen_mask = nullptr;
     session.exp_noise = nullptr;
+    session.suppress_eos = nullptr;
     session.mask_host.clear();
     session.scratch_mask.clear();
     session.scratch_kv_pos.clear();
@@ -366,9 +371,9 @@ bool t2s_session_build_decode_graph(
         const int     n_batch = (int) session.n_batch;
         const t2s_sampler_config & sampler_cfg = session.sampler_cfg;
 
-        // Top-p, top-k and repetition filtering together need over 60 tensors per slot.
-        const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 80 + 12;
-        const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
+        // Reserve both full-vocabulary and EOS-excluded sampler branches.
+        const size_t n_intermediates = (size_t) n_layer * 32 + (size_t) n_batch * 200 + 12;
+        const size_t graph_size      = std::max((size_t) GGML_DEFAULT_GRAPH_SIZE, n_intermediates);
         struct ggml_init_params params = {
             /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 1) +
                              ggml_graph_overhead_custom(graph_size, false),
@@ -400,7 +405,8 @@ bool t2s_session_build_decode_graph(
         t2s_sampler_result sampler_result = t2s_sampler_block_forward(
             ctx, x, model.weights.lm_head_w, session.seen_mask,
             sampler_cfg.top_k, sampler_cfg.top_p, sampler_cfg.temperature,
-            sampler_cfg.repetition_penalty, session.exp_noise);
+            sampler_cfg.repetition_penalty, session.exp_noise,
+            hparams.vocab_size > 1 ? session.suppress_eos : nullptr);
 
         ggml_set_name(sampler_result.sampled, "sampled");
         ggml_set_output(sampler_result.sampled);
@@ -464,6 +470,10 @@ struct ggml_tensor * t2s_session_get_exp_noise(const t2s_session & session) {
     return session.exp_noise;
 }
 
+struct ggml_tensor * t2s_session_get_suppress_eos(const t2s_session & session) {
+    return session.suppress_eos;
+}
+
 // ---------------------------------------------------------------------------
 // Flexible computation graph
 // ---------------------------------------------------------------------------
@@ -491,6 +501,7 @@ void t2s_flex_graph_free(t2s_flex_graph & graph) {
     graph.mask            = nullptr;
     graph.seen_mask       = nullptr;
     graph.exp_noise       = nullptr;
+    graph.suppress_eos    = nullptr;
     graph.sampled         = nullptr;
     graph.greedy          = nullptr;
     graph.backend         = nullptr;
@@ -542,13 +553,12 @@ t2s_flex_graph t2s_session_build_flex_graph(
     const int N_decode = n_decode;  // each decode slot contributes exactly 1 token
 
     // --- 1. Create graph context ---
-    // Include the sampler's top-p, top-k and repetition-filtering branches.
-    // Decode embedding path adds ~4 intermediates per decode slot (get_rows x2, mul, add).
+    // Reserve both sampler branches and ~4 decode embedding intermediates per slot.
     const size_t n_intermediates = (size_t) n_layer * 32
-                                 + (size_t) n_active * 80
+                                 + (size_t) n_active * 200
                                  + (size_t) n_decode * 4
                                  + 8;
-    const size_t graph_size      = GGML_DEFAULT_GRAPH_SIZE;
+    const size_t graph_size      = std::max((size_t) GGML_DEFAULT_GRAPH_SIZE, n_intermediates);
 
     struct ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead() * (n_intermediates + 8) +
@@ -714,6 +724,11 @@ t2s_flex_graph t2s_session_build_flex_graph(
         graph.exp_noise = ggml_new_tensor_2d(graph.ctx, GGML_TYPE_F32, vocab, n_active);
         ggml_set_name(graph.exp_noise, "exp_noise");
         ggml_set_input(graph.exp_noise);
+        if (vocab > 1) {
+            graph.suppress_eos = ggml_new_tensor_1d(graph.ctx, GGML_TYPE_I32, n_active);
+            ggml_set_name(graph.suppress_eos, "suppress_eos");
+            ggml_set_input(graph.suppress_eos);
+        }
 
         // Attach sampler: project hidden states to logits, apply filtering, sample tokens.
         t2s_sampler_result sampler_result = t2s_sampler_block_forward(
@@ -725,7 +740,8 @@ t2s_flex_graph t2s_session_build_flex_graph(
             sampler_cfg.top_p,
             sampler_cfg.temperature,
             sampler_cfg.repetition_penalty,
-            graph.exp_noise);
+            graph.exp_noise,
+            graph.suppress_eos);
 
         graph.sampled = sampler_result.sampled;
         ggml_set_name(graph.sampled, "sampled");
@@ -752,6 +768,12 @@ t2s_flex_graph t2s_session_build_flex_graph(
         fprintf(stderr, "%s: ggml_gallocr_alloc_graph() failed\n", __func__);
         t2s_flex_graph_free(graph);
         return graph;
+    }
+
+    if (graph.suppress_eos != nullptr) {
+        const std::vector<int32_t> zeros((size_t) n_active, 0);
+        ggml_backend_tensor_set(graph.suppress_eos, zeros.data(), 0,
+                                zeros.size() * sizeof(int32_t));
     }
 
     graph.backend  = session.backend;

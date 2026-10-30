@@ -341,10 +341,12 @@ static void install_zero_ref(Rig & rig, const std::vector<float> & audio) {
 }
 
 static gpt_sovits::t2s_generate_config gen_cfg(int32_t max_new_tokens,
-                                               uint32_t seed = 42) {
+                                               uint32_t seed = 42,
+                                               int32_t min_new_tokens = 0) {
     gpt_sovits::t2s_generate_config c;
     c.max_new_tokens = max_new_tokens;
     c.seed = seed;
+    c.min_new_tokens = min_new_tokens;
     return c;
 }
 
@@ -526,6 +528,223 @@ TEST(T2SGenerateSynthetic, DecodeEosStopsBeforeAppendingCandidate) {
     EXPECT_NE(rig.session.gf_dec, nullptr);
     EXPECT_EQ(rig.session.decode_model, &rig.model);
     EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(rig.session, 0), 0);
+}
+
+TEST(T2SGenerateSynthetic, DefaultEosWindowIncludesPrefillAndResetsWithReusedGraph) {
+    Rig rig;
+    const SynthSpec spec;
+    init_rig(rig, spec, 32, make_sampler_config(1, 1.35f));
+    setup_constant_token(rig.model, 0);
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    set_tensor_column(rig.model.weights.lm_head_w, spec.vocab - 1, scale_vec(u, 4.0f));
+    install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+    const int32_t tokens[] = {0, 1};
+    const auto bert = make_zeros(2048);
+    gpt_sovits::t2s_generate_config config;
+    EXPECT_EQ(config.min_new_tokens, 11);
+    config.max_new_tokens = 20;
+    ggml_cgraph * retained = nullptr;
+    for (int32_t minimum : {11, 0, 1, 3, 11}) {
+        SCOPED_TRACE(minimum);
+        config.min_new_tokens = minimum;
+        gpt_sovits::t2s_generate_result result;
+        ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+            rig.session, rig.model, tokens, 2, bert.data(), result, config));
+        EXPECT_EQ(result.codes, std::vector<int32_t>((size_t) minimum, 0));
+        EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::eos);
+        if (retained) EXPECT_EQ(rig.session.gf_dec, retained);
+        retained = rig.session.gf_dec;
+        ASSERT_NE(retained, nullptr);
+        EXPECT_EQ(rig.session.slots[0].n_pos, 0);
+        EXPECT_EQ(rig.session.ref_model, &rig.model);
+    }
+}
+
+TEST(T2SGenerateSynthetic, EosWindowNeverExtendsHardLimit) {
+    Rig rig;
+    const SynthSpec spec;
+    init_rig(rig, spec, 16, make_sampler_config(1));
+    setup_constant_token(rig.model, 0);
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    set_tensor_column(rig.model.weights.lm_head_w, spec.vocab - 1, scale_vec(u, 4.0f));
+    install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+    const int32_t tokens[] = {0, 1};
+    const auto bert = make_zeros(2048);
+    for (int32_t maximum : {1, 3, 11}) {
+        gpt_sovits::t2s_generate_result result;
+        ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+            rig.session, rig.model, tokens, 2, bert.data(), result, gen_cfg(maximum, 42, 11)));
+        EXPECT_EQ(result.codes, std::vector<int32_t>((size_t) maximum, 0));
+        EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::max_new_tokens);
+        EXPECT_EQ(rig.session.slots[0].n_pos, 0);
+    }
+}
+
+TEST(T2SGenerateSynthetic, StochasticEosSuppressionCoversBothChoices) {
+    const SynthSpec spec;
+    for (int top_k : {0, 2, 15}) {
+        Rig rig;
+        init_rig(rig, spec, 16, make_sampler_config(top_k, 1.35f, 0.95f, 1.2f));
+        setup_constant_token(rig.model, 0);
+        const auto u = zero_mean_dir(spec.d_model, 0);
+        set_tensor_column(rig.model.weights.lm_head_w, spec.vocab - 1, scale_vec(u, 1.1f));
+        install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+        const int32_t tokens[] = {0, 1};
+        const auto bert = make_zeros(2048);
+        for (uint32_t seed : {7u, 42u, 137u}) {
+            SCOPED_TRACE(top_k);
+            SCOPED_TRACE(seed);
+            gpt_sovits::t2s_generate_result result;
+            ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+                rig.session, rig.model, tokens, 2, bert.data(), result, gen_cfg(4, seed, 3)));
+            EXPECT_EQ(result.codes.size(), 3u);
+            EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::eos);
+            for (int32_t code : result.codes) EXPECT_LT(code, (int32_t) spec.vocab - 1);
+        }
+    }
+}
+
+TEST(T2SGenerateSynthetic, SuppressionIsNotAFiniteNegativeBias) {
+    Rig rig;
+    const SynthSpec spec;
+    init_rig(rig, spec, 16, make_sampler_config(0));
+    setup_constant_token(rig.model, spec.vocab - 1);
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    for (uint32_t id = 0; id + 1 < spec.vocab; ++id) {
+        set_tensor_column(rig.model.weights.lm_head_w, id,
+                          scale_vec(u, -1.0e11f * (id + 1)));
+    }
+    install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+    const int32_t tokens[] = {0, 1};
+    const auto bert = make_zeros(2048);
+    gpt_sovits::t2s_generate_result result;
+    ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+        rig.session, rig.model, tokens, 2, bert.data(), result, gen_cfg(3, 42, 2)));
+    EXPECT_EQ(result.codes, (std::vector<int32_t>{0, 0}));
+    EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::eos);
+}
+
+TEST(T2SGenerateSynthetic, SingleNonEosTokenSupportsSuppression) {
+    SynthSpec spec;
+    spec.vocab = 2;
+    Rig rig;
+    init_rig(rig, spec, 16, make_sampler_config(15, 1.35f, 0.95f));
+    setup_constant_token(rig.model, 0);
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    set_tensor_column(rig.model.weights.lm_head_w, 1, scale_vec(u, 4.0f));
+    install_zero_ref(rig, ref_audio_ending_in(spec.d_model, 2, u));
+    const int32_t tokens[] = {0, 1};
+    const auto bert = make_zeros(2048);
+    gpt_sovits::t2s_generate_result result;
+    ASSERT_TRUE(gpt_sovits::t2s_session_generate(
+        rig.session, rig.model, tokens, 2, bert.data(), result, gen_cfg(4, 42, 3)));
+    EXPECT_EQ(result.codes, (std::vector<int32_t>{0, 0, 0}));
+    EXPECT_EQ(result.stop_reason, gpt_sovits::t2s_stop_reason::eos);
+}
+
+TEST(T2SGenerateSynthetic, BatchedEosFlagsFollowActiveSlotsAndDefaultToZero) {
+    const SynthSpec spec;
+    BackendGuard backend;
+    backend.backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend.backend, nullptr);
+    ModelGuard holder;
+    create_synthetic_model(spec, backend.backend, holder.model);
+    auto & model = holder.model;
+    setup_constant_token(model, 0);
+    const auto u = zero_mean_dir(spec.d_model, 0);
+    set_tensor_column(model.weights.lm_head_w, spec.vocab - 1, scale_vec(u, 4.0f));
+    const int32_t eos = spec.vocab - 1;
+
+    SessionGuard sessions;
+    auto & session = sessions.session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(
+        session, model.hparams, backend.backend, 3, 16, make_sampler_config(2, 1.35f, 0.95f)));
+    zero_session_kv_caches(session);
+    session.ref_T_prompt = 1;
+    int32_t persistent_flags[3] = {-1, -1, -1};
+    ggml_backend_tensor_get(session.suppress_eos, persistent_flags, 0, sizeof(persistent_flags));
+    EXPECT_EQ(std::vector<int32_t>(persistent_flags, persistent_flags + 3),
+              (std::vector<int32_t>{0, 0, 0}));
+    for (int slot = 0; slot < 3; ++slot) {
+        session.slots[slot].n_pos = 1;
+        session.slots[slot].audio_offset = 0;
+    }
+    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model));
+    const int32_t ids[3] = {0, 0, 0};
+    const auto seen = make_zeros(spec.vocab * 3);
+    const std::vector<float> noise(spec.vocab * 3, 1.0f);
+    set_tensor_f32(session.seen_mask, seen);
+    set_tensor_f32(session.exp_noise, noise);
+    const int32_t flags[3] = {1, 0, 1};
+    ggml_backend_tensor_set(session.suppress_eos, flags, 0, sizeof(flags));
+    ggml_backend_tensor_set(session.token_id, ids, 0, sizeof(ids));
+    gpt_sovits::t2s_session_decode_advance(session);
+    ASSERT_EQ(ggml_backend_graph_compute(backend.backend, session.gf_dec), GGML_STATUS_SUCCESS);
+    int32_t sampled[3], greedy[3];
+    ggml_backend_tensor_get(session.sampled, sampled, 0, sizeof(sampled));
+    ggml_backend_tensor_get(session.greedy, greedy, 0, sizeof(greedy));
+    EXPECT_EQ(std::vector<int32_t>(sampled, sampled + 3), (std::vector<int32_t>{0, eos, 0}));
+    EXPECT_EQ(std::vector<int32_t>(greedy, greedy + 3), (std::vector<int32_t>{0, eos, 0}));
+    for (int slot = 0; slot < 3; ++slot) gpt_sovits::t2s_session_slot_release(session, slot);
+
+    for (const std::vector<int32_t> active_flags : {std::vector<int32_t>{0, 1}, {1, 0}}) {
+        gpt_sovits::t2s_batch_plan plan{{2, 0, 2}};
+        struct FlexGuard {
+            gpt_sovits::t2s_flex_graph graph;
+            ~FlexGuard() { gpt_sovits::t2s_flex_graph_free(graph); }
+        } flex{gpt_sovits::t2s_session_build_flex_graph(session, model, plan)};
+        auto & graph = flex.graph;
+        ASSERT_NE(graph.ctx, nullptr);
+        ASSERT_EQ(graph.n_active, 2);
+        int32_t initial[2] = {-1, -1};
+        ggml_backend_tensor_get(graph.suppress_eos, initial, 0, sizeof(initial));
+        EXPECT_EQ(initial[0], 0);
+        EXPECT_EQ(initial[1], 0);
+        std::vector<float> x;
+        for (int col = 0; col < 4; ++col) x.insert(x.end(), u.begin(), u.end());
+        set_tensor_f32(graph.x_prefill, x);
+        set_tensor_f32(graph.seen_mask, make_zeros(spec.vocab * 2));
+        set_tensor_f32(graph.exp_noise, std::vector<float>(spec.vocab * 2, 1.0f));
+        ggml_backend_tensor_set(graph.suppress_eos, active_flags.data(), 0, sizeof(initial));
+        gpt_sovits::t2s_session_flex_advance(session, plan, graph);
+        ASSERT_EQ(ggml_backend_graph_compute(backend.backend, graph.gf), GGML_STATUS_SUCCESS);
+        int32_t picked[2], best[2];
+        ggml_backend_tensor_get(graph.sampled, picked, 0, sizeof(picked));
+        ggml_backend_tensor_get(graph.greedy, best, 0, sizeof(best));
+        for (int i = 0; i < 2; ++i) {
+            const int32_t expected = active_flags[i] ? 0 : eos;
+            EXPECT_EQ(picked[i], expected);
+            EXPECT_EQ(best[i], expected);
+        }
+        EXPECT_EQ(session.slots[1].n_pos, 0);
+        for (int slot : {0, 2}) gpt_sovits::t2s_session_slot_release(session, slot);
+    }
+}
+
+TEST(T2SGenerateSynthetic, LargeBatchesReserveBothSamplerBranches) {
+    SynthSpec spec;
+    spec.n_layer = 24;
+    spec.vocab = 32;
+    BackendGuard backend;
+    backend.backend = ggml_backend_cpu_init();
+    ASSERT_NE(backend.backend, nullptr);
+    ModelGuard model;
+    create_synthetic_model(spec, backend.backend, model.model);
+    SessionGuard holder;
+    auto & session = holder.session;
+    ASSERT_TRUE(gpt_sovits::t2s_session_init(session, model.model.hparams, backend.backend,
+                                           16, 4, make_sampler_config(15, 1.35f, 0.95f)));
+    ASSERT_TRUE(gpt_sovits::t2s_session_build_decode_graph(session, model.model));
+    EXPECT_GT(ggml_graph_n_nodes(session.gf_dec), GGML_DEFAULT_GRAPH_SIZE);
+    gpt_sovits::t2s_batch_plan plan;
+    plan.n_query.assign(16, 2);
+    auto graph = gpt_sovits::t2s_session_build_flex_graph(session, model.model, plan);
+    EXPECT_NE(graph.ctx, nullptr);
+    if (graph.ctx) EXPECT_GT(ggml_graph_n_nodes(graph.gf), GGML_DEFAULT_GRAPH_SIZE);
+    gpt_sovits::t2s_flex_graph_free(graph);
+    EXPECT_EQ(graph.suppress_eos, nullptr);
+    gpt_sovits::t2s_session_free(session);
+    EXPECT_EQ(session.suppress_eos, nullptr);
 }
 
 TEST(T2SGenerateSynthetic, MaxNewTokensOneCountsPrefillToken) {
@@ -727,6 +946,24 @@ TEST(T2SGenerateSynthetic, InvalidConfigRejected) {
                 << "M=" << M;
             expect_result_unchanged(result);
             EXPECT_EQ(gpt_sovits::t2s_session_slot_n_pos(rig.session, 0), 0);
+        }
+    }
+
+    {
+        Rig rig;
+        init_rig(rig, spec, 16, make_sampler_config(1));
+        setup_constant_token(rig.model, 0);
+        install_zero_ref(rig, ref_audio);
+        for (int32_t minimum : {-1, std::numeric_limits<int32_t>::min()}) {
+            auto result = make_sentinel_result();
+            const auto mask = rig.session.mask_host;
+            EXPECT_FALSE(gpt_sovits::t2s_session_generate(
+                rig.session, rig.model, tokens.data(), (int64_t) tokens.size(),
+                bert.data(), result, gen_cfg(2, 42, minimum)));
+            expect_result_unchanged(result);
+            EXPECT_EQ(rig.session.slots[0].n_pos, 0);
+            EXPECT_EQ(rig.session.mask_host, mask);
+            EXPECT_EQ(rig.session.gf_dec, nullptr);
         }
     }
 

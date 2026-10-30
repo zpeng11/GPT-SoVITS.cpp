@@ -52,9 +52,15 @@ struct synthesis_result {
 // Output is raw 32 kHz mono F32, with codes.size() * 1280 samples. There is no
 // normalization, clipping, appended silence, int16 conversion or file IO. Codes
 // exclude the reference prompt and EOS. Length-limit termination retains all
-// accepted codes and reports max_new_tokens. Immediate EOS is an error (no retry).
-// Repetition history includes prompt ids plus accepted codes. EOS is not masked
-// in early steps; sampler semantics otherwise follow t2s_session_generate.
+// accepted codes and reports max_new_tokens. Immediate EOS is an error (no retry)
+// and is reachable with generate.min_new_tokens == 0.
+// generate.min_new_tokens defaults to 11 and excludes EOS from generation steps
+// below it; step 0 is the prediction from prefill. 0 disables the window.
+// max_new_tokens is always a hard cap and may be smaller than min_new_tokens; the
+// length limit then wins and EOS is never eligible. Repetition history includes
+// prompt ids plus accepted codes; other sampler semantics follow
+// t2s_session_generate. The EOS window approximates upstream early-EOS suppression
+// but does not claim full inference parity.
 // Seeds are reproducible only within the same build/backend, not across Python.
 //
 // Success replaces result and clears error; failure preserves result. Recoverable

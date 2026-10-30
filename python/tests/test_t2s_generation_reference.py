@@ -28,8 +28,9 @@ ARRAY_KEYS = {"phones", "bert", "prompt", "prefill_input", "codes", "logits",
 TOP_KEYS = {"schema", "status", "hparams", "dimensions", "policy", "stop_reason",
             "sources", "execution", "arrays"}
 POLICY_KEYS = {"top_k", "top_p", "temperature", "repetition_penalty", "max_new_tokens",
-               "history", "eos"}
+               "min_new_tokens", "history", "eos"}
 EOS_KW = {"eos": True, "codes": 2, "penalty": 1.5}
+EOS_POLICY = "suppressed-before-min-new-tokens"
 
 
 def write_three(directory, phones, bert, prompt):
@@ -45,7 +46,7 @@ def gen_provenance():
 
 
 def generation_arrays(reference_text=2, target_text=3, prompt=2, codes=3, *,
-                      eos=False, penalty=1.0, max_new_tokens=None):
+                      eos=False, penalty=1.0, max_new_tokens=None, min_new_tokens=0):
     text, decisions = reference_text + target_text, codes + (1 if eos else 0)
     budget = (codes + 1 if eos else codes) if max_new_tokens is None else max_new_tokens
     rng = np.random.default_rng(0x6E4)
@@ -70,7 +71,8 @@ def generation_arrays(reference_text=2, target_text=3, prompt=2, codes=3, *,
                        "codes": codes, "decisions": decisions},
         "policy": dict(top_k=1, top_p=1.0, temperature=1.0,
                        repetition_penalty=float(penalty), max_new_tokens=budget,
-                       history="prompt+generated-binary", eos="unmasked-before-accept"),
+                       min_new_tokens=min_new_tokens,
+                       history="prompt+generated-binary", eos=EOS_POLICY),
         "stop_reason": "eos" if eos else "max_new_tokens", "sources": gen_provenance(),
         "execution": dict(old.EXECUTION), "arrays": {}}
     return arrays, manifest
@@ -173,27 +175,33 @@ class GreedyPolicyTests(unittest.TestCase):
             return values
 
         cases = {
-            "positive divide": ([1], [row({5: 3.0, 6: 2.5})] * 2, 2, 2.0, [5, 6]),
-            "negative multiply": ([1], [row({5: -2.0, 6: -2.5})] * 2, 2, 2.0, [5, 6]),
+            "positive divide": ([1], [row({5: 3.0, 6: 2.5})] * 2, 2, 2.0, 0, [5, 6]),
+            "negative multiply": ([1], [row({5: -2.0, 6: -2.5})] * 2, 2, 2.0, 0, [5, 6]),
             # Binary history: the second sighting applies the same penalty.
-            "penalty once": ([1], [row({5: 3.0, 6: 2.5})] * 3, 3, 2.0, [5, 6, 5]),
+            "penalty once": ([1], [row({5: 3.0, 6: 2.5})] * 3, 3, 2.0, 0, [5, 6, 5]),
             # The original prompt is already in the history at step 0.
-            "prompt first step": ([5], [row({5: 3.0, 6: 2.5})], 1, 2.0, [6]),
+            "prompt first step": ([5], [row({5: 3.0, 6: 2.5})], 1, 2.0, 0, [6]),
             # Prompt and accepted IDs share one binary history.
-            "prompt and generated": ([5], [row({5: 3.0, 6: 2.5})] * 3, 3, 2.0,
+            "prompt and generated": ([5], [row({5: 3.0, 6: 2.5})] * 3, 3, 2.0, 0,
                                      [6, 5, 5]),
-            # EOS is unmasked and stops before being appended.
-            "eos unmasked": ([1], [row({EOS: 5.0, 5: 4.0})], 3, 2.0, [EOS]),
+            # EOS is unmasked and stops before being appended when min is zero.
+            "eos unmasked": ([1], [row({EOS: 5.0, 5: 4.0})], 3, 2.0, 0, [EOS]),
             # At the budget the last accepted code is retained, no extra probe.
             "limit retains last": ([1], [row({5: 3.0, 6: 2.0}), row({5: 2.0, 6: 3.0})],
-                                   2, 1.0, [5, 6])}
-        for name, (prompt, rows, budget, penalty, selected) in cases.items():
+                                   2, 1.0, 0, [5, 6]),
+            # Inside the window the raw highest EOS is skipped, then allowed.
+            "eos suppressed once": ([1], [row({EOS: 5.0, 5: 4.0})] * 2, 3, 2.0, 1,
+                                    [5, EOS]),
+            # min > max suppresses EOS for the whole request.
+            "eos suppressed to budget": ([1], [row({EOS: 5.0, 5: 4.0})] * 2, 2, 2.0, 11,
+                                         [5, 5])}
+        for name, (prompt, rows, budget, penalty, minimum, selected) in cases.items():
             with self.subTest(case=name):
                 inputs = {"phones": np.arange(3, dtype=np.int32),
                           "bert": np.zeros((3, 1024), dtype=np.float32),
                           "prompt": np.asarray(prompt, dtype=np.int32)}
                 arrays, reason = TOOL.run_greedy(
-                    self.scripted_model(rows), inputs, 1, budget, penalty)
+                    self.scripted_model(rows), inputs, 1, budget, penalty, minimum)
                 np.testing.assert_array_equal(arrays["selected"], np.asarray(selected, np.int32))
                 expected_codes = selected[:-1] if selected[-1] == EOS else selected
                 self.assertEqual(reason, "eos" if selected[-1] == EOS else "max_new_tokens")
@@ -210,7 +218,7 @@ class GreedyPolicyTests(unittest.TestCase):
             write_three(directory, phones, bert, prompt)
             inputs = TOOL.generation_inputs(directory, 2, 3, HPARAMS)
             model = old.build_model()
-            arrays, reason = TOOL.run_greedy(model, inputs, 2, 3, 1.5)
+            arrays, reason = TOOL.run_greedy(model, inputs, 2, 3, 1.5, 0)
             codes, decisions = arrays["codes"], arrays["logits"].shape[0]
             self.assertEqual(decisions, len(codes) + (1 if reason == "eos" else 0))
             self.assertGreaterEqual(decisions, 2)
@@ -252,6 +260,43 @@ class ManifestTests(unittest.TestCase):
                     name: "float32" if name in {"bert", "prefill_input", "logits"}
                     else "int32" for name in ARRAY_KEYS})
 
+    def test_min_new_tokens_window_roundtrip(self):
+        def suppressed_eos(minimum):
+            arrays, manifest = generation_arrays(codes=minimum, eos=True,
+                                                 min_new_tokens=minimum)
+            # Raw EOS is highest inside every suppressed decision.
+            arrays["logits"][:minimum, EOS] = 5.0
+            return arrays, manifest
+
+        for name, minimum in (("min one", 1), ("min eleven", 11)):
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                arrays, manifest = suppressed_eos(minimum)
+                output, published = publish_generation(
+                    Path(directory) / "ref", arrays, manifest)
+                self.assertEqual(TOOL.validate_generation_reference(output), published)
+                self.assertEqual(published["policy"]["min_new_tokens"], minimum)
+                self.assertEqual(published["policy"]["max_new_tokens"], minimum + 1)
+                self.assertEqual(published["stop_reason"], "eos")
+                self.assertEqual(int(np.load(output / "selected.npy")[-1]), EOS)
+                self.assertTrue(np.all(
+                    np.load(output / "selected.npy")[:-1] != EOS))
+
+    def test_min_greater_than_max_and_max_one(self):
+        cases = (
+            ("min over max", dict(codes=3, max_new_tokens=3, min_new_tokens=4)),
+            ("max one", dict(codes=1, max_new_tokens=1, min_new_tokens=11)))
+        for name, kwargs in cases:
+            with self.subTest(case=name), tempfile.TemporaryDirectory() as directory:
+                arrays, manifest = generation_arrays(**kwargs)
+                # Raw EOS wins but the whole request is inside the window.
+                arrays["logits"][:, EOS] = 5.0
+                output, published = publish_generation(
+                    Path(directory) / "ref", arrays, manifest)
+                self.assertEqual(TOOL.validate_generation_reference(output), published)
+                self.assertEqual(published["stop_reason"], "max_new_tokens")
+                self.assertTrue(np.all(
+                    np.load(output / "selected.npy") != EOS))
+
     def test_prompt_history_starts_at_first_decision(self):
         # Under prompt+generated history the prompt token is penalized at step
         # 0, so the raw runner-up (2.2 / 2 = 1.1) no longer wins and the
@@ -286,10 +331,12 @@ class ManifestTests(unittest.TestCase):
 
     def test_tampering_and_policy_violations_are_rejected(self):
         cases = {
+            "schema v1": ({}, mutate(lambda m: m.update(schema=TOOL.GEN_SCHEMA_V1))),
             "stop eos on limit": ({}, mutate(lambda m: m.update(stop_reason="eos"))),
             "stop limit on eos": (EOS_KW, mutate(lambda m: m.update(
                 stop_reason="max_new_tokens"))),
             "eos codes": (EOS_KW, mutate(lambda m: m["dimensions"].update(codes=3))),
+            "eos in window": (EOS_KW, mutate(lambda m: m["policy"].update(min_new_tokens=3))),
             "limit budget": ({}, mutate(lambda m: m["policy"].update(max_new_tokens=4))),
             "split sum": ({}, mutate(lambda m: m["dimensions"].update(target_text=4))),
             "reference zero": ({}, mutate(lambda m: m["dimensions"].update(
@@ -301,6 +348,14 @@ class ManifestTests(unittest.TestCase):
             "penalty nan": ({}, mutate(
                 lambda m: m["policy"].update(repetition_penalty=float("nan")))),
             "eos policy": ({}, mutate(lambda m: m["policy"].update(eos="masked"))),
+            "eos policy old": ({}, mutate(lambda m: m["policy"].update(
+                eos="unmasked-before-accept"))),
+            "min missing": ({}, mutate(lambda m: m["policy"].pop("min_new_tokens"))),
+            "min bool": ({}, mutate(lambda m: m["policy"].update(min_new_tokens=True))),
+            "min negative": ({}, mutate(lambda m: m["policy"].update(min_new_tokens=-1))),
+            "min float": ({}, mutate(lambda m: m["policy"].update(min_new_tokens=1.0))),
+            "min huge": ({}, mutate(lambda m: m["policy"].update(
+                min_new_tokens=int(np.iinfo(np.int32).max) + 1))),
             "policy missing": ({}, mutate(lambda m: m["policy"].pop("top_k"))),
             "four inputs": ({}, mutate(lambda m: m["sources"]["inputs"].update(
                 {"generated_codes.npy": "a" * 64}))),
@@ -334,6 +389,10 @@ class ManifestTests(unittest.TestCase):
         raw = np.array([-np.finfo(np.float32).max, 1.0, 0.0], np.float32)
         with self.assertRaisesRegex(ValueError, "non-finite"):
             TOOL.adjusted_logits(raw, [0], 1.35)
+        for bad in (True, -1, 1.0, int(np.iinfo(np.int32).max) + 1):
+            with self.subTest(min_new_tokens=bad), self.assertRaisesRegex(
+                    ValueError, "min_new_tokens"):
+                TOOL.generation_policy(1, 1.0, bad)
         arrays, _ = generation_arrays()
         arrays["logits"][1, int(arrays["codes"][0])] = -np.finfo(np.float32).max
         eos, _ = generation_arrays(eos=True, codes=0, penalty=1.0)
@@ -344,7 +403,7 @@ class ManifestTests(unittest.TestCase):
                 output = Path(directory) / name
                 with self.assertRaises(ValueError):
                     TOOL.write_generation_reference(output, data, HPARAMS, gen_provenance(),
-                                                     old.EXECUTION, 2, budget, rp, reason)
+                                                     old.EXECUTION, 2, budget, rp, reason, 0)
                 self.assertFalse(output.exists())
 
     def test_no_overwrite_cli_usage_and_signature(self):
@@ -360,7 +419,9 @@ class ManifestTests(unittest.TestCase):
                      ("--generate", *paths),
                      ("--generate", "--reference-phones", "1", "--validate", "x"),
                      ("--validate", "x", "--generate"),
-                     (*paths, "--max-new-tokens", "2")):
+                     (*paths, "--max-new-tokens", "2"),
+                     (*paths, "--min-new-tokens", "2"),
+                     ("--validate", "x", "--min-new-tokens", "2")):
             with self.subTest(args=args):
                 self.assertEqual(old.run_cli(*args).returncode, 2)
         params = inspect.signature(TOOL.export_reference).parameters
@@ -369,7 +430,8 @@ class ManifestTests(unittest.TestCase):
         self.assertEqual((params["steps"].default, params["steps"].kind),
                          (8, inspect.Parameter.POSITIONAL_OR_KEYWORD))
         for name, default in (("generation", False), ("reference_phones", None),
-                              ("max_new_tokens", 200), ("repetition_penalty", 1.0)):
+                              ("max_new_tokens", 200), ("repetition_penalty", 1.0),
+                              ("min_new_tokens", 11)):
             self.assertEqual((params[name].kind, params[name].default),
                              (inspect.Parameter.KEYWORD_ONLY, default))
         for name in ("generation_inputs", "run_greedy", "validate_generation_reference"):
@@ -377,7 +439,7 @@ class ManifestTests(unittest.TestCase):
 
 BLOCKED_IMPORT = r'''
 module = _load(sys.argv[1])
-assert module.GEN_SCHEMA == "gpt-sovits-t2s-generation-reference/v1"
+assert module.GEN_SCHEMA == "gpt-sovits-t2s-generation-reference/v2"
 assert "torch" not in sys.modules
 assert not any(n == "AR" or n.startswith("AR.") or n.startswith("GPT_SoVITS")
                for n in sys.modules)
@@ -395,7 +457,7 @@ class LazyGenerationTests(unittest.TestCase):
         result = old.run_blocked(BLOCKED_RUN, old.TOOL_PATH, "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
         for flag in ("--generate", "--reference-phones", "--max-new-tokens",
-                     "--repetition-penalty"):
+                     "--repetition-penalty", "--min-new-tokens"):
             self.assertIn(flag, result.stdout)
         with tempfile.TemporaryDirectory() as directory:
             generation, _ = write_generation(directory, name="generation")
@@ -485,8 +547,9 @@ class GenerationCliTests(unittest.TestCase):
             self.assertEqual(manifest["policy"],
                              {"top_k": 1, "top_p": 1.0, "temperature": 1.0,
                               "repetition_penalty": 1.35, "max_new_tokens": 3,
+                              "min_new_tokens": 11,
                               "history": "prompt+generated-binary",
-                              "eos": "unmasked-before-accept"})
+                              "eos": EOS_POLICY})
             self.assertEqual(manifest["stop_reason"], reason)
             self.assertEqual(manifest["execution"], old.EXECUTION)
             self.assertEqual(set(manifest["sources"]["inputs"]), set(GEN_INPUTS))

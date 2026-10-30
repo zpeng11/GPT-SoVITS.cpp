@@ -77,6 +77,11 @@ bool validate_synthesis_config(const synthesis_config & config, std::string * er
         if (config.generate.max_new_tokens <= 0 || config.generate.max_new_tokens > kSlotLimit) {
             return fail(error, "synthesis max_new_tokens must be in [1, 1024]");
         }
+        // The EOS window only has a lower bound. It may exceed max_new_tokens,
+        // in which case the hard length cap applies before EOS becomes eligible.
+        if (config.generate.min_new_tokens < 0) {
+            return fail(error, "synthesis min_new_tokens must be >= 0");
+        }
         if (!std::isfinite(config.noise_scale) || config.noise_scale <= 0.0f) {
             return fail(error, "synthesis noise_scale must be positive and finite");
         }

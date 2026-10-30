@@ -108,6 +108,9 @@ void print_usage(std::FILE * out, const char * program) {
         "                            frontend JSON contains Chinese segments\n"
         "  --overwrite               allow replacing an existing --output file\n"
         "  --max-new-tokens N        default 200; N in [1, 1024]\n"
+        "  --min-new-tokens N        default 11; N in [0, 2147483647]; EOS is\n"
+        "                            excluded for the first N steps; 0 disables\n"
+        "                            the window\n"
         "  --seed N                  T2S sampling seed (default 42)\n"
         "  --noise-seed N            SoVITS noise seed (default 7)\n"
         "  --noise-scale F           default 0.5; must be positive\n"
@@ -119,7 +122,9 @@ void print_usage(std::FILE * out, const char * program) {
         "\n"
         "Output is raw 32 kHz mono F32 with codes.size() * 1280 samples, written\n"
         "only after synthesis succeeds. Stop reason eos means natural termination;\n"
-        "max_new_tokens means the text may be truncated.\n"
+        "max_new_tokens means the text may be truncated. --max-new-tokens is a hard\n"
+        "cap and may be smaller than --min-new-tokens; the cap then wins and EOS is\n"
+        "never emitted.\n"
         "Exit codes: 0 success, 1 failure, 2 usage error.\n",
         program);
 }
@@ -196,6 +201,12 @@ parse_result parse_args(int argc, char ** argv, cli_options & opts, std::string 
             if (!parse_int64(value, v) || v < 1 || v > 1024)
                 return bad("an integer in [1, 1024]");
             opts.config.generate.max_new_tokens = static_cast<int32_t>(v);
+        } else if (flag == "--min-new-tokens") {
+            if (!next_value(value)) return parse_result::error;
+            int64_t v = 0;
+            if (!parse_int64(value, v) || v < 0 || v > INT32_MAX)
+                return bad("an integer in [0, 2147483647]");
+            opts.config.generate.min_new_tokens = static_cast<int32_t>(v);
         } else if (flag == "--seed") {
             if (!next_value(value)) return parse_result::error;
             int64_t v = 0;

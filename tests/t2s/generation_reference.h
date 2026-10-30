@@ -1,4 +1,4 @@
-// Test-only v1 generation reference reader. Reuses t2s_reference::detail for
+// Test-only v2 generation reference reader. Reuses t2s_reference::detail for
 // NPY/JSON/header validation. SHA-256 is syntax-checked only; run
 // generate_reference.py --validate before this reader to verify integrity.
 
@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <limits>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -23,6 +24,7 @@ struct Reference {
     int64_t reference_text = 0;
     int64_t target_text = 0;
     int64_t max_new_tokens = 0;
+    int64_t min_new_tokens = 0;
     float repetition_penalty = 1.0f;
     std::string stop_reason;
     std::vector<int32_t> codes;
@@ -38,7 +40,10 @@ namespace detail {
 
 using json = nlohmann::json;
 
-constexpr const char * kSchema = "gpt-sovits-t2s-generation-reference/v1";
+constexpr const char * kSchema = "gpt-sovits-t2s-generation-reference/v2";
+constexpr const char * kSchemaV1 = "gpt-sovits-t2s-generation-reference/v1";
+constexpr const char * kEosPolicy = "suppressed-before-min-new-tokens";
+constexpr const char * kLegacyEosPolicy = "unmasked-before-accept";
 
 [[noreturn]] inline void fail(const std::string & where, const std::string & message) {
     throw std::runtime_error("t2s generation reference " + where + ": " + message);
@@ -71,13 +76,15 @@ struct dimensions {
 
 struct policy {
     int64_t max_new_tokens = 0;
+    int64_t min_new_tokens = 0;
     float repetition_penalty = 1.0f;
 };
 
 inline policy validate_policy(const json & value) {
     const std::string where = "manifest.policy";
     d::require_keys(value,
-                    {"top_k", "top_p", "temperature", "repetition_penalty", "max_new_tokens", "history", "eos"},
+                    {"top_k", "top_p", "temperature", "repetition_penalty", "max_new_tokens",
+                     "min_new_tokens", "history", "eos"},
                     where);
     const json & top_k = d::field(value, "top_k", where);
     if (!top_k.is_number_integer() || top_k.get<int64_t>() != 1) fail(where + ".top_k", "must be 1");
@@ -96,13 +103,20 @@ inline policy validate_policy(const json & value) {
     policy out;
     out.max_new_tokens = static_cast<int64_t>(
         d::positive_integer(d::field(value, "max_new_tokens", where), where + ".max_new_tokens", d::kContextLimit));
+    out.min_new_tokens = nonnegative_integer(
+        d::field(value, "min_new_tokens", where), where + ".min_new_tokens",
+        static_cast<uint64_t>(std::numeric_limits<int32_t>::max()));
     out.repetition_penalty = static_cast<float>(penalty_value);
     if (!std::isfinite(out.repetition_penalty) || !(out.repetition_penalty > 0.0f) ||
         !std::isfinite(1.0f / out.repetition_penalty)) {
         fail(where + ".repetition_penalty", "penalty and reciprocal must be positive finite float32");
     }
     d::require_string(d::field(value, "history", where), "prompt+generated-binary", where + ".history");
-    d::require_string(d::field(value, "eos", where), "unmasked-before-accept", where + ".eos");
+    const json & eos = d::field(value, "eos", where);
+    if (eos.is_string() && eos.get<std::string>() == kLegacyEosPolicy) {
+        fail(where + ".eos", "legacy unmasked-before-accept references are unsupported; re-export them");
+    }
+    d::require_string(eos, kEosPolicy, where + ".eos");
     return out;
 }
 
@@ -144,6 +158,9 @@ inline std::string validate_stop_reason(const json & value) {
 inline void validate_stop_shape(const dimensions & dims, const policy & pol, const std::string & stop_reason) {
     if (stop_reason == "eos") {
         if (dims.decisions != dims.codes + 1) fail("manifest.dimensions", "eos stop requires decisions = codes + 1");
+        if (dims.decisions - 1 < pol.min_new_tokens) {
+            fail("manifest.dimensions", "eos stop must occur after the min_new_tokens suppression window");
+        }
     } else if (dims.codes != dims.decisions || dims.codes != pol.max_new_tokens) {
         fail("manifest.dimensions", "max_new_tokens stop requires codes = decisions = max_new_tokens");
     }
@@ -237,9 +254,14 @@ inline void validate_selection(const Reference & reference, const gpt_sovits::t2
     }
     for (int64_t step = 0; step < decisions; ++step) {
         const size_t base = static_cast<size_t>(step * vocab);
+        const bool suppressed = step < reference.min_new_tokens;
+        const int64_t limit = suppressed ? eos : vocab;
+        if (suppressed && reference.selected[static_cast<size_t>(step)] == eos) {
+            fail("selected.npy", "EOS selected inside the min_new_tokens suppression window");
+        }
         int64_t best = 0;
         float best_value = penalized(reference.logits[base], seen[0] != 0, reference.repetition_penalty);
-        for (int64_t token = 1; token < vocab; ++token) {
+        for (int64_t token = 1; token < limit; ++token) {
             const float value = penalized(reference.logits[base + static_cast<size_t>(token)],
                                           seen[static_cast<size_t>(token)] != 0, reference.repetition_penalty);
             if (value > best_value) {
@@ -267,7 +289,12 @@ inline Reference load(const std::filesystem::path & directory) {
                     {"schema", "status", "hparams", "dimensions", "policy", "stop_reason", "sources", "execution",
                      "arrays"},
                     "manifest");
-    d::require_string(d::field(manifest, "schema", "manifest"), detail::kSchema, "manifest.schema");
+    const detail::json & schema = d::field(manifest, "schema", "manifest");
+    if (schema.is_string() && schema.get<std::string>() == detail::kSchemaV1) {
+        detail::fail("manifest.schema",
+                     "legacy v1 used unmasked EOS; re-export the reference with this reader's schema");
+    }
+    d::require_string(schema, detail::kSchema, "manifest.schema");
     d::require_string(d::field(manifest, "status", "manifest"), "complete", "manifest.status");
     const gpt_sovits::t2s_hparams hparams = d::validate_hparams(d::field(manifest, "hparams", "manifest"));
     const detail::policy pol = detail::validate_policy(d::field(manifest, "policy", "manifest"));
@@ -304,6 +331,7 @@ inline Reference load(const std::filesystem::path & directory) {
     out.reference_text = dims.reference_text;
     out.target_text = dims.target_text;
     out.max_new_tokens = pol.max_new_tokens;
+    out.min_new_tokens = pol.min_new_tokens;
     out.repetition_penalty = pol.repetition_penalty;
     out.stop_reason = stop_reason;
 

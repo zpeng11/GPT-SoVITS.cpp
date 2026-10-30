@@ -16,6 +16,7 @@ inside the runner. RoBERTa can be null only when neither text needs Chinese BERT
 gpt_sovits::synthesis_models models{&hubert, &roberta, &t2s, &sovits, &sv};
 gpt_sovits::synthesis_config config;
 config.generate.max_new_tokens = 100;
+config.generate.min_new_tokens = 11;  // default; 0 disables the EOS window
 config.generate.seed = 42;
 config.noise_seed = 7;
 gpt_sovits::synthesis_result result;
@@ -41,14 +42,22 @@ with an initial total limit of 1024. Over-budget requests fail without truncatio
 
 `result.samples` is raw mono F32 at `result.sample_rate == 32000`, containing
 `result.codes.size() * 1280` samples. Codes exclude the reference prompt and EOS.
-An immediate EOS is an error and never calls SoVITS or retries. Length-limit
-termination retains all accepted codes and reports `max_new_tokens` through
-`result.stop_reason`. No normalization, clipping, trailing silence or int16
-conversion is applied. The T2S repetition mask is a binary set of reference prompt
-codes plus codes accepted in this request, matching upstream's history scope.
-Repeated IDs are penalized once, and history is reset for every call. Python's
-early EOS suppression, duration-based stopping and RNG are not reproduced.
-Same-seed reproducibility is restricted to the same build/backend.
+An immediate EOS is an error and never calls SoVITS or retries; it is reachable
+when `min_new_tokens` is `0`. Length-limit termination retains all accepted codes
+and reports `max_new_tokens` through `result.stop_reason`. No normalization,
+clipping, trailing silence or int16 conversion is applied.
+
+`min_new_tokens` defaults to `11` and excludes EOS from generation steps below it
+(step 0 is the prediction from prefill). `0` disables the window; either sampled
+or greedy EOS can then stop before the candidate is accepted. `max_new_tokens` remains a hard cap and may be smaller
+than `min_new_tokens`; the length limit then wins and EOS is never eligible, so a
+`max_new_tokens` stop does not in that case imply that EOS was available. The T2S
+repetition mask is a binary set of reference prompt codes plus codes accepted in
+this request, matching upstream's history scope. Repeated IDs are penalized once,
+and history is reset for every call. The EOS window approximates upstream's
+early-EOS suppression, but duration-based stopping and RNG are not reproduced, and
+this is not a claim of full upstream inference parity. Same-seed reproducibility
+is restricted to the same build/backend.
 
 Build and run the runner tests using the same explicit local case setting as the
 reference tests below:

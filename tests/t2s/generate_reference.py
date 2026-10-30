@@ -24,7 +24,10 @@ import tempfile
 import numpy as np
 
 SCHEMA = "gpt-sovits-t2s-decode-reference/v1"
-GEN_SCHEMA = "gpt-sovits-t2s-generation-reference/v1"
+GEN_SCHEMA = "gpt-sovits-t2s-generation-reference/v2"
+GEN_SCHEMA_V1 = "gpt-sovits-t2s-generation-reference/v1"
+EOS_POLICY = "suppressed-before-min-new-tokens"
+EOS_POLICY_V1 = "unmasked-before-accept"
 CONTEXT_LIMIT = 1024
 INPUT_FILES = (
     "t2s_all_phones.npy", "t2s_all_bert.npy", "t2s_prompt.npy", "generated_codes.npy",
@@ -57,6 +60,12 @@ def regular_file(path):
 
 def positive_int(value, name):
     require(type(value) is int and value > 0, f"{name} must be a positive integer")
+    return value
+
+
+def nonnegative_int32(value, name):
+    require(type(value) is int and 0 <= value <= np.iinfo(np.int32).max,
+            f"{name} must be a nonnegative int32")
     return value
 
 
@@ -349,8 +358,9 @@ def publish_reference(output, arrays, specs, manifest, validate):
     return manifest
 
 
-def generation_policy(max_new_tokens, repetition_penalty):
+def generation_policy(max_new_tokens, repetition_penalty, min_new_tokens=11):
     positive_int(max_new_tokens, "max_new_tokens")
+    nonnegative_int32(min_new_tokens, "min_new_tokens")
     require(type(repetition_penalty) in (int, float) and np.isfinite(repetition_penalty)
             and repetition_penalty > 0, "repetition_penalty must be finite and positive")
     with np.errstate(over="ignore", divide="ignore", invalid="ignore"):
@@ -360,7 +370,8 @@ def generation_policy(max_new_tokens, repetition_penalty):
             "repetition_penalty and its reciprocal must be finite and positive in float32")
     return {"top_k": 1, "top_p": 1.0, "temperature": 1.0,
             "repetition_penalty": float(repetition_penalty), "max_new_tokens": max_new_tokens,
-            "history": "prompt+generated-binary", "eos": "unmasked-before-accept"}
+            "min_new_tokens": min_new_tokens,
+            "history": "prompt+generated-binary", "eos": EOS_POLICY}
 
 
 def adjusted_logits(logits, codes, repetition_penalty, prompt=()):
@@ -378,14 +389,16 @@ def adjusted_logits(logits, codes, repetition_penalty, prompt=()):
     return adjusted
 
 
-def run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penalty):
+def run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penalty,
+               min_new_tokens=11):
     import torch
 
-    generation_policy(max_new_tokens, repetition_penalty)
+    generation_policy(max_new_tokens, repetition_penalty, min_new_tokens)
     positive_int(reference_phones, "reference_phones")
     require(reference_phones < len(inputs["phones"]), "reference/target text split must leave nonempty target phones")
     t, p = len(inputs["phones"]), len(inputs["prompt"])
     require(t + p + max_new_tokens - 1 <= CONTEXT_LIMIT, "generation exceeds the 1024-position context budget")
+    eos = int(model.EOS)
     model.cpu().float().eval()
     phones = torch.from_numpy(inputs["phones"].astype(np.int64))[None]
     bert = torch.from_numpy(inputs["bert"])[None]
@@ -403,11 +416,12 @@ def run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penal
         for step in range(max_new_tokens):
             logits = model.ar_predict_layer(hidden[:, -1])[0].cpu().numpy().copy()
             require(np.isfinite(logits).all(), f"non-finite generation logits at step {step}")
-            token = int(adjusted_logits(
-                logits, codes, repetition_penalty, inputs["prompt"]).argmax())
+            scores = adjusted_logits(logits, codes, repetition_penalty, inputs["prompt"])
+            # The last vocabulary entry is EOS; suppress it inside the window.
+            token = int(scores[:eos].argmax() if step < min_new_tokens else scores.argmax())
             rows.append(logits)
             selected.append(token)
-            if token == model.EOS:
+            if token == eos:
                 reason = "eos"
                 break
             codes.append(token)
@@ -452,16 +466,27 @@ def validate_generation_reference(directory):
     t, r, target, p, n, c, d = (dims[k] for k in ("text", "reference_text", "target_text", "prompt", "prefill", "codes", "decisions"))
     require(t == r + target and n == t + p, "inconsistent text split/prefill dimensions")
     require(isinstance(policy, dict) and set(policy) == {
-        "top_k", "top_p", "temperature", "repetition_penalty", "max_new_tokens", "history", "eos",
+        "top_k", "top_p", "temperature", "repetition_penalty", "max_new_tokens", "min_new_tokens",
+        "history", "eos",
     }, "unexpected generation policy fields")
-    expected = generation_policy(policy["max_new_tokens"], policy["repetition_penalty"])
+    require(policy["eos"] != EOS_POLICY_V1,
+            "legacy unmasked-before-accept generation references are unsupported; re-export")
+    minimum = policy["min_new_tokens"]
+    require(type(minimum) is int and 0 <= minimum <= np.iinfo(np.int32).max,
+            "generation policy min_new_tokens must be a nonnegative int32")
+    expected = generation_policy(policy["max_new_tokens"], policy["repetition_penalty"], minimum)
     require(type(policy["top_k"]) is int and all(type(policy[k]) in (int, float) for k in ("top_p", "temperature"))
             and policy == expected, "unsupported generation policy")
     maximum = policy["max_new_tokens"]
     require(n + maximum - 1 <= CONTEXT_LIMIT, "generation exceeds the 1024-position context budget")
     reason = manifest["stop_reason"]
-    require((reason == "eos" and d == c + 1 and d <= maximum)
-            or (reason == "max_new_tokens" and c == d == maximum), "inconsistent stop reason/codes/decisions")
+    if reason == "eos":
+        require(d == c + 1 and d <= maximum, "inconsistent stop reason/codes/decisions")
+        require(d - 1 >= minimum, "EOS stop must occur after the min_new_tokens suppression window")
+    elif reason == "max_new_tokens":
+        require(c == d == maximum, "inconsistent stop reason/codes/decisions")
+    else:
+        require(False, "unexpected generation stop reason")
     validate_provenance(manifest["sources"], INPUT_FILES[:3])
     validate_execution(manifest["execution"])
     arrays = validate_arrays(directory, manifest, generation_specs(hp, dims))
@@ -473,16 +498,17 @@ def validate_generation_reference(directory):
     if reason == "eos":
         require(arrays["selected"][-1] == hp["EOS"], "EOS stop must include an unaccepted EOS decision")
     for step, row in enumerate(arrays["logits"]):
-        expected_token = int(adjusted_logits(
-            row, arrays["codes"][:step], policy["repetition_penalty"],
-            arrays["prompt"]).argmax())
+        scores = adjusted_logits(row, arrays["codes"][:step], policy["repetition_penalty"],
+                                 arrays["prompt"])
+        expected_token = int(scores[:hp["EOS"]].argmax() if step < minimum else scores.argmax())
         require(expected_token == arrays["selected"][step], f"selected token disagrees with policy at step {step}")
     return manifest
 
 
 def write_generation_reference(output_dir, arrays, hparams, provenance, execution,
-                               reference_phones, max_new_tokens, repetition_penalty, stop_reason):
-    policy = generation_policy(max_new_tokens, repetition_penalty)
+                               reference_phones, max_new_tokens, repetition_penalty, stop_reason,
+                               min_new_tokens=11):
+    policy = generation_policy(max_new_tokens, repetition_penalty, min_new_tokens)
     dimensions = {"text": len(arrays["phones"]), "reference_text": reference_phones,
                   "target_text": len(arrays["phones"]) - reference_phones, "prompt": len(arrays["prompt"]),
                   "prefill": len(arrays["phones"]) + len(arrays["prompt"]),
@@ -561,11 +587,12 @@ def configure_torch():
 
 
 def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8, *,
-                     generation=False, reference_phones=None, max_new_tokens=200, repetition_penalty=1.0):
+                     generation=False, reference_phones=None, max_new_tokens=200, repetition_penalty=1.0,
+                     min_new_tokens=11):
     require(not os.path.lexists(output_dir), f"output already exists; refusing to overwrite: {output_dir}")
     if generation:
         positive_int(reference_phones, "reference_phones")
-        generation_policy(max_new_tokens, repetition_penalty)
+        generation_policy(max_new_tokens, repetition_penalty, min_new_tokens)
     else:
         positive_int(steps, "steps")
     input_files = INPUT_FILES[:3] if generation else INPUT_FILES
@@ -598,7 +625,8 @@ def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8,
     model.load_state_dict(state, strict=True)
     del state, weights
     if generation:
-        arrays, reason = run_greedy(model, inputs, reference_phones, max_new_tokens, repetition_penalty)
+        arrays, reason = run_greedy(model, inputs, reference_phones, max_new_tokens,
+                                    repetition_penalty, min_new_tokens)
     else:
         arrays = run_teacher_forced(model, inputs)
     require(sha256(checkpoint) == checkpoint_hash, "checkpoint changed during export")
@@ -614,7 +642,8 @@ def export_reference(checkpoint, upstream_root, inputs_dir, output_dir, steps=8,
     }
     if generation:
         return write_generation_reference(output_dir, arrays, hparams, provenance, execution,
-                                          reference_phones, max_new_tokens, repetition_penalty, reason)
+                                          reference_phones, max_new_tokens, repetition_penalty,
+                                          reason, min_new_tokens)
     return write_reference(output_dir, arrays, hparams, provenance, execution)
 
 
@@ -630,9 +659,12 @@ def main(argv=None):
     parser.add_argument("--reference-phones", type=int, help="reference phone count in concatenated all-phones input")
     parser.add_argument("--max-new-tokens", type=int, help="generation budget (default: 200)")
     parser.add_argument("--repetition-penalty", type=float, help="prompt+generated repetition penalty (default: 1.0)")
+    parser.add_argument("--min-new-tokens", type=int,
+                        help="EOS suppression window in predictions; 0 disables it (default: 11)")
     args = parser.parse_args(argv)
     exporting = (args.checkpoint, args.upstream_root, args.inputs_dir, args.output_dir, args.steps,
-                 args.reference_phones, args.max_new_tokens, args.repetition_penalty)
+                 args.reference_phones, args.max_new_tokens, args.repetition_penalty,
+                 args.min_new_tokens)
     if args.validate:
         if args.generate or any(value is not None for value in exporting):
             parser.error("--validate cannot be combined with export arguments")
@@ -649,6 +681,8 @@ def main(argv=None):
             header = json.loads(path.read_text(encoding="utf-8"))
             require(isinstance(header, dict), "reference manifest must be an object")
             schema = header.get("schema")
+            require(schema != GEN_SCHEMA_V1,
+                    "generation reference schema v1 used unmasked EOS; re-export it with this exporter")
             manifest = (validate_generation_reference(args.validate) if schema == GEN_SCHEMA
                         else validate_reference(args.validate))
         else:
@@ -656,7 +690,8 @@ def main(argv=None):
                                         args.output_dir, 8 if args.steps is None else args.steps,
                                         generation=args.generate, reference_phones=args.reference_phones,
                                         max_new_tokens=200 if args.max_new_tokens is None else args.max_new_tokens,
-                                        repetition_penalty=1.0 if args.repetition_penalty is None else args.repetition_penalty)
+                                        repetition_penalty=1.0 if args.repetition_penalty is None else args.repetition_penalty,
+                                        min_new_tokens=11 if args.min_new_tokens is None else args.min_new_tokens)
         d = manifest["dimensions"]
         if manifest["schema"] == GEN_SCHEMA:
             print(f"Validated {GEN_SCHEMA}: codes={d['codes']}, decisions={d['decisions']}, stop={manifest['stop_reason']}")

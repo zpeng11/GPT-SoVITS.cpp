@@ -270,6 +270,48 @@ static ::ggml_tensor * pick_sampler_token(
     return ggml_reshape_1d(ctx, picked_token, 1);
 }
 
+static t2s_sampler_result sample_column(
+    ::ggml_context * ctx,
+    ::ggml_tensor * logits,
+    ::ggml_tensor * seen_mask,
+    int top_k,
+    float top_p,
+    float temperature,
+    float repetition_penalty,
+    ::ggml_tensor * exp_noise)
+{
+    t2s_sampler_probs_result probs = build_sampler_probs(
+        ctx, logits, seen_mask, top_k, top_p, temperature, repetition_penalty);
+    ::ggml_tensor * indices = flatten_vector_like(ctx, probs.sorted_indices);
+    ::ggml_tensor * greedy = ggml_view_1d(ctx, indices, 1, 0);
+    t2s_sampler_result result;
+    result.greedy = ggml_reshape_1d(ctx, ggml_cont(ctx, greedy), 1);
+    result.sampled = pick_sampler_token(ctx, probs.probs_sorted, probs.sorted_indices, exp_noise);
+    return result;
+}
+
+static ::ggml_tensor * concat_token_ids(
+    ::ggml_context * ctx,
+    ::ggml_tensor * first,
+    ::ggml_tensor * second)
+{
+    // CUDA CONCAT only supports F32. SET preserves int32 IDs without a lossy cast.
+    const int64_t count = first->ne[0] + second->ne[0];
+    ::ggml_tensor * joined = ggml_cast(ctx, ggml_arange(ctx, 0, (float) count, 1), GGML_TYPE_I32);
+    joined = ggml_set_1d(ctx, joined, first, 0);
+    return ggml_set_1d(ctx, joined, second, first->ne[0] * sizeof(int32_t));
+}
+
+static ::ggml_tensor * select_sampler_token(
+    ::ggml_context * ctx,
+    ::ggml_tensor * unmasked,
+    ::ggml_tensor * suppressed,
+    ::ggml_tensor * selector)
+{
+    ::ggml_tensor * choices = concat_token_ids(ctx, unmasked, suppressed);
+    return ggml_reshape_1d(ctx, ggml_get_rows(ctx, ensure_scalar_rows(ctx, choices), selector), 1);
+}
+
 t2s_sampler_result t2s_sampler_block_forward(
     ::ggml_context * ctx,
     ::ggml_tensor  * y,
@@ -279,7 +321,8 @@ t2s_sampler_result t2s_sampler_block_forward(
     float            top_p,
     float            temperature,
     float            repetition_penalty,
-    ::ggml_tensor  * exp_noise)
+    ::ggml_tensor  * exp_noise,
+    ::ggml_tensor  * suppress_eos)
 {
     GGML_ASSERT(ctx != nullptr);
     GGML_ASSERT(y != nullptr);
@@ -291,6 +334,12 @@ t2s_sampler_result t2s_sampler_block_forward(
     const int64_t vocab   = logits->ne[0];
     const int64_t n_batch = logits->ne[1];
     GGML_ASSERT(n_batch >= 1);
+    if (suppress_eos != nullptr) {
+        GGML_ASSERT(vocab > 1);
+        GGML_ASSERT(suppress_eos->type == GGML_TYPE_I32);
+        GGML_ASSERT(suppress_eos->ne[0] == n_batch);
+        GGML_ASSERT(ggml_is_vector(suppress_eos));
+    }
 
     // Process each batch element independently via 1D column views.
     // Columns of a contiguous {vocab, n_batch} tensor are contiguous
@@ -312,22 +361,26 @@ t2s_sampler_result t2s_sampler_block_forward(
             exp_noise_b = ggml_view_1d(ctx, exp_noise, vocab, b * exp_noise->nb[1]);
         }
 
-        // Run 1D sampler logic on this batch element.
-        t2s_sampler_probs_result probs = build_sampler_probs(
-            ctx, logits_b, seen_mask_b, top_k, top_p, temperature, repetition_penalty);
+        t2s_sampler_result column = sample_column(
+            ctx, logits_b, seen_mask_b, top_k, top_p, temperature, repetition_penalty, exp_noise_b);
+        if (suppress_eos != nullptr) {
+            // Slicing excludes EOS exactly; -inf is unsafe in the filtering
+            // arithmetic and a finite negative bias is not an exclusion.
+            ::ggml_tensor * logits_prefix = ggml_view_1d(ctx, logits_b, vocab - 1, 0);
+            ::ggml_tensor * seen_prefix = seen_mask_b
+                ? ggml_view_1d(ctx, seen_mask_b, vocab - 1, 0) : nullptr;
+            ::ggml_tensor * noise_prefix = exp_noise_b
+                ? ggml_view_1d(ctx, exp_noise_b, vocab - 1, 0) : nullptr;
+            t2s_sampler_result suppressed = sample_column(
+                ctx, logits_prefix, seen_prefix, top_k, top_p, temperature, repetition_penalty, noise_prefix);
+            ::ggml_tensor * selector = ggml_view_1d(ctx, suppress_eos, 1,
+                                                   b * suppress_eos->nb[0]);
+            column.sampled = select_sampler_token(ctx, column.sampled, suppressed.sampled, selector);
+            column.greedy = select_sampler_token(ctx, column.greedy, suppressed.greedy, selector);
+        }
 
-        // Greedy token: sorted_indices[0] is the argmax (highest logit after
-        // repetition penalty, before temperature/noise).
-        ::ggml_tensor * indices_vec = flatten_vector_like(ctx, probs.sorted_indices);
-        ::ggml_tensor * greedy = ggml_view_1d(ctx, indices_vec, 1, 0);
-        greedy = ggml_reshape_1d(ctx, ggml_cont(ctx, greedy), 1);
-
-        // Sampled token.
-        ::ggml_tensor * sampled = pick_sampler_token(
-            ctx, probs.probs_sorted, probs.sorted_indices, exp_noise_b);
-
-        sampled_list.push_back(sampled);
-        greedy_list.push_back(greedy);
+        sampled_list.push_back(column.sampled);
+        greedy_list.push_back(column.greedy);
     }
 
     // Combine per-batch results via concat along dim 0.
@@ -339,8 +392,8 @@ t2s_sampler_result t2s_sampler_block_forward(
         result.sampled = sampled_list[0];
         result.greedy  = greedy_list[0];
         for (int64_t b = 1; b < n_batch; b++) {
-            result.sampled = ggml_concat(ctx, result.sampled, sampled_list[b], 0);
-            result.greedy  = ggml_concat(ctx, result.greedy,  greedy_list[b],  0);
+            result.sampled = concat_token_ids(ctx, result.sampled, sampled_list[b]);
+            result.greedy  = concat_token_ids(ctx, result.greedy, greedy_list[b]);
         }
     }
 
