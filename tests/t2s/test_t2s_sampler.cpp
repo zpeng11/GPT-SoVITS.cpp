@@ -166,6 +166,59 @@ const SamplerCase kTopPCases[] = {
 INSTANTIATE_TEST_SUITE_P(, T2SSamplerTopP, ::testing::ValuesIn(kTopPCases),
     [](const ::testing::TestParamInfo<SamplerCase> & info) { return std::string(info.param.name); });
 
+class T2SSamplerTopK : public T2SSampler, public ::testing::WithParamInterface<SamplerCase> {};
+
+TEST_P(T2SSamplerTopK, MatchesExpectedToken) {
+    const auto & c = GetParam();
+    ASSERT_NO_FATAL_FAILURE(Run(c));
+    EXPECT_EQ(sampled_, std::vector<int32_t>{c.sampled});
+    EXPECT_EQ(greedy_, std::vector<int32_t>{c.greedy});
+}
+
+// Sorted token IDs are {1, 3, 0, 2}; small noise makes the selected rank win
+// whenever it remains eligible. Other sampling controls are disabled.
+const SamplerCase kTopKCases[] = {
+    {"CutoffIncludesKthCandidate", {1, 3, 0, 2}, {1, 1e-4f, 1, 1},
+     1.0f, 3, 1, 2},
+    {"RemovesCandidateBelowCutoff", {1, 3, 0, 2}, {1, 1, 1e-4f, 1},
+     1.0f, 1, 1, 2},
+    {"ZeroDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+     1.0f, 2, 1, 0},
+    {"NegativeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+     1.0f, 2, 1, -1},
+    {"VocabularySizeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+     1.0f, 2, 1, 4},
+    {"AboveVocabularySizeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+     1.0f, 2, 1, 5},
+};
+
+INSTANTIATE_TEST_SUITE_P(, T2SSamplerTopK, ::testing::ValuesIn(kTopKCases),
+    [](const ::testing::TestParamInfo<SamplerCase> & info) { return std::string(info.param.name); });
+
+TEST_F(T2SSampler, TopKKeepsCandidatesTiedWithPivot) {
+    // Rank 2 lies beyond the first k=2 entries but ties with the pivot. Force it
+    // to win without depending on which tied token ID occupies that rank.
+    const SamplerCase c = {"", {2, 3, 0, 2}, {1, 1, 1e-4f, 1},
+                           1.0f, 0, 1, 2};
+    ASSERT_NO_FATAL_FAILURE(Run(c));
+    ASSERT_EQ(sampled_.size(), 1u);
+    EXPECT_TRUE(sampled_[0] == 0 || sampled_[0] == 3) << sampled_[0];
+    EXPECT_EQ(greedy_, std::vector<int32_t>{1});
+}
+
+TEST_F(T2SSampler, TopKOneKeepsTiedLeadingCandidates) {
+    // Rank 1 must remain eligible even with k=1. Comparing with greedy avoids
+    // assuming a particular ordering of the tied leading token IDs.
+    const SamplerCase c = {"", {2, 0, 2, 1}, {1, 1e-4f, 1, 1},
+                           1.0f, 0, 0, 1};
+    ASSERT_NO_FATAL_FAILURE(Run(c));
+    ASSERT_EQ(sampled_.size(), 1u);
+    ASSERT_EQ(greedy_.size(), 1u);
+    EXPECT_TRUE(sampled_[0] == 0 || sampled_[0] == 2) << sampled_[0];
+    EXPECT_TRUE(greedy_[0] == 0 || greedy_[0] == 2) << greedy_[0];
+    EXPECT_NE(sampled_[0], greedy_[0]);
+}
+
 TEST_F(T2SSampler, ExactCumulativeThresholdRemainsEligible) {
     // Uniform logits give exactly representable probabilities and cumulative
     // sums. Comparing with greedy avoids depending on the sort order of ties.

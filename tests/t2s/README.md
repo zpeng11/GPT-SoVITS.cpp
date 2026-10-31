@@ -16,8 +16,15 @@ disables it. For probabilities `[0.5, 0.3, 0.2]` and `top_p=0.7`, only the first
 token remains. This is not the shifted-mask rule of upstream's separate
 `top_k_top_p_filtering` helper.
 
+Top-k uses the k-th largest logit as its pivot and removes only logits **strictly
+below** it. Candidates tied with the pivot remain eligible, so more than k
+candidates may survive, even when k is 1. `top_k <= 0` disables this filtering;
+`top_k >= vocab` does not truncate the vocabulary. Top-k follows top-p filtering
+and temperature scaling, matching the corresponding `logits_to_probs` cutoff.
+
 Tests cover the crossing token, exact and zero thresholds, at least one candidate,
-a single-token vocabulary, disabled filtering, the default top-k 15, temperature
+a single-token vocabulary, disabled filtering, the default top-k 15, top-k cutoff
+inclusion and exclusion, pivot ties, k at or above vocabulary size, temperature
 and top-k ordering, repetition penalty, token-ID remapping, EOS prefix suppression
 and independent batch columns. Fixed noise follows the existing sorted-rank
 convention; these tests do not change noise ordering or claim vocabulary-indexed
