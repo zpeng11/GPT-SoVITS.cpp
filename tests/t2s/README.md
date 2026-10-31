@@ -26,9 +26,10 @@ Tests cover the crossing token, exact and zero thresholds, at least one candidat
 a single-token vocabulary, disabled filtering, the default top-k 15, top-k cutoff
 inclusion and exclusion, pivot ties, k at or above vocabulary size, temperature
 and top-k ordering, repetition penalty, token-ID remapping, EOS prefix suppression
-and independent batch columns. Fixed noise follows the existing sorted-rank
-convention; these tests do not change noise ordering or claim vocabulary-indexed
-noise replay, cross-language RNG parity, or full stochastic-sequence parity.
+and independent batch columns. Handwritten cases supply fixed sorted-rank noise;
+the upstream fixture cases below adapt vocabulary-indexed noise only in the test.
+Neither changes production noise ordering or claims cross-language RNG parity or
+full stochastic-sequence parity.
 The prior implementation already used this top-p rule; its right-shift comment
 and variable name were misleading. No production sampling behavior is changed.
 
@@ -75,10 +76,10 @@ single-threaded and deterministic; numeric probabilities come only from upstream
 `sampled` is replayed from the upstream formula using `probabilities` and the
 fixed noise, not a fresh random draw.
 
-Upstream filters in vocabulary order while the C++ sampler works on sorted ranks,
-so a future consumer must remap through the actual `sorted_indices`. The fixture
-does not make same-seed noise equal across languages and is not a cross-language
-RNG oracle. Provenance records exporter/source hashes and environment versions,
+Upstream returns probabilities and consumes noise in vocabulary order, while the
+C++ sampler consumes noise in sorted-rank order. Its test-only adapter therefore
+remaps through CPU ggml sorting, as described below. The fixture does not make
+same-seed noise equal across languages and is not a cross-language RNG oracle. Provenance records exporter/source hashes and environment versions,
 with no paths, timestamps or private content. A canonical SHA-256 guards content
 integrity; it is not a signature or numerical proof. Byte-identical exports are
 promised only for the same source, tool and environment, not across versions or
@@ -101,6 +102,33 @@ validator does not reimplement the full sampler or establish numerical truth for
 all outputs. Only actual upstream exports author the fixture. Optional PyTorch
 tests use an explicit sampler test double for parameter adaptation and CLI
 plumbing, not as a real oracle; computation tests skip when PyTorch is absent.
+
+### C++ fixture decision comparison
+
+`T2SSamplerUpstream` in `test_t2s_sampler` runs all 19 tracked cases on the CPU
+through the public sampler with the original logits and binary history. Every
+sampled token must exactly match the fixture; greedy must belong to its recorded
+maximum-score candidate set. The fixture is required, not optional: missing,
+malformed or incompatible data fails the test rather than skipping. It is read
+at test runtime, not during GoogleTest discovery. The existing build and CTest
+commands above include these cases and the reader's invalid-data contract test.
+No model, Python process, upstream checkout, network or extra configuration is
+needed to run them.
+
+A test-only mapping graph reproduces the C++ F32 repetition-penalty arithmetic
+and CPU argsort on the active vocabulary, then reorders the fixed noise by those
+token IDs. Matching the same input, shape and local argsort handles ties without
+assuming a portable tie order. The adapter does not implement top-p, top-k or
+softmax and never computes the expected token. Suppressed-EOS cases sort only the
+non-EOS prefix for noise mapping but still exercise the full public sampler with
+its suppression flag set. Production noise ordering and APIs are unchanged.
+
+This is a token-decision comparison for these synthetic cases, not a direct
+comparison of the full probability arrays: the public sampler returns only
+sampled and greedy IDs. It does not establish stochastic-sequence parity,
+bitwise probability agreement or cross-language RNG parity. Full fixture digest
+and provenance validation remains in the separate Python validator above; the
+C++ reader checks the schema, semantics, complete case names and consumed data.
 
 The following sections describe the separate model-backed decode and generation
 references.

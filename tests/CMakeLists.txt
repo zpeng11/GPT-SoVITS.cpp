@@ -146,6 +146,10 @@ foreach(test_src ${T2S_TEST_SOURCES})
 endforeach()
 
 add_executable(test_t2s_sampler t2s/test_t2s_sampler.cpp)
+target_include_directories(test_t2s_sampler PRIVATE ${CMAKE_SOURCE_DIR}/third_party/nlohmann/include)
+target_compile_definitions(test_t2s_sampler PRIVATE
+    T2S_SAMPLER_REFERENCE_PATH="${CMAKE_CURRENT_SOURCE_DIR}/t2s/fixtures/sampler_reference.json"
+)
 target_link_libraries(test_t2s_sampler PRIVATE gpt_sovits_cpp_static GTest::gtest_main)
 gtest_discover_tests(test_t2s_sampler NO_PRETTY_VALUES PROPERTIES LABELS "cpu")
 
