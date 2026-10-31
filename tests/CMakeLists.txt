@@ -145,6 +145,10 @@ foreach(test_src ${T2S_TEST_SOURCES})
     gtest_discover_tests(${test_name})
 endforeach()
 
+add_executable(test_t2s_sampler t2s/test_t2s_sampler.cpp)
+target_link_libraries(test_t2s_sampler PRIVATE gpt_sovits_cpp_static GTest::gtest_main)
+gtest_discover_tests(test_t2s_sampler NO_PRETTY_VALUES PROPERTIES LABELS "cpu")
+
 set(GPTSOVITS_T2S_DECODE_REFERENCE "" CACHE PATH "Local teacher-forced T2S decode reference export")
 set(GPTSOVITS_T2S_DECODE_MODEL "" CACHE FILEPATH "Matching F32 T2S GGUF for decode reference tests")
 

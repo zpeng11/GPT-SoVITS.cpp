@@ -70,7 +70,8 @@ static ::ggml_tensor * apply_top_p_sorted(
     ::ggml_tensor * threshold = ggml_fill(ctx, sorted_logits, top_p);
     ::ggml_tensor * remove_mask = ggml_step(ctx, ggml_sub(ctx, cum_probs, threshold));
 
-    // Shift right by one so the first token above the threshold is kept.
+    // Always keep rank 0; other ranks are removed when cumulative probability
+    // exceeds top_p, without retaining the first token above the threshold.
     ::ggml_tensor * keep_head = ggml_view_1d(ctx, remove_mask, 1, 0);
     keep_head = ggml_cont(ctx, keep_head);
     keep_head = ggml_fill(ctx, keep_head, 0.0f);
@@ -79,11 +80,11 @@ static ::ggml_tensor * apply_top_p_sorted(
         remove_mask,
         vocab - 1,
         /* offset = */ ggml_element_size(remove_mask));
-    ::ggml_tensor * shifted_remove = ggml_concat(ctx, keep_head, remove_tail, 0);
-    shifted_remove = ggml_cont(ctx, shifted_remove);
+    ::ggml_tensor * tail_preserving_remove = ggml_concat(ctx, keep_head, remove_tail, 0);
+    tail_preserving_remove = ggml_cont(ctx, tail_preserving_remove);
 
     ::ggml_tensor * masked_value = ggml_fill(ctx, sorted_logits, kSamplerMaskLogit);
-    return masked_lerp(ctx, sorted_logits, masked_value, shifted_remove);
+    return masked_lerp(ctx, sorted_logits, masked_value, tail_preserving_remove);
 }
 
 static ::ggml_tensor * apply_top_k_sorted(

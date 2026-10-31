@@ -21,7 +21,8 @@ namespace gpt_sovits {
 //                        Values are treated as binary via step(mask):
 //                        > 0 means token has appeared before.
 //   top_k              - <= 0 disables top-k filtering
-//   top_p              - >= 1 disables top-p filtering
+//   top_p              - >= 1 disables top-p filtering; otherwise remove ranks
+//                        whose cumulative probability exceeds top_p, except rank 0.
 //   temperature        - logits are divided by max(temperature, 1e-5)
 //   repetition_penalty - 1.0 disables repetition penalty
 //   exp_noise          - optional Exp(1) noise samples          {vocab, n_batch} or nullptr

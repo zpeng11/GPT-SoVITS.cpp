@@ -1,5 +1,39 @@
 # T2S teacher-forced CPU decode reference
 
+## No-model sampler contract tests
+
+`test_t2s_sampler` exercises the public `t2s_sampler_block_forward` on a CPU
+backend with an identity LM-head projection, explicit logits and fixed positive
+noise. It needs no GGUF, private reference files, PyTorch, or Python process.
+
+The top-p rule follows `AR.models.utils.logits_to_probs`, used by `sample()`:
+after repetition penalty, sort logits and compute cumulative softmax probability;
+remove ranks whose cumulative probability is **strictly greater** than `top_p`,
+but always retain rank 0. The first token crossing the threshold is not retained
+unless it is rank 0. A cumulative probability exactly equal to the threshold
+remains eligible. Temperature and top-k follow this filtering; `top_p >= 1`
+disables it. For probabilities `[0.5, 0.3, 0.2]` and `top_p=0.7`, only the first
+token remains. This is not the shifted-mask rule of upstream's separate
+`top_k_top_p_filtering` helper.
+
+Tests cover the crossing token, exact and zero thresholds, at least one candidate,
+a single-token vocabulary, disabled filtering, the default top-k 15, temperature
+and top-k ordering, repetition penalty, token-ID remapping, EOS prefix suppression
+and independent batch columns. Fixed noise follows the existing sorted-rank
+convention; these tests do not change noise ordering or claim vocabulary-indexed
+noise replay, cross-language RNG parity, or full stochastic-sequence parity.
+The prior implementation already used this top-p rule; its right-shift comment
+and variable name were misleading. No production sampling behavior is changed.
+
+```sh
+cmake -S . -B build -DGPTSOVITS_BUILD_TESTS=ON
+cmake --build build --target test_t2s_sampler -j 4
+ctest --test-dir build -R '^T2SSampler' --output-on-failure
+```
+
+The following sections describe the separate model-backed decode and generation
+references.
+
 `generate_reference.py` exports an independent upstream PyTorch reference for
 multi-step C++ decode tests. It runs **one unpadded request on CPU in F32**, using
 precomputed text features and semantic tokens. It does not run the text frontend,
