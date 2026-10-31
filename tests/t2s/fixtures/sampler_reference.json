@@ -1,0 +1,898 @@
+{
+  "cases": [
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.5,
+          3.7037036418914795,
+          0.25,
+          4.25,
+          1.6666666269302368,
+          0.75,
+          3.5,
+          1.75,
+          3.5185184478759766,
+          0.5,
+          3.0,
+          1.25,
+          3.3333332538604736,
+          2.5,
+          1.0,
+          4.0,
+          2.0,
+          3.75,
+          2.75,
+          3.25
+        ],
+        "greedy_candidates": [
+          3
+        ],
+        "probabilities": [
+          0.01122317835688591,
+          0.10166517645120621,
+          0.0,
+          0.17556005716323853,
+          0.013258617371320724,
+          0.0,
+          0.08292869478464127,
+          0.01441084686666727,
+          0.0844787135720253,
+          0.0,
+          0.05029879882931709,
+          0.0,
+          0.07019761949777603,
+          0.030507763847708702,
+          0.0,
+          0.13672630488872528,
+          0.018503893166780472,
+          0.10648255795240402,
+          0.03917274624109268,
+          0.06458494067192078
+        ],
+        "relative_margin": 0.9871597290039062,
+        "sampled": 15
+      },
+      "logits": [
+        1.5,
+        5.0,
+        0.25,
+        4.25,
+        2.25,
+        0.75,
+        3.5,
+        1.75,
+        4.75,
+        0.5,
+        3.0,
+        1.25,
+        4.5,
+        2.5,
+        1.0,
+        4.0,
+        2.0,
+        3.75,
+        2.75,
+        3.25
+      ],
+      "name": "default_policy",
+      "noise": [
+        1.0,
+        1.0,
+        9.999999747378752e-06,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        1.0,
+        0.009999999776482582,
+        1.0,
+        1.0,
+        1.0,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.350000023841858,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 15,
+        "top_p": 1.0
+      },
+      "previous_tokens": [
+        1,
+        1,
+        8,
+        12,
+        4
+      ]
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          0.0,
+          -1.0,
+          -2.0
+        ],
+        "greedy_candidates": [
+          0
+        ],
+        "probabilities": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "relative_margin": 1.0,
+        "sampled": 0
+      },
+      "logits": [
+        0.0,
+        -1.0,
+        -2.0
+      ],
+      "name": "top_p_removes_crossing",
+      "noise": [
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 0.800000011920929
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          0.0,
+          -1.0,
+          -2.0
+        ],
+        "greedy_candidates": [
+          0
+        ],
+        "probabilities": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "relative_margin": 1.0,
+        "sampled": 0
+      },
+      "logits": [
+        0.0,
+        -1.0,
+        -2.0
+      ],
+      "name": "top_p_low_keeps_leader",
+      "noise": [
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 0.10000000149011612
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          0.0,
+          -1.0,
+          -2.0
+        ],
+        "greedy_candidates": [
+          0
+        ],
+        "probabilities": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "relative_margin": 1.0,
+        "sampled": 0
+      },
+      "logits": [
+        0.0,
+        -1.0,
+        -2.0
+      ],
+      "name": "top_p_zero_keeps_leader",
+      "noise": [
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 0.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          3.0,
+          2.0,
+          0.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.0,
+          0.8807970285415649,
+          0.11920291185379028,
+          0.0
+        ],
+        "relative_margin": 0.9261094331741333,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        3.0,
+        2.0,
+        0.0
+      ],
+      "name": "top_p_before_temperature",
+      "noise": [
+        1.0,
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 0.5,
+        "top_k": 0,
+        "top_p": 0.8999999761581421
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          3.0,
+          2.0,
+          0.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.0,
+          0.7310585975646973,
+          0.2689414322376251,
+          0.0
+        ],
+        "relative_margin": 0.9728171825408936,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        3.0,
+        2.0,
+        0.0
+      ],
+      "name": "top_p_before_top_k",
+      "noise": [
+        1.0,
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 2,
+        "top_p": 0.8999999761581421
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          0.0,
+          2.0,
+          1.0,
+          -1.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.0,
+          0.8807970285415649,
+          0.11920291185379028,
+          0.0
+        ],
+        "relative_margin": 0.3233236074447632,
+        "sampled": 1
+      },
+      "logits": [
+        0.0,
+        2.0,
+        1.0,
+        -1.0
+      ],
+      "name": "temperature_after_filtering",
+      "noise": [
+        1.0,
+        1.0,
+        0.20000000298023224,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 0.5,
+        "top_k": 0,
+        "top_p": 0.949999988079071
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          -2.0,
+          1.5,
+          -0.5,
+          0.0,
+          2.5
+        ],
+        "greedy_candidates": [
+          4
+        ],
+        "probabilities": [
+          0.007352760992944241,
+          0.24349001049995422,
+          0.03295278921723366,
+          0.05432996526360512,
+          0.6618744730949402
+        ],
+        "relative_margin": 0.4563436210155487,
+        "sampled": 1
+      },
+      "logits": [
+        -1.0,
+        3.0,
+        -0.5,
+        0.0,
+        2.5
+      ],
+      "name": "signed_penalty_duplicate_history",
+      "noise": [
+        1.0,
+        0.20000000298023224,
+        0.10000000149011612,
+        1.0,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 2.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0
+      },
+      "previous_tokens": [
+        0,
+        1,
+        3,
+        0,
+        1
+      ]
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          -2.0,
+          1.5,
+          -0.5,
+          0.0,
+          2.5
+        ],
+        "greedy_candidates": [
+          4
+        ],
+        "probabilities": [
+          0.007352760992944241,
+          0.24349001049995422,
+          0.03295278921723366,
+          0.05432996526360512,
+          0.6618744730949402
+        ],
+        "relative_margin": 0.4563436210155487,
+        "sampled": 1
+      },
+      "logits": [
+        -1.0,
+        3.0,
+        -0.5,
+        0.0,
+        2.5
+      ],
+      "name": "signed_penalty_unique_history",
+      "noise": [
+        1.0,
+        0.20000000298023224,
+        0.10000000149011612,
+        1.0,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 2.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0
+      },
+      "previous_tokens": [
+        0,
+        1,
+        3
+      ]
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          -1.0,
+          3.0,
+          -0.5,
+          0.0,
+          2.5
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.010743377730250359,
+          0.5865685343742371,
+          0.01771283522248268,
+          0.02920352667570114,
+          0.3557718098163605
+        ],
+        "relative_margin": 0.8786938786506653,
+        "sampled": 1
+      },
+      "logits": [
+        -1.0,
+        3.0,
+        -0.5,
+        0.0,
+        2.5
+      ],
+      "name": "penalty_disabled",
+      "noise": [
+        1.0,
+        0.20000000298023224,
+        0.10000000149011612,
+        1.0,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0
+      },
+      "previous_tokens": [
+        0,
+        1,
+        3,
+        0,
+        1
+      ]
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          3.0,
+          0.0,
+          2.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.08714432269334793,
+          0.6439142823219299,
+          0.032058604061603546,
+          0.23688283562660217
+        ],
+        "relative_margin": 0.9979914426803589,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        3.0,
+        0.0,
+        2.0
+      ],
+      "name": "top_k_zero",
+      "noise": [
+        1.0,
+        1.0,
+        9.999999747378752e-05,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          3.0,
+          0.0,
+          2.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.08714432269334793,
+          0.6439142823219299,
+          0.032058604061603546,
+          0.23688283562660217
+        ],
+        "relative_margin": 0.9979914426803589,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        3.0,
+        0.0,
+        2.0
+      ],
+      "name": "top_k_negative",
+      "noise": [
+        1.0,
+        1.0,
+        9.999999747378752e-05,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": -1,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          3.0,
+          0.0,
+          2.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.08714432269334793,
+          0.6439142823219299,
+          0.032058604061603546,
+          0.23688283562660217
+        ],
+        "relative_margin": 0.9979914426803589,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        3.0,
+        0.0,
+        2.0
+      ],
+      "name": "top_k_at_vocab",
+      "noise": [
+        1.0,
+        1.0,
+        9.999999747378752e-05,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 4,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          3.0,
+          0.0,
+          2.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.08714432269334793,
+          0.6439142823219299,
+          0.032058604061603546,
+          0.23688283562660217
+        ],
+        "relative_margin": 0.9979914426803589,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        3.0,
+        0.0,
+        2.0
+      ],
+      "name": "top_k_above_vocab",
+      "noise": [
+        1.0,
+        1.0,
+        9.999999747378752e-05,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 5,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          2.0,
+          3.0,
+          0.0,
+          2.0
+        ],
+        "greedy_candidates": [
+          1
+        ],
+        "probabilities": [
+          0.21194157004356384,
+          0.5761169195175171,
+          0.0,
+          0.21194157004356384
+        ],
+        "relative_margin": 0.5,
+        "sampled": 0
+      },
+      "logits": [
+        2.0,
+        3.0,
+        0.0,
+        2.0
+      ],
+      "name": "top_k_pivot_ties",
+      "noise": [
+        0.009999999776482582,
+        1.0,
+        1.0,
+        0.019999999552965164
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 2,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          2.0,
+          0.0,
+          2.0,
+          1.0
+        ],
+        "greedy_candidates": [
+          0,
+          2
+        ],
+        "probabilities": [
+          0.5,
+          0.0,
+          0.5,
+          0.0
+        ],
+        "relative_margin": 0.9900000095367432,
+        "sampled": 2
+      },
+      "logits": [
+        2.0,
+        0.0,
+        2.0,
+        1.0
+      ],
+      "name": "top_k_one_leading_ties",
+      "noise": [
+        1.0,
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 1,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          0.0,
+          3.0
+        ],
+        "greedy_candidates": [
+          2
+        ],
+        "probabilities": [
+          0.0,
+          0.0,
+          1.0
+        ],
+        "relative_margin": 1.0,
+        "sampled": 2
+      },
+      "logits": [
+        1.0,
+        0.0,
+        3.0
+      ],
+      "name": "eos_unmasked",
+      "noise": [
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 0.800000011920929
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          1.0,
+          0.0
+        ],
+        "greedy_candidates": [
+          0
+        ],
+        "probabilities": [
+          1.0,
+          0.0,
+          0.0
+        ],
+        "relative_margin": 1.0,
+        "sampled": 0
+      },
+      "logits": [
+        1.0,
+        0.0,
+        3.0
+      ],
+      "name": "eos_prefix_suppressed",
+      "noise": [
+        1.0,
+        0.009999999776482582,
+        1.0
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": true,
+        "temperature": 1.0,
+        "top_k": 0,
+        "top_p": 0.800000011920929
+      },
+      "previous_tokens": []
+    },
+    {
+      "expected": {
+        "adjusted_logits": [
+          0.0
+        ],
+        "greedy_candidates": [
+          0
+        ],
+        "probabilities": [
+          1.0
+        ],
+        "relative_margin": 1.0,
+        "sampled": 0
+      },
+      "logits": [
+        0.0
+      ],
+      "name": "single_token_vocabulary",
+      "noise": [
+        0.5
+      ],
+      "parameters": {
+        "repetition_penalty": 1.0,
+        "suppress_eos": false,
+        "temperature": 1.0,
+        "top_k": 15,
+        "top_p": 1.0
+      },
+      "previous_tokens": []
+    }
+  ],
+  "content_sha256": "53535da312d47028e709ee9aae3ef9b5f547237982ab665dad2cb15c963b35e6",
+  "execution": {
+    "deterministic_algorithms": true,
+    "device": "cpu",
+    "dtype": "float32",
+    "inference_mode": true,
+    "machine": "arm64",
+    "num_interop_threads": 1,
+    "num_threads": 1,
+    "numpy": "1.26.4",
+    "python": "3.11.15",
+    "system": "Darwin",
+    "torch": "2.11.0"
+  },
+  "schema": "gpt-sovits-t2s-sampler-reference/v1",
+  "semantics": {
+    "disabled_top_k": "nonpositive-maps-to-None",
+    "eos": "last-id;optional-prefix-exclusion-before-upstream",
+    "greedy": "all-maxima-of-adjusted-logits-before-filtering",
+    "noise": "vocabulary-indexed;fixed-positive-f32;no-rng",
+    "probabilities": "vocabulary-indexed;upstream-logits_to_probs",
+    "sampled": "argmax(probabilities/noise)"
+  },
+  "sources": {
+    "exporter_sha256": "e3a789ba36eb38c8da3ad2aad56f52d8a02078bdfb21c93b8c24876681c761ca",
+    "upstream": {
+      "AR/models/utils.py": "201061ba41cec604d2fbff098a6956f84e7c1a576254263542fa466f98d51443"
+    }
+  },
+  "status": "complete"
+}

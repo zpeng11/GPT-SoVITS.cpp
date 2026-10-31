@@ -38,6 +38,70 @@ cmake --build build --target test_t2s_sampler -j 4
 ctest --test-dir build -R '^T2SSampler' --output-on-failure
 ```
 
+## Reproducible upstream sampler fixtures
+
+`generate_sampler_reference.py` exports one self-contained JSON fixture from the
+real upstream `AR.models.utils.logits_to_probs`, loaded directly from source under
+`--upstream-root` (no package import, and existing bytecode caches are ignored).
+Exporting needs PyTorch and NumPy; `--validate` and `--help` need only NumPy and
+the standard library, and neither mode imports the upstream, PyTorch, the network,
+nor installs anything. The fixture is synthetic public data, unlike private
+model-backed exports under `tests/*/out/`.
+
+```sh
+python3 -I tests/t2s/generate_sampler_reference.py \
+  --upstream-root /path/to/trusted/GPT-SoVITS \
+  --output tests/t2s/out/sampler-a.json
+python3 -I tests/t2s/generate_sampler_reference.py \
+  --upstream-root /path/to/trusted/GPT-SoVITS \
+  --output tests/t2s/out/sampler-b.json
+cmp tests/t2s/out/sampler-a.json tests/t2s/out/sampler-b.json
+python3 -I tests/t2s/generate_sampler_reference.py --validate tests/t2s/out/sampler-a.json
+```
+
+The output file must not already exist. One file with schema
+`gpt-sovits-t2s-sampler-reference/v1` holds a fixed synthetic catalog: `logits`,
+`previous_tokens`, `parameters` (including `suppress_eos`) and vocabulary-indexed
+fixed positive `noise`, so cases do not depend on RNG draws. `expected` records the
+upstream `adjusted_logits` (only over the valid vocabulary prefix, or `V-1` when
+EOS is suppressed), full-vocabulary `probabilities` (EOS set to 0 when
+suppressed), the `greedy_candidates` set, `sampled`, and `relative_margin`. The
+clone inputs reproduce upstream's in-place repetition penalty; `top_k <= 0` maps
+to `None`.
+
+EOS suppression is an outer prefix adapter applied before the upstream call, not
+an upstream function parameter or generation window. Execution is CPU/F32,
+single-threaded and deterministic; numeric probabilities come only from upstream.
+`sampled` is replayed from the upstream formula using `probabilities` and the
+fixed noise, not a fresh random draw.
+
+Upstream filters in vocabulary order while the C++ sampler works on sorted ranks,
+so a future consumer must remap through the actual `sorted_indices`. The fixture
+does not make same-seed noise equal across languages and is not a cross-language
+RNG oracle. Provenance records exporter/source hashes and environment versions,
+with no paths, timestamps or private content. A canonical SHA-256 guards content
+integrity; it is not a signature or numerical proof. Byte-identical exports are
+promised only for the same source, tool and environment, not across versions or
+machines. C++ scales positive-score repetition with an F32 reciprocal where
+upstream divides, so bitwise agreement is not claimed.
+
+The catalog covers the default top-k 15 with repetition penalty 1.35 on a
+20-token vocabulary, top-p ordering and temperature, signed repetition penalties
+with repeated history, disabled top-k and pivot ties, and EOS pairs. Fixture
+tests use only NumPy and the standard library:
+
+```sh
+python3 -I -m unittest discover -s python/tests -p test_t2s_sampler_reference.py -v
+```
+
+They check the tracked `fixtures/sampler_reference.json` catalog, provenance and
+content digests, probability normalization, greedy candidate sets and fixed-noise
+replay, plus selected analytic probabilities and policy relationships. The
+validator does not reimplement the full sampler or establish numerical truth for
+all outputs. Only actual upstream exports author the fixture. Optional PyTorch
+tests use an explicit sampler test double for parameter adaptation and CLI
+plumbing, not as a real oracle; computation tests skip when PyTorch is absent.
+
 The following sections describe the separate model-backed decode and generation
 references.
 
@@ -124,8 +188,10 @@ clean up this run's files. A process kill can leave an incomplete directory;
 without the completion manifest it is not a valid export. Existing data is never
 overwritten or removed. Publication uses exclusive hard links within the output
 filesystem; a filesystem without hard-link support fails explicitly. Private
-inputs and generated data belong under the ignored `tests/*/out/` directories,
-not in tracked fixtures.
+inputs and generated data from these model-backed exports belong under the
+ignored `tests/*/out/` directories, not in tracked fixtures. The synthetic,
+upstream-authored sampler fixture described above is public data and an explicit
+exception to this rule.
 
 ## Forward semantics and determinism
 

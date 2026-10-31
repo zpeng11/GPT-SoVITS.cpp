@@ -102,3 +102,20 @@ validation (including rejection of old unmasked exports) and cross-process expor
 identity. NumPy-only validation and CLI rejection tests still run without PyTorch;
 model computation tests skip when
 it is absent. This is not a comparison with the upstream UI's sampling defaults.
+
+## T2S sampler reference fixture
+
+```sh
+python3 -I -m unittest discover -s python/tests -p test_t2s_sampler_reference.py -v
+```
+
+These tests check the tracked `tests/t2s/fixtures/sampler_reference.json` catalog,
+provenance/digests, probability normalization and fixed-noise replay. Selected
+small cases additionally check analytic probabilities and policy relationships;
+the tests do not reimplement the full sampler or prove all upstream outputs.
+NumPy and the standard library are enough: no upstream checkout, PyTorch,
+network access or dependency installation is required. Optional PyTorch tests
+use an explicit sampler test double for parameter adaptation and CLI plumbing;
+it is not a real upstream oracle, and computation tests skip without PyTorch. See
+[the T2S reference documentation](../../tests/t2s/README.md) for the export CLI,
+schema and provenance rules.
