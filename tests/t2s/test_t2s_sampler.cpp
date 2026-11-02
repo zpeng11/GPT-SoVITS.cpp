@@ -243,8 +243,7 @@ protected:
         for (int64_t i = 0; i < vocab; ++i) identity[static_cast<size_t>(i * vocab + i)] = 1.0f;
         ggml_backend_tensor_set(weights, identity.data(), 0, identity.size() * sizeof(float));
         ggml_backend_tensor_set(y, c.logits.data(), 0, c.logits.size() * sizeof(float));
-        // Run consumes sorted-rank noise. Handwritten cases supply it directly;
-        // upstream cases use the test-only vocabulary-to-rank adapter below.
+        // All cases supply noise indexed by token ID within each batch column.
         ggml_backend_tensor_set(noise, c.noise.data(), 0, c.noise.size() * sizeof(float));
         if (seen) ggml_backend_tensor_set(seen, c.seen.data(), 0, c.seen.size() * sizeof(float));
         if (suppress) ggml_backend_tensor_set(suppress, c.suppress_eos.data(), 0,
@@ -254,52 +253,6 @@ protected:
         greedy_.resize(static_cast<size_t>(n_batch));
         ggml_backend_tensor_get(result.sampled, sampled_.data(), 0, sampled_.size() * sizeof(int32_t));
         ggml_backend_tensor_get(result.greedy, greedy_.data(), 0, greedy_.size() * sizeof(int32_t));
-    }
-
-    void MapVocabularyNoise(SamplerCase & c, std::vector<int32_t> & permutation) {
-        const bool suppress = !c.suppress_eos.empty() && c.suppress_eos[0] == 1;
-        const size_t active = c.logits.size() - (suppress ? 1 : 0);
-        ASSERT_GT(active, 0u);
-        ggml_tensor * logits = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, active);
-        ggml_set_input(logits);
-        ggml_tensor * adjusted = logits;
-        ggml_tensor * seen = nullptr;
-        if (!c.seen.empty() && c.repetition_penalty != 1.0f) {
-            seen = ggml_new_tensor_1d(ctx_, GGML_TYPE_F32, active);
-            ggml_set_input(seen);
-            // Match only the F32 penalty arithmetic used before argsort. This
-            // adapts noise indices; it never computes an expected sampler result.
-            const auto lerp = [&](ggml_tensor * base, ggml_tensor * selected, ggml_tensor * mask) {
-                return ggml_add(ctx_, base, ggml_mul(ctx_, mask, ggml_sub(ctx_, selected, base)));
-            };
-            ggml_tensor * positive = ggml_scale(ctx_, logits, 1.0f / c.repetition_penalty);
-            ggml_tensor * negative = ggml_scale(ctx_, logits, c.repetition_penalty);
-            ggml_tensor * scaled = lerp(positive, negative, ggml_step(ctx_, ggml_neg(ctx_, logits)));
-            adjusted = lerp(logits, scaled, ggml_step(ctx_, seen));
-        }
-        // Same one-row F32 CPU argsort as the sampler: tied IDs may have any
-        // order, but this identical input/length reproduces that order locally.
-        ggml_tensor * indices = ggml_argsort(ctx_, adjusted, GGML_SORT_ORDER_DESC);
-        ggml_set_output(indices);
-        ggml_cgraph * graph = ggml_new_graph_custom(ctx_, 1024, false);
-        ggml_build_forward_expand(graph, indices);
-        ASSERT_TRUE(ggml_gallocr_alloc_graph(alloc_, graph));
-        ggml_backend_tensor_set(logits, c.logits.data(), 0, active * sizeof(float));
-        if (seen) ggml_backend_tensor_set(seen, c.seen.data(), 0, active * sizeof(float));
-        ASSERT_EQ(ggml_backend_graph_compute(backend_, graph), GGML_STATUS_SUCCESS);
-        permutation.resize(active);
-        ggml_backend_tensor_get(indices, permutation.data(), 0, active * sizeof(int32_t));
-        const std::vector<float> vocabulary_noise = c.noise;
-        c.noise.assign(c.logits.size(), 1.0f);
-        std::vector<bool> visited(active, false);
-        for (size_t rank = 0; rank < active; ++rank) {
-            const int32_t token = permutation[rank];
-            ASSERT_GE(token, 0);
-            ASSERT_LT(static_cast<size_t>(token), active);
-            ASSERT_FALSE(visited[token]);
-            visited[token] = true;
-            c.noise[rank] = vocabulary_noise[token];
-        }
     }
 
     std::vector<int32_t> sampled_, greedy_;
@@ -318,15 +271,13 @@ TEST_P(T2SSamplerUpstream, MatchesFixtureDecision) {
     const auto found = std::find_if(cases.begin(), cases.end(),
         [&](const UpstreamCase & ref) { return ref.name == GetParam(); });
     ASSERT_NE(found, cases.end());
-    SamplerCase c = found->sampler;
-    std::vector<int32_t> permutation;
-    ASSERT_NO_FATAL_FAILURE(MapVocabularyNoise(c, permutation));
+    const SamplerCase & c = found->sampler;
     SCOPED_TRACE(::testing::Message() << found->name << ": top_k=" << c.top_k
         << ", top_p=" << c.top_p << ", temperature=" << c.temperature
         << ", repetition_penalty=" << c.repetition_penalty
         << ", suppress_eos=" << ::testing::PrintToString(c.suppress_eos)
-        << ", sorted token IDs=" << ::testing::PrintToString(permutation)
-        << ", rank noise=" << ::testing::PrintToString(c.noise)
+        << ", logits=" << ::testing::PrintToString(c.logits)
+        << ", vocabulary noise=" << ::testing::PrintToString(c.noise)
         << ", reference margin=" << found->relative_margin);
     ASSERT_NO_FATAL_FAILURE(Run(c));
     EXPECT_EQ(sampled_, std::vector<int32_t>{c.sampled});
@@ -415,7 +366,7 @@ const SamplerCase kTopPCases[] = {
      0.7f, 1, 1, 0, 1.0f, 2.0f, {1.0f, 0.0f, 0.0f}},
     {"UnsortedLogitsMapBackToTokenIds", Logits({0.2f, 0.5f, 0.3f}), {1.0f, 0.01f, 1.0f},
      0.7f, 1, 1},
-    {"UnsuppressedEosUsesFullVocabulary", Logits({0.3f, 0.2f, 0.5f}), {1.0f, 0.01f, 1.0f},
+    {"UnsuppressedEosUsesFullVocabulary", Logits({0.3f, 0.2f, 0.5f}), {0.01f, 1.0f, 1.0f},
      0.7f, 2, 2, 0, 1.0f, 1.0f, {}, {0}},
     {"SuppressedEosUsesPrefixProbabilities", Logits({0.3f, 0.2f, 0.5f}), {1.0f, 0.01f, 1.0f},
      0.7f, 0, 0, 0, 1.0f, 1.0f, {}, {1}},
@@ -435,20 +386,20 @@ TEST_P(T2SSamplerTopK, MatchesExpectedToken) {
     EXPECT_EQ(greedy_, std::vector<int32_t>{c.greedy});
 }
 
-// Sorted token IDs are {1, 3, 0, 2}; small noise makes the selected rank win
-// whenever it remains eligible. Other sampling controls are disabled.
+// Sorted token IDs are {1, 3, 0, 2}; small token-indexed noise makes the
+// targeted candidate win whenever eligible. Other sampling controls are disabled.
 const SamplerCase kTopKCases[] = {
-    {"CutoffIncludesKthCandidate", {1, 3, 0, 2}, {1, 1e-4f, 1, 1},
+    {"CutoffIncludesKthCandidate", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
      1.0f, 3, 1, 2},
-    {"RemovesCandidateBelowCutoff", {1, 3, 0, 2}, {1, 1, 1e-4f, 1},
+    {"RemovesCandidateBelowCutoff", {1, 3, 0, 2}, {1e-4f, 1, 1, 1},
      1.0f, 1, 1, 2},
-    {"ZeroDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+    {"ZeroDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1e-4f, 1},
      1.0f, 2, 1, 0},
-    {"NegativeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+    {"NegativeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1e-4f, 1},
      1.0f, 2, 1, -1},
-    {"VocabularySizeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+    {"VocabularySizeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1e-4f, 1},
      1.0f, 2, 1, 4},
-    {"AboveVocabularySizeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1, 1e-4f},
+    {"AboveVocabularySizeDisablesFiltering", {1, 3, 0, 2}, {1, 1, 1e-4f, 1},
      1.0f, 2, 1, 5},
 };
 
@@ -456,45 +407,74 @@ INSTANTIATE_TEST_SUITE_P(, T2SSamplerTopK, ::testing::ValuesIn(kTopKCases),
     [](const ::testing::TestParamInfo<SamplerCase> & info) { return std::string(info.param.name); });
 
 TEST_F(T2SSampler, TopKKeepsCandidatesTiedWithPivot) {
-    // Rank 2 lies beyond the first k=2 entries but ties with the pivot. Force it
-    // to win without depending on which tied token ID occupies that rank.
-    const SamplerCase c = {"", {2, 3, 0, 2}, {1, 1, 1e-4f, 1},
+    // Both pivot-tied IDs must remain eligible, regardless of their sort order.
+    const SamplerCase c = {"", {2, 3, 0, 2,  2, 3, 0, 2},
+                           {1e-4f, 1, 1, 1,  1, 1, 1, 1e-4f},
                            1.0f, 0, 1, 2};
-    ASSERT_NO_FATAL_FAILURE(Run(c));
-    ASSERT_EQ(sampled_.size(), 1u);
-    EXPECT_TRUE(sampled_[0] == 0 || sampled_[0] == 3) << sampled_[0];
-    EXPECT_EQ(greedy_, std::vector<int32_t>{1});
+    ASSERT_NO_FATAL_FAILURE(Run(c, 2));
+    EXPECT_EQ(sampled_, (std::vector<int32_t>{0, 3}));
+    EXPECT_EQ(greedy_, (std::vector<int32_t>{1, 1}));
 }
 
 TEST_F(T2SSampler, TopKOneKeepsTiedLeadingCandidates) {
-    // Rank 1 must remain eligible even with k=1. Comparing with greedy avoids
-    // assuming a particular ordering of the tied leading token IDs.
-    const SamplerCase c = {"", {2, 0, 2, 1}, {1, 1e-4f, 1, 1},
+    // Target each tied leading ID in a separate column; k=1 must retain both.
+    const SamplerCase c = {"", {2, 0, 2, 1,  2, 0, 2, 1},
+                           {1e-4f, 1, 1, 1,  1, 1, 1e-4f, 1},
                            1.0f, 0, 0, 1};
-    ASSERT_NO_FATAL_FAILURE(Run(c));
-    ASSERT_EQ(sampled_.size(), 1u);
-    ASSERT_EQ(greedy_.size(), 1u);
-    EXPECT_TRUE(sampled_[0] == 0 || sampled_[0] == 2) << sampled_[0];
-    EXPECT_TRUE(greedy_[0] == 0 || greedy_[0] == 2) << greedy_[0];
-    EXPECT_NE(sampled_[0], greedy_[0]);
+    ASSERT_NO_FATAL_FAILURE(Run(c, 2));
+    EXPECT_EQ(sampled_, (std::vector<int32_t>{0, 2}));
+    ASSERT_EQ(greedy_.size(), 2u);
+    for (int32_t token : greedy_) EXPECT_TRUE(token == 0 || token == 2) << token;
+}
+
+SamplerCase UniformThresholdCase(float top_p) {
+    SamplerCase c = {"", std::vector<float>(16, 0.0f), std::vector<float>(16, 1.0f),
+                     top_p, 0, 0};
+    // Each column targets a different token, so every eligible ID is observable
+    // without assuming any particular sort order for the uniform logits.
+    for (size_t token = 0; token < 4; ++token) c.noise[token * 4 + token] = 0.01f;
+    return c;
 }
 
 TEST_F(T2SSampler, ExactCumulativeThresholdRemainsEligible) {
-    // Uniform logits give exactly representable probabilities and cumulative
-    // sums. Comparing with greedy avoids depending on the sort order of ties.
-    const SamplerCase c = {"", {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 0.01f, 1.0f, 1.0f},
-                           0.5f, 0, 0};
-    ASSERT_NO_FATAL_FAILURE(Run(c));
-    ASSERT_EQ(sampled_.size(), 1u);
-    ASSERT_EQ(greedy_.size(), 1u);
-    EXPECT_NE(sampled_[0], greedy_[0]);
+    // Uniform logits give exactly representable probabilities and cumulative sums.
+    ASSERT_NO_FATAL_FAILURE(Run(UniformThresholdCase(0.5f), 4));
+    ASSERT_EQ(sampled_.size(), 4u);
+    EXPECT_EQ((std::set<int32_t>(sampled_.begin(), sampled_.end()).size()), 2u);
 }
 
 TEST_F(T2SSampler, CumulativeProbabilityAboveThresholdIsRemoved) {
-    const SamplerCase c = {"", {0.0f, 0.0f, 0.0f, 0.0f}, {1.0f, 0.01f, 1.0f, 1.0f},
-                           0.49f, 0, 0};
-    ASSERT_NO_FATAL_FAILURE(Run(c));
+    ASSERT_NO_FATAL_FAILURE(Run(UniformThresholdCase(0.49f), 4));
+    ASSERT_EQ(sampled_.size(), 4u);
     EXPECT_EQ(sampled_, greedy_);
+    EXPECT_EQ((std::set<int32_t>(sampled_.begin(), sampled_.end()).size()), 1u);
+}
+
+TEST_F(T2SSampler, NoiseUsesTokenIdsForUnsortedLogits) {
+    const SamplerCase c = {"", {3, 1, 2, 0}, {1, 0.01f, 1, 1},
+                           1.0f, 1, 0};
+    ASSERT_NO_FATAL_FAILURE(Run(c));
+    EXPECT_EQ(sampled_, std::vector<int32_t>{1});
+    EXPECT_EQ(greedy_, std::vector<int32_t>{0});
+}
+
+TEST_F(T2SSampler, NoiseUsesTokenIdsWithSuppressedEos) {
+    const SamplerCase c = {"", {1, 3, 2, 6}, {0.01f, 1, 1, 1e-6f},
+                           1.0f, 0, 1, 0, 1.0f, 1.0f, {}, {1}};
+    ASSERT_NO_FATAL_FAILURE(Run(c));
+    EXPECT_EQ(sampled_, std::vector<int32_t>{0});
+    EXPECT_EQ(greedy_, std::vector<int32_t>{1});
+}
+
+TEST_F(T2SSampler, BatchColumnsKeepTokenIndexedNoiseIndependent) {
+    const SamplerCase c = {"", {3, 1, 2, 0,  1, 3, 2, 6,
+                                0, 2, 1, 3,  2, 0, 3, 5},
+                           {1, 0.01f, 1, 1,  0.01f, 1, 1, 1e-6f,
+                            1, 1, 0.001f, 1,  1, 0.001f, 1, 1e-6f},
+                           1.0f, 0, 0, 0, 1.0f, 1.0f, {}, {0, 1, 0, 1}};
+    ASSERT_NO_FATAL_FAILURE(Run(c, 4));
+    EXPECT_EQ(sampled_, (std::vector<int32_t>{1, 0, 2, 1}));
+    EXPECT_EQ(greedy_, (std::vector<int32_t>{0, 1, 3, 2}));
 }
 
 TEST_F(T2SSampler, BatchColumnsKeepIndependentTopPAndEosMasks) {

@@ -26,12 +26,11 @@ Tests cover the crossing token, exact and zero thresholds, at least one candidat
 a single-token vocabulary, disabled filtering, the default top-k 15, top-k cutoff
 inclusion and exclusion, pivot ties, k at or above vocabulary size, temperature
 and top-k ordering, repetition penalty, token-ID remapping, EOS prefix suppression
-and independent batch columns. Handwritten cases supply fixed sorted-rank noise;
-the upstream fixture cases below adapt vocabulary-indexed noise only in the test.
-Neither changes production noise ordering or claims cross-language RNG parity or
-full stochastic-sequence parity.
-The prior implementation already used this top-p rule; its right-shift comment
-and variable name were misleading. No production sampling behavior is changed.
+and independent batch columns. All cases supply fixed vocabulary-indexed noise:
+`noise[token_id]` is paired with that token's probability, including when EOS is
+excluded. Unsorted logits, per-column noise and EOS masks test this correspondence
+directly. Tie tests target each tied candidate in separate columns; exact-threshold
+tests target every token to count eligible IDs without assuming a tie sort order.
 
 ```sh
 cmake -S . -B build -DGPTSOVITS_BUILD_TESTS=ON
@@ -76,10 +75,9 @@ single-threaded and deterministic; numeric probabilities come only from upstream
 `sampled` is replayed from the upstream formula using `probabilities` and the
 fixed noise, not a fresh random draw.
 
-Upstream returns probabilities and consumes noise in vocabulary order, while the
-C++ sampler consumes noise in sorted-rank order. Its test-only adapter therefore
-remaps through CPU ggml sorting, as described below. The fixture does not make
-same-seed noise equal across languages and is not a cross-language RNG oracle. Provenance records exporter/source hashes and environment versions,
+Both upstream and the C++ sampler pair probabilities and fixed noise by token ID.
+The fixture does not make same-seed noise equal across languages and is not a
+cross-language RNG oracle. Provenance records exporter/source hashes and environment versions,
 with no paths, timestamps or private content. A canonical SHA-256 guards content
 integrity; it is not a signature or numerical proof. Byte-identical exports are
 promised only for the same source, tool and environment, not across versions or
@@ -115,13 +113,17 @@ commands above include these cases and the reader's invalid-data contract test.
 No model, Python process, upstream checkout, network or extra configuration is
 needed to run them.
 
-A test-only mapping graph reproduces the C++ F32 repetition-penalty arithmetic
-and CPU argsort on the active vocabulary, then reorders the fixed noise by those
-token IDs. Matching the same input, shape and local argsort handles ties without
-assuming a portable tie order. The adapter does not implement top-p, top-k or
-softmax and never computes the expected token. Suppressed-EOS cases sort only the
-non-EOS prefix for noise mapping but still exercise the full public sampler with
-its suppression flag set. Production noise ordering and APIs are unchanged.
+Fixture noise is uploaded unchanged; no test-only sorting or noise mapping graph
+is used. Production gathers noise by the same sorted token IDs used for the
+probabilities. Suppressed-EOS cases retain the original token IDs over the non-EOS
+prefix and exercise the full public sampler with its suppression flag set.
+
+Previously the C++ sampler paired noise by sorted rank. Token-indexed pairing
+preserves the categorical distribution for independent identically distributed
+Exp(1) noise, but fixed noise inputs and same-seed generated sequences can differ
+from older builds. Repeated runs with identical inputs, options, build and backend
+remain reproducible. Tensor shapes and public signatures are unchanged; this is
+not cross-language RNG or full stochastic-sequence parity.
 
 This is a token-decision comparison for these synthetic cases, not a direct
 comparison of the full probability arrays: the public sampler returns only

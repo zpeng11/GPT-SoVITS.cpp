@@ -261,7 +261,10 @@ static ::ggml_tensor * pick_sampler_token(
         GGML_ASSERT(exp_noise->type == GGML_TYPE_F32);
         ::ggml_tensor * noise_vec = flatten_vector_like(ctx, exp_noise);
         GGML_ASSERT(noise_vec->ne[0] == vocab);
-        score = ggml_div(ctx, probs_vec, noise_vec);
+        // Pair each sorted probability with the noise indexed by its token ID.
+        ::ggml_tensor * noise_sorted = ggml_get_rows(ctx, ensure_scalar_rows(ctx, noise_vec), indices_vec);
+        noise_sorted = ggml_reshape_1d(ctx, noise_sorted, vocab);
+        score = ggml_div(ctx, probs_vec, noise_sorted);
     }
 
     ::ggml_tensor * score_matrix = ggml_reshape_2d(ctx, score, vocab, 1);

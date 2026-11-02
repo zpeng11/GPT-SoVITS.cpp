@@ -119,8 +119,8 @@ static ErrorStats compute_errors(const std::vector<float> & actual,
     return s;
 }
 
-// Generate Exp(1) noise for the sampler.  The sampler computes
-// score = softmax(sorted_logits) / noise, then picks argmax(score).
+// Generate token-indexed Exp(1) noise for the sampler.  The sampler computes
+// score[token] = probability[token] / noise[token], then picks argmax(score).
 // Exp(1) noise implements the Gumbel-max trick for categorical sampling.
 static void fill_exp_noise(std::vector<float> & buf, std::mt19937 & rng) {
     std::exponential_distribution<float> dist(1.0f);

@@ -26,6 +26,8 @@ namespace gpt_sovits {
 //   temperature        - logits are divided by max(temperature, 1e-5)
 //   repetition_penalty - 1.0 disables repetition penalty
 //   exp_noise          - optional Exp(1) noise samples          {vocab, n_batch} or nullptr
+//                        Indexed by token ID within each batch column; each token's
+//                        probability is paired with its own noise sample.
 //                        When null, this falls back to greedy argmax.
 //   suppress_eos       - optional I32 flags {n_batch}: 0 uses all logits, 1 excludes
 //                        the last vocabulary entry from both sampled and greedy.
